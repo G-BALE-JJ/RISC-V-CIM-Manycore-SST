@@ -1,0 +1,93 @@
+Single-Node Heterogeneous Microarchitecture (Vanadis + RoCC + Golem)
+Role-agnostic (no worker/manager split)
+
++--------------------------------------------------------------------------------------+
+| L1. Application / Runtime Layer                                                      |
+|--------------------------------------------------------------------------------------|
+|  Test Program / Matmul Runtime                                                       |
+|        |                                                                             |
+|        v                                                                             |
+|  Golem Custom ISA Calls: mvm.*, remote.*, mm2gm/gm2mm, reg2gm/gm2reg                |
++--------------------------------------------------------------------------------------+
+                                 |
+                                 v
++--------------------------------------------------------------------------------------+
+| L2. Compute Layer                                                                     |
+|--------------------------------------------------------------------------------------|
+|  +--------------------------------------+      +-----------------------------------+ |
+|  | Vanadis Core (deep microarchitecture)|<---->| RoCC Controller                   | |
+|  |--------------------------------------|      |-----------------------------------| |
+|  | Fetch + Decode                       |      | cmd/resp path + opcode decode     | |
+|  | OoO Engine (ROB/Issue/Retire)        |      | remote length + output mode cfg   | |
+|  | LSQ + ITLB/DTLB                      |      +------------------+----------------+ |
+|  | L1I/L1D + L2 + MemNIC                |                         |                  |
+|  +-------------------+------------------+                         |                  |
+|                      |                                            |                  |
+|                      |                                            v                  |
+|                      |                         +-----------------------------------+ |
+|                      |                         | Golem Compute Array               | |
+|                      |                         |-----------------------------------| |
+|                      |                         | MVMIntArray / MVMFloatArray       | |
+|                      |                         | numArrays, input/output size       | |
+|                      |                         | CU-based latency model             | |
+|                      |                         +-----------------------------------+ |
+|                      |                                            |                  |
+|                      |                                            v                  |
+|                      |                         +-----------------------------------+ |
+|                      +------------------------>| Golem Memory Array (GlobalMemory) | |
+|                                                |-----------------------------------| |
+|                                                | per-core GM window                 | |
+|                                                | DMA engine + retry/inflight control| |
+|                                                | link buffer + NoC interface        | |
+|                                                +-----------------------------------+ |
++--------------------------------------------------------------------------------------+
+            |                                                       |
+            |                                                       |
+            v                                                       v
++--------------------------------------------------------------------------------------+
+| L3. On-Chip Interconnect Layer                                                       |
+|--------------------------------------------------------------------------------------|
+|  Mesh NoC Routers                                                                    |
+|  Optional direct control links (ctrl/scheduler endpoints)                            |
++--------------------------------------------------------------------------------------+
+                                 |
+                                 v
++--------------------------------------------------------------------------------------+
+| L4. Memory System Layer                                                              |
+|--------------------------------------------------------------------------------------|
+|  Directory Controllers  ->  Memory Controllers  ->  DRAMSim3 / HBM backing          |
++--------------------------------------------------------------------------------------+
+
+
+Connection Summary (for PPT bullet use)
+
+1) CPU compute/control path
+   Vanadis Core <-> RoCC Controller
+
+2) Accelerator internal path
+   RoCC Controller -> Compute Array
+   RoCC Controller -> Memory Array (GlobalMemory)
+
+3) Data network path
+   Vanadis cache hierarchy (MemNIC) -> Mesh NoC
+   GlobalMemory network interface -> Mesh NoC
+   Mesh NoC -> Directory Controller -> Memory Controller -> DRAM/HBM
+
+4) ISA-to-hardware mapping
+   mvm.set/mvm.l/mvm/mvm.s/mvm.mv      -> RoCC + Compute Array
+   mvm.gm2imat/mvm.gm2ivec/mvm.ovec2gm -> RoCC + GlobalMemory + Compute Array
+   remote.ld/remote.st/mvm.slen         -> RoCC + GlobalMemory DMA + NoC
+   mm2gm/gm2mm/reg2gm/gm2reg            -> RoCC + GlobalMemory + host memory path
+
+
+PPT Drawing Guide (if you redraw manually)
+
+- Use 4 horizontal layers: Application, Compute, Interconnect, Memory.
+- In Compute layer, place Vanadis on left and RoCC+Golem on right.
+- Expand Vanadis into 4 sub-blocks: Fetch/Decode, OoO, LSQ+TLB, Cache+MemNIC.
+- Expand Golem into 2 sub-blocks: Compute Array and Memory Array.
+- Keep only one NoC block in layer 3 to avoid visual clutter.
+- Highlight 3 critical arrows with thicker lines:
+  A) Vanadis <-> RoCC
+  B) RoCC -> Compute Array / Memory Array
+  C) GlobalMemory -> NoC -> Memory System

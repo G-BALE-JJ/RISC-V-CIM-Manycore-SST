@@ -1,0 +1,173 @@
+// Copyright 2009-2025 NTESS. Under the terms
+// of Contract DE-NA0003525 with NTESS, the U.S.
+// Government retains certain rights in this software.
+//
+// Copyright (c) 2009-2025, NTESS
+// All rights reserved.
+//
+// Portions are copyright of other developers:
+// See the file CONTRIBUTORS.TXT in the top level directory
+// of the distribution for more information.
+//
+// This file is part of the SST software package. For license
+// information, see the LICENSE file in the top level directory of the
+// distribution.
+
+#ifndef _H_SHOGUN_NIC
+#define _H_SHOGUN_NIC
+
+#include <sst/core/interfaces/simpleNetwork.h>
+#include <sst/core/link.h>
+#include <sst/core/unitAlgebra.h>
+
+#include "shogun_event.h"
+#include "shogun_q.h"
+
+using namespace SST;
+using namespace SST::Interfaces;
+
+namespace SST {
+namespace Shogun {
+
+    class ShogunNIC : public SST::Interfaces::SimpleNetwork {
+
+    public:
+        SST_ELI_REGISTER_SUBCOMPONENT(
+            ShogunNIC,
+            "shogun",
+            "ShogunNIC",
+            SST_ELI_ELEMENT_VERSION(1, 0, 0),
+            "Shogun X-Bar Interface for Memory Crossbars",
+            SST::Interfaces::SimpleNetwork
+        )
+
+        SST_ELI_DOCUMENT_PARAMS(
+            { "verbose", "Level of output verbosity, higher is more output, 0 is no output", "0"},
+            { "port_name", "If loaded anonymously, port to use (otherwise will use own port)", "port"}
+        )
+
+        SST_ELI_DOCUMENT_PORTS(
+            {"port", "Port into network", {"shogun.ShogunCreditEvent", "shogun.ShogunEvent"} }
+        )
+
+        ShogunNIC(SST::ComponentId_t id, Params& params, int vns);
+        ~ShogunNIC();
+
+        /**
+     		* Sends a network request during the init() phase
+     	*/
+        void sendUntimedData(Request* req) override;
+
+        /**
+     		* Receive any data during the init() phase.
+     		* @see SST::Link::recvInitData()
+     	*/
+        Request* recvUntimedData() override;
+
+
+        /**
+         * Send a Request to the network.
+         */
+        virtual bool send(Request* req, int vn) override;
+
+        /**
+         * Receive a Request from the network.
+         *
+         * Use this method for polling-based applications.
+         * Register a handler for push-based notification of responses.
+         *
+         * @param vn Virtual network to receive on
+         * @return NULL if nothing is available.
+         * @return Pointer to a Request response (that should be deleted)
+         */
+        virtual Request* recv(int vn) override;
+
+        virtual void setup() override;
+        virtual void init(unsigned int phase) override;
+        virtual void complete(unsigned int phase) override;
+        virtual void finish() override;
+
+        /**
+         * Checks if there is sufficient space to send on the specified
+         * virtual network
+         * @param vn Virtual network to check
+         * @param num_bits Minimum size in bits required to have space
+         * to send
+         * @return true if there is space in the output, false otherwise
+         */
+        virtual bool spaceToSend(int vn, int num_bits) override;
+
+        /**
+         * Checks if there is a waiting network request request pending in
+         * the specified virtual network.
+         * @param vn Virtual network to check
+         * @return true if a network request is pending in the specified
+         * virtual network, false otherwise
+         */
+        virtual bool requestToReceive(int vn) override;
+
+        /**
+         * Registers a functor which will fire when a new request is
+         * received from the network.  Note, the actual request that
+         * was received is not passed into the functor, it is only a
+         * notification that something is available.
+         * @param functor Functor to call when request is received
+         */
+        virtual void setNotifyOnReceive(SimpleNetwork::HandlerBase* functor) override;
+
+        /**
+         * Registers a functor which will fire when a request is
+         * sent to the network.  Note, this only tells you when data
+         * is sent, it does not guarantee any specified amount of
+         * available space.
+         * @param functor Functor to call when request is sent
+         */
+        virtual void setNotifyOnSend(SimpleNetwork::HandlerBase* functor) override;
+
+        /**
+         * Check to see if network is initialized.  If network is not
+         * initialized, then no other functions other than init() can
+         * can be called on the interface.
+         * @return true if network is initialized, false otherwise
+         */
+        virtual bool isNetworkInitialized() const override;
+
+        /**
+         * Returns the endpoint ID.  Cannot be called until after the
+         * network is initialized.
+         * @return Endpoint ID
+         */
+        virtual nid_t getEndpointID() const override;
+
+        /**
+         * Returns the final BW of the link managed by the simpleNetwork
+         * instance.  Cannot be called until after the network is
+         * initialized.
+         * @return Link bandwidth of associated link
+         */
+        virtual const UnitAlgebra& getLinkBW() const override;
+
+    private:
+        SST::Output* output;
+        SST::Link* link;
+        nid_t netID;
+
+        SimpleNetwork::HandlerBase* onSendFunctor;
+        SimpleNetwork::HandlerBase* onRecvFunctor;
+
+        ShogunQueue<Request*>* reqQ;
+        int remote_input_slots;
+        int port_count;
+
+        void recvLinkEvent(SST::Event* ev);
+        void reconfigureNIC(ShogunInitEvent* initEv);
+
+        std::vector<Request*> initReqs;
+
+        UnitAlgebra bw;
+    };
+
+}
+}
+
+#endif

@@ -1,0 +1,12 @@
+date=2026-04-26T17:00:11+08:00
+cuda_home=/usr/local/cuda-12.6
+nvcc=/usr/local/cuda-12.6/bin/nvcc
+cuda_visible_devices=0
+gpu_device_index=0
+peak_tflops_ref=15.7
+warmup=100
+iters=1000
+dims=256 512 1024 2048
+0, Tesla V100-SXM2-32GB, 32768 MiB, 560.28.03
+1, Tesla V100-SXM2-32GB, 32768 MiB, 560.28.03
+2, Tesla V100-SXM2-32GB, 32768 MiB, 560.28.03

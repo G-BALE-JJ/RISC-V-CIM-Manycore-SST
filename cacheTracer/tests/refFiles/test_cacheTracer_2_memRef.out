@@ -1,0 +1,248 @@
+NB: Addr: 0x15280 timestamp: 29 Cmd: 1 ID: 13-0 ResponseID: 0--1 @14 ns
+NB: Addr: 0x57172 timestamp: 29 Cmd: 1 ID: 14-0 ResponseID: 0--1 @14 ns
+NB: Addr: 0x17980 timestamp: 38 Cmd: 2 ID: 15-0 ResponseID: 0--1 @19 ns
+NB: Addr: 0x84232 timestamp: 39 Cmd: 2 ID: 16-0 ResponseID: 0--1 @19 ns
+NB: Addr: 0x39652 timestamp: 39 Cmd: 1 ID: 17-0 ResponseID: 0--1 @19 ns
+NB: Addr: 0x82216 timestamp: 43 Cmd: 1 ID: 18-0 ResponseID: 0--1 @21 ns
+NB: Addr: 0x19264 timestamp: 49 Cmd: 1 ID: 19-0 ResponseID: 0--1 @24 ns
+NB: Addr: 0x53144 timestamp: 50 Cmd: 1 ID: 20-0 ResponseID: 0--1 @25 ns
+NB: Addr: 0x40272 timestamp: 57 Cmd: 2 ID: 21-0 ResponseID: 0--1 @28 ns
+NB: Addr: 0x28284 timestamp: 58 Cmd: 2 ID: 22-0 ResponseID: 0--1 @29 ns
+NB: Addr: 0x92844 timestamp: 60 Cmd: 1 ID: 23-0 ResponseID: 0--1 @30 ns
+NB: Addr: 0x96388 timestamp: 62 Cmd: 1 ID: 24-0 ResponseID: 0--1 @31 ns
+NB: Addr: 0x55392 timestamp: 63 Cmd: 1 ID: 25-0 ResponseID: 0--1 @31 ns
+NB: Addr: 0x43632 timestamp: 67 Cmd: 1 ID: 26-0 ResponseID: 0--1 @33 ns
+NB: Addr: 0x42872 timestamp: 68 Cmd: 2 ID: 27-0 ResponseID: 0--1 @34 ns
+NB: Addr: 0x100212 timestamp: 74 Cmd: 1 ID: 28-0 ResponseID: 0--1 @37 ns
+SB: Addr: 0x15280 timestamp: 231 Cmd: 9 ID: 13-0 ResponseID: 13-0 @115 ns
+SB: Addr: 0x57172 timestamp: 232 Cmd: 9 ID: 14-0 ResponseID: 14-0 @116 ns
+SB: Addr: 0x17980 timestamp: 240 Cmd: 9 ID: 15-0 ResponseID: 15-0 @120 ns
+SB: Addr: 0x84232 timestamp: 241 Cmd: 9 ID: 16-0 ResponseID: 16-0 @120 ns
+SB: Addr: 0x39652 timestamp: 242 Cmd: 9 ID: 17-0 ResponseID: 17-0 @121 ns
+SB: Addr: 0x82216 timestamp: 245 Cmd: 9 ID: 18-0 ResponseID: 18-0 @122 ns
+SB: Addr: 0x19264 timestamp: 251 Cmd: 9 ID: 19-0 ResponseID: 19-0 @125 ns
+SB: Addr: 0x53144 timestamp: 252 Cmd: 9 ID: 20-0 ResponseID: 20-0 @126 ns
+SB: Addr: 0x40272 timestamp: 259 Cmd: 9 ID: 21-0 ResponseID: 21-0 @129 ns
+SB: Addr: 0x28284 timestamp: 260 Cmd: 9 ID: 22-0 ResponseID: 22-0 @130 ns
+SB: Addr: 0x92844 timestamp: 262 Cmd: 9 ID: 23-0 ResponseID: 23-0 @131 ns
+SB: Addr: 0x96388 timestamp: 264 Cmd: 9 ID: 24-0 ResponseID: 24-0 @132 ns
+SB: Addr: 0x55392 timestamp: 265 Cmd: 9 ID: 25-0 ResponseID: 25-0 @132 ns
+SB: Addr: 0x43632 timestamp: 269 Cmd: 9 ID: 26-0 ResponseID: 26-0 @134 ns
+SB: Addr: 0x42872 timestamp: 270 Cmd: 9 ID: 27-0 ResponseID: 27-0 @135 ns
+NB: Addr: 0x50608 timestamp: 272 Cmd: 1 ID: 29-0 ResponseID: 0--1 @136 ns
+NB: Addr: 0x87912 timestamp: 274 Cmd: 1 ID: 30-0 ResponseID: 0--1 @137 ns
+SB: Addr: 0x100212 timestamp: 276 Cmd: 9 ID: 28-0 ResponseID: 28-0 @138 ns
+NB: Addr: 0x91744 timestamp: 286 Cmd: 2 ID: 32-0 ResponseID: 0--1 @143 ns
+NB: Addr: 0x85524 timestamp: 286 Cmd: 2 ID: 33-0 ResponseID: 0--1 @143 ns
+NB: Addr: 0x26104 timestamp: 294 Cmd: 1 ID: 34-0 ResponseID: 0--1 @147 ns
+NB: Addr: 0x54980 timestamp: 296 Cmd: 2 ID: 35-0 ResponseID: 0--1 @148 ns
+NB: Addr: 0x39252 timestamp: 296 Cmd: 2 ID: 36-0 ResponseID: 0--1 @148 ns
+NB: Addr: 0x79856 timestamp: 297 Cmd: 1 ID: 37-0 ResponseID: 0--1 @148 ns
+NB: Addr: 0x71956 timestamp: 300 Cmd: 2 ID: 38-0 ResponseID: 0--1 @150 ns
+NB: Addr: 0x52152 timestamp: 323 Cmd: 1 ID: 39-0 ResponseID: 0--1 @161 ns
+NB: Addr: 0x25688 timestamp: 327 Cmd: 1 ID: 40-0 ResponseID: 0--1 @163 ns
+NB: Addr: 0x78888 timestamp: 327 Cmd: 2 ID: 41-0 ResponseID: 0--1 @163 ns
+NB: Addr: 0x17404 timestamp: 328 Cmd: 1 ID: 42-0 ResponseID: 0--1 @164 ns
+NB: Addr: 0x31604 timestamp: 330 Cmd: 1 ID: 43-0 ResponseID: 0--1 @165 ns
+NB: Addr: 0x196 timestamp: 330 Cmd: 2 ID: 44-0 ResponseID: 0--1 @165 ns
+NB: Addr: 0x15676 timestamp: 332 Cmd: 1 ID: 46-0 ResponseID: 0--1 @166 ns
+SB: Addr: 0x50608 timestamp: 474 Cmd: 9 ID: 29-0 ResponseID: 29-0 @237 ns
+SB: Addr: 0x87912 timestamp: 476 Cmd: 9 ID: 30-0 ResponseID: 30-0 @238 ns
+SB: Addr: 0x91744 timestamp: 488 Cmd: 9 ID: 32-0 ResponseID: 32-0 @244 ns
+SB: Addr: 0x85524 timestamp: 489 Cmd: 9 ID: 33-0 ResponseID: 33-0 @244 ns
+SB: Addr: 0x26104 timestamp: 496 Cmd: 9 ID: 34-0 ResponseID: 34-0 @248 ns
+SB: Addr: 0x54980 timestamp: 498 Cmd: 9 ID: 35-0 ResponseID: 35-0 @249 ns
+SB: Addr: 0x39252 timestamp: 499 Cmd: 9 ID: 36-0 ResponseID: 36-0 @249 ns
+SB: Addr: 0x79856 timestamp: 500 Cmd: 9 ID: 37-0 ResponseID: 37-0 @250 ns
+SB: Addr: 0x71956 timestamp: 502 Cmd: 9 ID: 38-0 ResponseID: 38-0 @251 ns
+NB: Addr: 0x38572 timestamp: 516 Cmd: 1 ID: 47-0 ResponseID: 0--1 @258 ns
+NB: Addr: 0x96028 timestamp: 524 Cmd: 2 ID: 48-0 ResponseID: 0--1 @262 ns
+SB: Addr: 0x52152 timestamp: 525 Cmd: 9 ID: 39-0 ResponseID: 39-0 @262 ns
+SB: Addr: 0x25688 timestamp: 529 Cmd: 9 ID: 40-0 ResponseID: 40-0 @264 ns
+SB: Addr: 0x78888 timestamp: 530 Cmd: 9 ID: 41-0 ResponseID: 41-0 @265 ns
+SB: Addr: 0x17404 timestamp: 531 Cmd: 9 ID: 42-0 ResponseID: 42-0 @265 ns
+SB: Addr: 0x31604 timestamp: 532 Cmd: 9 ID: 43-0 ResponseID: 43-0 @266 ns
+SB: Addr: 0x196 timestamp: 533 Cmd: 9 ID: 44-0 ResponseID: 44-0 @266 ns
+SB: Addr: 0x15676 timestamp: 534 Cmd: 9 ID: 46-0 ResponseID: 46-0 @267 ns
+NB: Addr: 0x19908 timestamp: 538 Cmd: 1 ID: 49-0 ResponseID: 0--1 @269 ns
+NB: Addr: 0x76780 timestamp: 538 Cmd: 2 ID: 50-0 ResponseID: 0--1 @269 ns
+NB: Addr: 0x57120 timestamp: 551 Cmd: 1 ID: 51-0 ResponseID: 0--1 @275 ns
+NB: Addr: 0x7764 timestamp: 551 Cmd: 1 ID: 52-0 ResponseID: 0--1 @275 ns
+NB: Addr: 0x87988 timestamp: 554 Cmd: 1 ID: 54-0 ResponseID: 0--1 @277 ns
+NB: Addr: 0x62740 timestamp: 572 Cmd: 2 ID: 56-0 ResponseID: 0--1 @286 ns
+NB: Addr: 0x64844 timestamp: 572 Cmd: 1 ID: 57-0 ResponseID: 0--1 @286 ns
+NB: Addr: 0x52068 timestamp: 595 Cmd: 2 ID: 59-0 ResponseID: 0--1 @297 ns
+NB: Addr: 0x88876 timestamp: 595 Cmd: 1 ID: 60-0 ResponseID: 0--1 @297 ns
+NB: Addr: 0x68700 timestamp: 597 Cmd: 2 ID: 62-0 ResponseID: 0--1 @298 ns
+NB: Addr: 0x55140 timestamp: 601 Cmd: 1 ID: 63-0 ResponseID: 0--1 @300 ns
+NB: Addr: 0x91156 timestamp: 602 Cmd: 1 ID: 64-0 ResponseID: 0--1 @301 ns
+NB: Addr: 0x81372 timestamp: 620 Cmd: 2 ID: 66-0 ResponseID: 0--1 @310 ns
+NB: Addr: 0x64308 timestamp: 620 Cmd: 1 ID: 67-0 ResponseID: 0--1 @310 ns
+SB: Addr: 0x38572 timestamp: 718 Cmd: 9 ID: 47-0 ResponseID: 47-0 @359 ns
+SB: Addr: 0x96028 timestamp: 726 Cmd: 9 ID: 48-0 ResponseID: 48-0 @363 ns
+SB: Addr: 0x19908 timestamp: 740 Cmd: 9 ID: 49-0 ResponseID: 49-0 @370 ns
+SB: Addr: 0x76780 timestamp: 741 Cmd: 9 ID: 50-0 ResponseID: 50-0 @370 ns
+SB: Addr: 0x57120 timestamp: 753 Cmd: 9 ID: 51-0 ResponseID: 51-0 @376 ns
+SB: Addr: 0x7764 timestamp: 754 Cmd: 9 ID: 52-0 ResponseID: 52-0 @377 ns
+SB: Addr: 0x87988 timestamp: 756 Cmd: 9 ID: 54-0 ResponseID: 54-0 @378 ns
+NB: Addr: 0x96124 timestamp: 765 Cmd: 1 ID: 68-0 ResponseID: 0--1 @382 ns
+NB: Addr: 0x90216 timestamp: 771 Cmd: 2 ID: 70-0 ResponseID: 0--1 @385 ns
+SB: Addr: 0x62740 timestamp: 774 Cmd: 9 ID: 56-0 ResponseID: 56-0 @387 ns
+SB: Addr: 0x64844 timestamp: 775 Cmd: 9 ID: 57-0 ResponseID: 57-0 @387 ns
+NB: Addr: 0x76232 timestamp: 793 Cmd: 2 ID: 71-0 ResponseID: 0--1 @396 ns
+NB: Addr: 0x81904 timestamp: 793 Cmd: 2 ID: 72-0 ResponseID: 0--1 @396 ns
+SB: Addr: 0x52068 timestamp: 797 Cmd: 9 ID: 59-0 ResponseID: 59-0 @398 ns
+SB: Addr: 0x88876 timestamp: 798 Cmd: 9 ID: 60-0 ResponseID: 60-0 @399 ns
+NB: Addr: 0x100752 timestamp: 799 Cmd: 1 ID: 73-0 ResponseID: 0--1 @399 ns
+SB: Addr: 0x68700 timestamp: 799 Cmd: 9 ID: 62-0 ResponseID: 62-0 @399 ns
+SB: Addr: 0x55140 timestamp: 803 Cmd: 9 ID: 63-0 ResponseID: 63-0 @401 ns
+NB: Addr: 0x2476 timestamp: 804 Cmd: 2 ID: 74-0 ResponseID: 0--1 @402 ns
+SB: Addr: 0x91156 timestamp: 804 Cmd: 9 ID: 64-0 ResponseID: 64-0 @402 ns
+NB: Addr: 0x88752 timestamp: 809 Cmd: 1 ID: 75-0 ResponseID: 0--1 @404 ns
+NB: Addr: 0x58056 timestamp: 821 Cmd: 1 ID: 76-0 ResponseID: 0--1 @410 ns
+SB: Addr: 0x81372 timestamp: 822 Cmd: 9 ID: 66-0 ResponseID: 66-0 @411 ns
+SB: Addr: 0x64308 timestamp: 823 Cmd: 9 ID: 67-0 ResponseID: 67-0 @411 ns
+NB: Addr: 0x84416 timestamp: 824 Cmd: 1 ID: 77-0 ResponseID: 0--1 @412 ns
+NB: Addr: 0x23076 timestamp: 844 Cmd: 1 ID: 79-0 ResponseID: 0--1 @422 ns
+NB: Addr: 0x56608 timestamp: 844 Cmd: 1 ID: 80-0 ResponseID: 0--1 @422 ns
+NB: Addr: 0x101428 timestamp: 847 Cmd: 1 ID: 82-0 ResponseID: 0--1 @423 ns
+NB: Addr: 0x26156 timestamp: 848 Cmd: 2 ID: 83-0 ResponseID: 0--1 @424 ns
+NB: Addr: 0x67752 timestamp: 849 Cmd: 1 ID: 84-0 ResponseID: 0--1 @424 ns
+NB: Addr: 0x69808 timestamp: 868 Cmd: 2 ID: 85-0 ResponseID: 0--1 @434 ns
+NB: Addr: 0x18988 timestamp: 873 Cmd: 1 ID: 86-0 ResponseID: 0--1 @436 ns
+SB: Addr: 0x96124 timestamp: 967 Cmd: 9 ID: 68-0 ResponseID: 68-0 @483 ns
+SB: Addr: 0x90216 timestamp: 973 Cmd: 9 ID: 70-0 ResponseID: 70-0 @486 ns
+SB: Addr: 0x76232 timestamp: 995 Cmd: 9 ID: 71-0 ResponseID: 71-0 @497 ns
+SB: Addr: 0x81904 timestamp: 996 Cmd: 9 ID: 72-0 ResponseID: 72-0 @498 ns
+SB: Addr: 0x100752 timestamp: 1001 Cmd: 9 ID: 73-0 ResponseID: 73-0 @500 ns
+SB: Addr: 0x2476 timestamp: 1006 Cmd: 9 ID: 74-0 ResponseID: 74-0 @503 ns
+NB: Addr: 0x30500 timestamp: 1010 Cmd: 2 ID: 88-0 ResponseID: 0--1 @505 ns
+SB: Addr: 0x88752 timestamp: 1011 Cmd: 9 ID: 75-0 ResponseID: 75-0 @505 ns
+NB: Addr: 0x15764 timestamp: 1016 Cmd: 2 ID: 90-0 ResponseID: 0--1 @508 ns
+SB: Addr: 0x58056 timestamp: 1023 Cmd: 9 ID: 76-0 ResponseID: 76-0 @511 ns
+SB: Addr: 0x84416 timestamp: 1026 Cmd: 9 ID: 77-0 ResponseID: 77-0 @513 ns
+SB: Addr: 0x23076 timestamp: 1046 Cmd: 9 ID: 79-0 ResponseID: 79-0 @523 ns
+SB: Addr: 0x56608 timestamp: 1047 Cmd: 9 ID: 80-0 ResponseID: 80-0 @523 ns
+SB: Addr: 0x101428 timestamp: 1049 Cmd: 9 ID: 82-0 ResponseID: 82-0 @524 ns
+SB: Addr: 0x26156 timestamp: 1050 Cmd: 9 ID: 83-0 ResponseID: 83-0 @525 ns
+SB: Addr: 0x67752 timestamp: 1051 Cmd: 9 ID: 84-0 ResponseID: 84-0 @525 ns
+NB: Addr: 0x13792 timestamp: 1060 Cmd: 2 ID: 91-0 ResponseID: 0--1 @530 ns
+NB: Addr: 0x15844 timestamp: 1060 Cmd: 1 ID: 92-0 ResponseID: 0--1 @530 ns
+NB: Addr: 0x81980 timestamp: 1061 Cmd: 2 ID: 93-0 ResponseID: 0--1 @530 ns
+NB: Addr: 0x92272 timestamp: 1062 Cmd: 2 ID: 97-0 ResponseID: 0--1 @531 ns
+NB: Addr: 0x21232 timestamp: 1064 Cmd: 1 ID: 99-0 ResponseID: 0--1 @532 ns
+NB: Addr: 0x27436 timestamp: 1068 Cmd: 1 ID: 100-0 ResponseID: 0--1 @534 ns
+NB: Addr: 0x89084 timestamp: 1069 Cmd: 1 ID: 101-0 ResponseID: 0--1 @534 ns
+SB: Addr: 0x69808 timestamp: 1070 Cmd: 9 ID: 85-0 ResponseID: 85-0 @535 ns
+SB: Addr: 0x18988 timestamp: 1075 Cmd: 9 ID: 86-0 ResponseID: 86-0 @537 ns
+NB: Addr: 0x52492 timestamp: 1098 Cmd: 1 ID: 104-0 ResponseID: 0--1 @549 ns
+NB: Addr: 0x91708 timestamp: 1105 Cmd: 2 ID: 107-0 ResponseID: 0--1 @552 ns
+NB: Addr: 0x69904 timestamp: 1116 Cmd: 1 ID: 109-0 ResponseID: 0--1 @558 ns
+NB: Addr: 0x33260 timestamp: 1121 Cmd: 2 ID: 111-0 ResponseID: 0--1 @560 ns
+NB: Addr: 0x79772 timestamp: 1124 Cmd: 1 ID: 113-0 ResponseID: 0--1 @562 ns
+NB: Addr: 0x10476 timestamp: 1124 Cmd: 1 ID: 114-0 ResponseID: 0--1 @562 ns
+NB: Addr: 0x19552 timestamp: 1127 Cmd: 1 ID: 116-0 ResponseID: 0--1 @563 ns
+SB: Addr: 0x30500 timestamp: 1212 Cmd: 9 ID: 88-0 ResponseID: 88-0 @606 ns
+SB: Addr: 0x15764 timestamp: 1218 Cmd: 9 ID: 90-0 ResponseID: 90-0 @609 ns
+NB: Addr: 0x94868 timestamp: 1255 Cmd: 2 ID: 118-0 ResponseID: 0--1 @627 ns
+NB: Addr: 0x29840 timestamp: 1261 Cmd: 1 ID: 119-0 ResponseID: 0--1 @630 ns
+SB: Addr: 0x13792 timestamp: 1262 Cmd: 9 ID: 91-0 ResponseID: 91-0 @631 ns
+SB: Addr: 0x15844 timestamp: 1263 Cmd: 9 ID: 92-0 ResponseID: 92-0 @631 ns
+SB: Addr: 0x81980 timestamp: 1264 Cmd: 9 ID: 93-0 ResponseID: 93-0 @632 ns
+SB: Addr: 0x92272 timestamp: 1265 Cmd: 9 ID: 97-0 ResponseID: 97-0 @632 ns
+SB: Addr: 0x21232 timestamp: 1266 Cmd: 9 ID: 99-0 ResponseID: 99-0 @633 ns
+SB: Addr: 0x27436 timestamp: 1270 Cmd: 9 ID: 100-0 ResponseID: 100-0 @635 ns
+SB: Addr: 0x89084 timestamp: 1271 Cmd: 9 ID: 101-0 ResponseID: 101-0 @635 ns
+SB: Addr: 0x52492 timestamp: 1300 Cmd: 9 ID: 104-0 ResponseID: 104-0 @650 ns
+NB: Addr: 0x18216 timestamp: 1307 Cmd: 2 ID: 120-0 ResponseID: 0--1 @653 ns
+NB: Addr: 0x71272 timestamp: 1307 Cmd: 1 ID: 121-0 ResponseID: 0--1 @653 ns
+SB: Addr: 0x91708 timestamp: 1307 Cmd: 9 ID: 107-0 ResponseID: 107-0 @653 ns
+NB: Addr: 0x55064 timestamp: 1316 Cmd: 1 ID: 126-0 ResponseID: 0--1 @658 ns
+NB: Addr: 0x96368 timestamp: 1316 Cmd: 1 ID: 127-0 ResponseID: 0--1 @658 ns
+NB: Addr: 0x56320 timestamp: 1318 Cmd: 1 ID: 130-0 ResponseID: 0--1 @659 ns
+SB: Addr: 0x69904 timestamp: 1318 Cmd: 9 ID: 109-0 ResponseID: 109-0 @659 ns
+SB: Addr: 0x33260 timestamp: 1323 Cmd: 9 ID: 111-0 ResponseID: 111-0 @661 ns
+SB: Addr: 0x79772 timestamp: 1326 Cmd: 9 ID: 113-0 ResponseID: 113-0 @663 ns
+NB: Addr: 0x73212 timestamp: 1327 Cmd: 1 ID: 132-0 ResponseID: 0--1 @663 ns
+SB: Addr: 0x10476 timestamp: 1327 Cmd: 9 ID: 114-0 ResponseID: 114-0 @663 ns
+SB: Addr: 0x19552 timestamp: 1329 Cmd: 9 ID: 116-0 ResponseID: 116-0 @664 ns
+NB: Addr: 0x81768 timestamp: 1341 Cmd: 1 ID: 134-0 ResponseID: 0--1 @670 ns
+NB: Addr: 0x55976 timestamp: 1346 Cmd: 2 ID: 136-0 ResponseID: 0--1 @673 ns
+NB: Addr: 0x7052 timestamp: 1348 Cmd: 2 ID: 138-0 ResponseID: 0--1 @674 ns
+NB: Addr: 0x82148 timestamp: 1359 Cmd: 1 ID: 140-0 ResponseID: 0--1 @679 ns
+NB: Addr: 0x46160 timestamp: 1367 Cmd: 1 ID: 141-0 ResponseID: 0--1 @683 ns
+NB: Addr: 0x4336 timestamp: 1367 Cmd: 1 ID: 142-0 ResponseID: 0--1 @683 ns
+NB: Addr: 0x45196 timestamp: 1369 Cmd: 1 ID: 144-0 ResponseID: 0--1 @684 ns
+SB: Addr: 0x94868 timestamp: 1457 Cmd: 9 ID: 118-0 ResponseID: 118-0 @728 ns
+SB: Addr: 0x29840 timestamp: 1463 Cmd: 9 ID: 119-0 ResponseID: 119-0 @731 ns
+SB: Addr: 0x18216 timestamp: 1509 Cmd: 9 ID: 120-0 ResponseID: 120-0 @754 ns
+SB: Addr: 0x71272 timestamp: 1510 Cmd: 9 ID: 121-0 ResponseID: 121-0 @755 ns
+SB: Addr: 0x55064 timestamp: 1518 Cmd: 9 ID: 126-0 ResponseID: 126-0 @759 ns
+SB: Addr: 0x96368 timestamp: 1519 Cmd: 9 ID: 127-0 ResponseID: 127-0 @759 ns
+SB: Addr: 0x56320 timestamp: 1520 Cmd: 9 ID: 130-0 ResponseID: 130-0 @760 ns
+SB: Addr: 0x73212 timestamp: 1529 Cmd: 9 ID: 132-0 ResponseID: 132-0 @764 ns
+SB: Addr: 0x81768 timestamp: 1543 Cmd: 9 ID: 134-0 ResponseID: 134-0 @771 ns
+SB: Addr: 0x55976 timestamp: 1548 Cmd: 9 ID: 136-0 ResponseID: 136-0 @774 ns
+SB: Addr: 0x7052 timestamp: 1550 Cmd: 9 ID: 138-0 ResponseID: 138-0 @775 ns
+SB: Addr: 0x82148 timestamp: 1561 Cmd: 9 ID: 140-0 ResponseID: 140-0 @780 ns
+SB: Addr: 0x46160 timestamp: 1569 Cmd: 9 ID: 141-0 ResponseID: 141-0 @784 ns
+SB: Addr: 0x4336 timestamp: 1570 Cmd: 9 ID: 142-0 ResponseID: 142-0 @785 ns
+SB: Addr: 0x45196 timestamp: 1571 Cmd: 9 ID: 144-0 ResponseID: 144-0 @785 ns
+FINAL STATS:
+-----------------------------------------------------------------
+- Events at NorthBus                 : 95
+- Events at SouthBus                 : 95
+- Total Events                       : 190
+-----------------------------------------------------------------
+
+Address Histogram:
+-----------------------------------------------------------------
+Address_Range: Count
+- [0-4095]: 2
+- [4096-8191]: 3
+- [8192-12287]: 1
+- [12288-16383]: 5
+- [16384-20479]: 7
+- [20480-24575]: 2
+- [24576-28671]: 5
+- [28672-32767]: 3
+- [32768-36863]: 1
+- [36864-40959]: 4
+- [40960-45055]: 2
+- [45056-49151]: 2
+- [49152-53247]: 5
+- [53248-57343]: 9
+- [57344-61439]: 1
+- [61440-65535]: 3
+- [65536-69631]: 2
+- [69632-73727]: 5
+- [73728-77823]: 2
+- [77824-81919]: 6
+- [81920-86015]: 6
+- [86016-90111]: 5
+- [90112-94207]: 6
+- [94208-98303]: 5
+- [98304-102399]: 3
+-----------------------------------------------------------------
+- Total_Events_Address: 95
+-----------------------------------------------------------------
+
+Access Latency Distribution (ns):
+-----------------------------------------------------------------
+Min-Latency(ns): 101  Max-Latency(ns): 102  #Bins: 10
+-----------------------------------------------------------------
+Latency Range(ns): Count
+- [0-10]: 0
+- [11-21]: 0
+- [22-32]: 0
+- [33-43]: 0
+- [44-54]: 0
+- [55-65]: 0
+- [66-76]: 0
+- [77-87]: 0
+- [88-98]: 0
+- [99-109]: 95
+-----------------------------------------------------------------
+- Total_Events_Latency: 95
+-----------------------------------------------------------------
+

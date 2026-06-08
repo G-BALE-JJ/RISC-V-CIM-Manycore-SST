@@ -1,0 +1,74 @@
+@startuml
+skinparam backgroundColor white
+skinparam packageStyle rectangle
+skinparam shadowing false
+skinparam defaultTextAlignment center
+skinparam ArrowThickness 1.2
+skinparam rectangle {
+  BorderColor #333333
+}
+
+title Single-Node Heterogeneous Microarchitecture (Vanadis + RoCC + Golem)
+
+rectangle "L1. Application / Runtime Layer" as L1 {
+  rectangle "Test Program / Matmul Runtime" as APP
+  rectangle "Golem Custom ISA Calls\nmvm.*, remote.*, mm2gm/gm2mm, reg2gm/gm2reg" as ISA
+  APP --> ISA
+}
+
+rectangle "L2. Compute Layer" as L2 {
+  package "Vanadis Core (Deep Microarchitecture)" as VAN {
+    rectangle "Instruction Fetch" as IF
+    rectangle "Decoder\nVanadisRISCV64Decoder\nuop/predecode cache" as DEC
+    rectangle "Branch Unit" as BR
+    rectangle "OoO Engine\nROB / Issue / Retire" as OOO
+    rectangle "LSQ" as LSQ
+    rectangle "ITLB + DTLB" as TLB
+    rectangle "L1I / L1D" as L1C
+    rectangle "L2 Cache" as L2C
+    rectangle "MemNIC (CPU side)" as NICCPU
+
+    IF --> DEC --> OOO
+    BR --> OOO
+    OOO --> LSQ
+    OOO --> TLB
+    TLB --> L1C --> L2C --> NICCPU
+  }
+
+  package "RoCC + Golem Accelerator" as ACC {
+    rectangle "RoCC Controller\ncmd/resp + opcode decode\nremote length + output mode" as ROCC
+    rectangle "Golem Compute Array\nMVMIntArray / MVMFloatArray\nnumArrays, in/out size, CU model" as CA
+    rectangle "Golem Memory Array (GlobalMemory)\nper-core GM window\nDMA + retry/inflight + link buffer" as MA
+
+    ROCC --> CA
+    ROCC --> MA
+  }
+
+  VAN <--> ROCC : RoCC interface
+}
+
+rectangle "L3. On-Chip Interconnect Layer" as L3 {
+  rectangle "Mesh NoC Routers" as NOC
+  rectangle "Optional ctrl/scheduler direct links" as CTRL
+  NOC -- CTRL
+}
+
+rectangle "L4. Memory System Layer" as L4 {
+  rectangle "Directory Controllers" as DIR
+  rectangle "Memory Controllers" as MEMC
+  rectangle "DRAMSim3 / HBM Backing" as HBM
+  DIR --> MEMC --> HBM
+}
+
+ISA --> ROCC
+NICCPU --> NOC
+MA --> NOC
+NOC --> DIR
+
+legend right
+  Role-agnostic single-node view
+  No worker/manager split
+  Vanadis expanded to microarchitecture blocks
+endlegend
+
+@enduml

@@ -1,0 +1,66 @@
+<?xml version="1.0"?>
+
+<sdl version="2.0"/>
+
+<config>
+    run-mode=both
+</config>
+
+<param_include>
+  <rtr_params>
+    <num_ports>  3   </num_ports>
+    <link_bw>   4GB/s </link_bw>
+    <flit_size> 4B </flit_size>
+    <xbar_bw>   4.5GB/s </xbar_bw>
+    <input_latency>   10ns </input_latency>
+    <output_latency>  2ns </output_latency>
+    <topology> merlin.torus </topology>
+    <input_buf_size>  3200B </input_buf_size>
+    <output_buf_size> 3200B  </output_buf_size>
+    <torus:shape> 2 </torus:shape>
+  </rtr_params>
+
+  <nic_params>
+    <num_vns>    2   </num_vns>
+    <link_bw>  4GB/s  </link_bw>
+    <packet_size> 16B  </packet_size>
+    <packets_to_send> 1000 </packets_to_send>
+    <buffer_size> 3200B </buffer_size>
+  </nic_params>
+</param_include>
+
+<sst>
+    <component name=0.rtr type=merlin.hr_router >
+        <params include=rtr_params>
+            <id> 0 </id>
+        </params>
+        <link name=link_0_1 port=port0 latency=10ns/>
+        <link name=link_1_0 port=port1 latency=10ns/>
+        <link name=nic0 port=port2 latency=10ns/>
+    </component>
+
+    <component name=0.nic type=merlin.pt2pt_test >
+        <params include=nic_params>
+            <id> 0 </id>
+        </params>
+        <link name=nic0 port=rtr latency=10ns/>
+    </component>
+
+    <component name=1.rtr type=merlin.hr_router >
+        <params include=rtr_params>
+            <id> 1 </id>
+        </params>
+        <link name=link_1_0 port=port0 latency=10ns/>
+        <link name=link_0_1 port=port1 latency=10ns/>
+        <link name=nic1 port=port2 latency=10ns/>
+    </component>
+
+    <component name=1.nic type=merlin.pt2pt_test >
+        <params include=nic_params>
+            <id> 1 </id>
+        </params>
+        <link name=nic1 port=rtr latency=10ns/>
+    </component>
+
+
+</sst>
