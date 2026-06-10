@@ -3,12 +3,12 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ARTIFACT_ROOT="${GOLEM_ARTIFACT_ROOT:-$SCRIPT_DIR/artifacts}"
-SWEEP_ROOT="${GOLEM_SWEEP_ROOT:-$ARTIFACT_ROOT/stats/sweeps/flow_control_4x4_bk128}"
+SWEEP_ROOT="${GOLEM_SWEEP_ROOT:-$ARTIFACT_ROOT/stats/sweeps/flow_control_4x4_bk64}"
 SWEEP_TAG="${GOLEM_SWEEP_TAG:-$(date +%Y%m%d_%H%M%S)}"
 SWEEP_RUN_DIR="${GOLEM_SWEEP_RUN_DIR:-$SWEEP_ROOT/run_$SWEEP_TAG}"
 RUN_SUMMARY_CSV="$SWEEP_RUN_DIR/run_summary.csv"
 STATUS_RAW_CSV="$SWEEP_RUN_DIR/flow_control_status_raw.csv"
-SWEEP_CSV="$SWEEP_RUN_DIR/flow_control_sweep_4x4_bk128.csv"
+SWEEP_CSV="$SWEEP_RUN_DIR/flow_control_sweep_4x4_bk64.csv"
 PLOTS_DIR="$SWEEP_RUN_DIR/plots"
 
 mkdir -p "$SWEEP_RUN_DIR" "$PLOTS_DIR"
@@ -16,25 +16,24 @@ mkdir -p "$SWEEP_RUN_DIR" "$PLOTS_DIR"
 GEMM_M="${GOLEM_SWEEP_GEMM_M:-1024}"
 GEMM_N="${GOLEM_SWEEP_GEMM_N:-1024}"
 GEMM_K="${GOLEM_SWEEP_GEMM_K:-1024}"
-BLOCK_K="${GOLEM_SWEEP_GEMM_BLOCK_K:-128}"
+BLOCK_K="${GOLEM_SWEEP_GEMM_BLOCK_K:-64}"
 RUN_TIMEOUT="${GOLEM_SWEEP_TIMEOUT:-300s}"
 BASE_NODE_CREDITS="${GOLEM_FLOW_BASE_NODE_CHUNK_CREDITS:-84}"
-BASE_PREFETCH_DEPTH="${GOLEM_FLOW_BASE_PREFETCH_DEPTH:-8}"
+BASE_WCP_PREFETCH_WINDOWS="${GOLEM_FLOW_BASE_WCP_PREFETCH_WINDOWS:-2}"
 NODE_CREDITS_SET=(${GOLEM_FLOW_NODE_CREDITS_SET:-32 48 64 82 84 96 128 256})
-PREFETCH_SET=(${GOLEM_FLOW_PREFETCH_DEPTH_SET:-2 4 8 16})
+WCP_PREFETCH_SET=(${GOLEM_FLOW_WCP_PREFETCH_WINDOWS_SET:-1 2 3})
 
-printf 'run_order,phase,label,dma_partial_credit_enable,dma_node_chunk_credits,dma_prefetch_depth,status,exit_code\n' > "$STATUS_RAW_CSV"
+printf 'run_order,phase,label,dma_node_chunk_credits,wcp_prefetch_windows,status,exit_code\n' > "$STATUS_RAW_CSV"
 
 run_order=0
 run_case() {
   local phase="$1"
   local label="$2"
-  local partial_credit="$3"
-  local node_credits="$4"
-  local prefetch_depth="$5"
+  local node_credits="$3"
+  local wcp_prefetch_windows="$4"
 
   run_order=$((run_order + 1))
-  echo "[SWEEP] phase=${phase} label=${label} partial=${partial_credit} node_chunk_credits=${node_credits} prefetch_depth=${prefetch_depth}"
+  echo "[SWEEP] phase=${phase} label=${label} node_chunk_credits=${node_credits} wcp_prefetch_windows=${wcp_prefetch_windows}"
   set +e
   GOLEM_RUN_SUMMARY_CSV="$RUN_SUMMARY_CSV" \
   GOLEM_GEMM_M="$GEMM_M" \
@@ -43,14 +42,8 @@ run_case() {
   GOLEM_GEMM_BLOCK_K="$BLOCK_K" \
   GOLEM_A_REUSE_N_TILES=4 \
   GOLEM_B_REUSE_M_TILES=4 \
-  GOLEM_WCP_READY_REUSE_QUEUE=0 \
-  GOLEM_WCP_STREAM_KTILE_WINDOWS=0 \
-  GOLEM_DMA_PARTIAL_CREDIT_ENABLE="$partial_credit" \
   GOLEM_DMA_NODE_CHUNK_CREDITS="$node_credits" \
-  GOLEM_DMA_CREDIT_CHUNK_BYTES=8192 \
-  GOLEM_DMA_RESPONSE_CHUNK_BYTES=8192 \
-  GOLEM_DMA_RESPONSE_VN=1 \
-  GOLEM_DMA_PREFETCH_DEPTH="$prefetch_depth" \
+  GOLEM_WCP_PREFETCH_WINDOWS="$wcp_prefetch_windows" \
   timeout "$RUN_TIMEOUT" "$SCRIPT_DIR/run_noc_dma_pipeline.sh"
   rc=$?
   set -e
@@ -62,22 +55,19 @@ run_case() {
   else
     status="FAIL"
   fi
-  printf '%s,%s,%s,%s,%s,%s,%s,%s\n' \
-    "$run_order" "$phase" "$label" "$partial_credit" "$node_credits" "$prefetch_depth" "$status" "$rc" >> "$STATUS_RAW_CSV"
+  printf '%s,%s,%s,%s,%s,%s,%s\n' \
+    "$run_order" "$phase" "$label" "$node_credits" "$wcp_prefetch_windows" "$status" "$rc" >> "$STATUS_RAW_CSV"
   if [[ "$status" != "PASS" ]]; then
     echo "[WARN] label=${label} ended with status=${status} exit_code=${rc}; continuing sweep"
   fi
 }
 
-run_case "partial" "partial_off" 0 "$BASE_NODE_CREDITS" "$BASE_PREFETCH_DEPTH"
-run_case "partial" "partial_on" 1 "$BASE_NODE_CREDITS" "$BASE_PREFETCH_DEPTH"
-
 for credits in "${NODE_CREDITS_SET[@]}"; do
-  run_case "node_credits" "node_${credits}" 1 "$credits" "$BASE_PREFETCH_DEPTH"
+  run_case "node_credits" "node_${credits}" "$credits" "$BASE_WCP_PREFETCH_WINDOWS"
 done
 
-for depth in "${PREFETCH_SET[@]}"; do
-  run_case "prefetch_depth" "prefetch_${depth}" 1 "$BASE_NODE_CREDITS" "$depth"
+for windows in "${WCP_PREFETCH_SET[@]}"; do
+  run_case "wcp_prefetch_windows" "wcp_${windows}" "$BASE_NODE_CREDITS" "$windows"
 done
 
 python3 - "$RUN_SUMMARY_CSV" "$STATUS_RAW_CSV" "$SWEEP_CSV" "$PLOTS_DIR" <<'PY'
@@ -102,8 +92,7 @@ pass_iter = iter(pass_summary_rows)
 
 fieldnames = [
     "run_order", "phase", "label", "status", "exit_code",
-    "dma_partial_credit_enable", "dma_node_chunk_credits", "dma_credit_chunk_bytes",
-    "dma_response_chunk_bytes", "dma_prefetch_depth", "timestamp", "log_file",
+    "dma_node_chunk_credits", "dma_credit_chunk_bytes", "wcp_prefetch_windows", "timestamp", "log_file",
     "gemm_m", "gemm_n", "gemm_k", "block_m", "block_n", "block_k",
     "exec_total_cycles", "speedup_vs_phase_baseline", "exec_array_utilization_pct",
     "exec_breakdown_compute_active_time", "exec_breakdown_prefetch_wait_time",
@@ -130,9 +119,8 @@ for status_row in status_rows:
         "label": status_row.get("label", ""),
         "status": status_row.get("status", ""),
         "exit_code": status_row.get("exit_code", ""),
-        "dma_partial_credit_enable": status_row.get("dma_partial_credit_enable", ""),
         "dma_node_chunk_credits": status_row.get("dma_node_chunk_credits", ""),
-        "dma_prefetch_depth": status_row.get("dma_prefetch_depth", ""),
+        "wcp_prefetch_windows": status_row.get("wcp_prefetch_windows", ""),
         "speedup_vs_phase_baseline": f"{speedup:.6f}" if total_cycles else "",
     }
     for key in fieldnames:
@@ -228,9 +216,8 @@ plt.rcParams.update({
 })
 
 for phase, title, xlabel in [
-    ("partial", "Partial Credit On/Off Ablation", "Partial credit config"),
     ("node_credits", "Node Chunk Credit Budget Sweep", "Node chunk credits"),
-    ("prefetch_depth", "Prefetch Depth Sweep", "Prefetch depth"),
+    ("wcp_prefetch_windows", "WCP Prefetch Window Sweep", "WCP prefetch windows"),
 ]:
     phase_rows = [row for row in records if row["phase"] == phase]
     if phase_rows:

@@ -150,6 +150,7 @@ matmul_dtype = _normalize_matmul_dtype(os.getenv("GOLEM_MATMUL_DTYPE", "int32"))
 rocc_type = os.getenv("GOLEM_ROCC_TYPE", _default_rocc_type(matmul_dtype))
 array_type = os.getenv("GOLEM_ARRAY_TYPE", _default_array_type(matmul_dtype))
 gm_buffer_length = os.getenv("GOLEM_GM_BUFFER_LENGTH", "64KB")
+gm_link_bw = os.getenv("GOLEM_NOC_LINK_BW", "100GB/s")
 gm_dma_max_inflight = int(os.getenv("GOLEM_DMA_MAX_INFLIGHT", "256"))
 gm_dma_retry_ticks = int(os.getenv("GOLEM_DMA_READ_RETRY_TICKS", "96"))
 gm_dma_max_retries = int(os.getenv("GOLEM_DMA_READ_MAX_RETRIES", "8"))
@@ -164,7 +165,6 @@ array_clock = os.getenv("GOLEM_ARRAY_CLOCK", cpu_clock)
 rocc_verbose = int(os.getenv("GOLEM_ROCC_VERBOSE", "0"))
 gm_verbose = int(os.getenv("GOLEM_GM_VERBOSE", "0"))
 gm_dump_data = int(os.getenv("GOLEM_GM_DUMP_DATA", "0"))
-gm_dma_response_chunk_bytes = int(os.getenv("GOLEM_DMA_RESPONSE_CHUNK_BYTES", "0"))
 ctrl_link_enable = int(os.getenv("GOLEM_CTRL_LINK_ENABLE", "0"))
 ctrl_link_latency = os.getenv("GOLEM_CTRL_LINK_LATENCY", "2ns")
 ctrl_link_queue_depth = os.getenv("GOLEM_CTRL_QUEUE_DEPTH", "32")
@@ -183,15 +183,17 @@ request_scheduler_node_credit_chunk_bytes = os.getenv(
     "GOLEM_DMA_CREDIT_CHUNK_BYTES",
     str(gm_dma_burst_bytes),
 )
-request_scheduler_partial_credit_enable = os.getenv("GOLEM_DMA_PARTIAL_CREDIT_ENABLE", "1")
-request_scheduler_prefetch_depth = os.getenv("GOLEM_DMA_PREFETCH_DEPTH", "2")
+request_scheduler_panel_chunk_bytes = os.getenv(
+    "GOLEM_DMA_PANEL_CHUNK_BYTES",
+    request_scheduler_node_credit_chunk_bytes,
+)
+request_scheduler_issue_budget_per_tick = os.getenv(
+    "GOLEM_SCHED_ISSUE_BUDGET_PER_TICK",
+    "2",
+)
+wcp_prefetch_windows = os.getenv("GOLEM_WCP_PREFETCH_WINDOWS", "2")
 request_scheduler_submit_batch_size = os.getenv("GOLEM_SCHED_SUBMIT_BATCH_SIZE", "4")
 request_scheduler_done_batch_size = os.getenv("GOLEM_SCHED_DONE_BATCH_SIZE", "4")
-request_scheduler_issue_budget = os.getenv("GOLEM_SCHED_ISSUE_BUDGET", "4")
-request_scheduler_smooth_enable = os.getenv("GOLEM_SCHED_SMOOTH_ENABLE", "0")
-request_scheduler_smooth_read_bw = os.getenv("GOLEM_SCHED_READ_BW_BYTES_PER_CYCLE", "0")
-request_scheduler_smooth_write_bw = os.getenv("GOLEM_SCHED_WRITE_BW_BYTES_PER_CYCLE", "0")
-request_scheduler_smooth_burst = os.getenv("GOLEM_SCHED_TOKEN_BURST_BYTES", "65536")
 request_scheduler_verbose = os.getenv("GOLEM_REQUEST_SCHEDULER_VERBOSE", "0")
 request_scheduler_trace = os.getenv("GOLEM_REQUEST_SCHEDULER_TRACE", "0")
 worker_command_processor_enable = int(
@@ -226,19 +228,62 @@ matmul_block_m = int(os.getenv("GOLEM_MATMUL_BLOCK_M", str(array_output_size)))
 matmul_block_n = int(os.getenv("GOLEM_MATMUL_BLOCK_N", str(num_arrays)))
 matmul_block_k = int(os.getenv("GOLEM_MATMUL_BLOCK_K", str(array_input_size)))
 matmul_elem_bytes = 4
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return int(raw)
+
+
 request_sched_slot0_bytes = matmul_block_m * matmul_block_k * matmul_elem_bytes
 request_sched_slot1_bytes = matmul_block_n * matmul_block_k * matmul_elem_bytes
 request_sched_credit_chunk_bytes_int = max(1, int(request_scheduler_node_credit_chunk_bytes))
-request_sched_max_transfer_chunks = max(
+request_sched_slot0_chunks = max(
     1,
-    math.ceil(max(request_sched_slot0_bytes, request_sched_slot1_bytes) / request_sched_credit_chunk_bytes_int),
+    math.ceil(request_sched_slot0_bytes / request_sched_credit_chunk_bytes_int),
 )
-if request_scheduler_initial_chunk_credit_env is not None:
+request_sched_slot1_chunks = max(
+    1,
+    math.ceil(request_sched_slot1_bytes / request_sched_credit_chunk_bytes_int),
+)
+request_sched_prefetch_windows = max(1, int(wcp_prefetch_windows))
+request_sched_window_buffers = request_sched_prefetch_windows + 1
+request_sched_window_k_tiles = max(1, _env_int("GOLEM_DMA_WINDOW_K_TILES", 4))
+request_sched_total_k_tiles = max(1, math.ceil(matmul_k / max(1, matmul_block_k)))
+request_sched_resident_k_tiles = min(request_sched_window_k_tiles, request_sched_total_k_tiles)
+request_sched_a_reuse_n = max(1, _env_int("GOLEM_A_REUSE_N_TILES", 1))
+request_sched_b_reuse_m = max(1, _env_int("GOLEM_B_REUSE_M_TILES", 1))
+request_sched_slot_count = max(1, _env_int("GOLEM_DMA_SLOT_COUNT", 2))
+if request_sched_a_reuse_n > 1 and request_sched_b_reuse_m > 1:
+    request_sched_mat_resident_k = request_sched_slot_count // (
+        request_sched_window_buffers * request_sched_b_reuse_m
+    )
+    request_sched_vec_resident_k = request_sched_slot_count // (
+        request_sched_window_buffers * request_sched_a_reuse_n
+    )
+    request_sched_slot_resident_k = min(
+        request_sched_mat_resident_k, request_sched_vec_resident_k
+    )
+    if request_sched_slot_resident_k > 0:
+        request_sched_resident_k_tiles = min(
+            request_sched_resident_k_tiles, request_sched_slot_resident_k
+        )
+request_sched_active_workers = max(1, active_worker_cores)
+request_sched_per_worker_ab_chunks = request_sched_resident_k_tiles * (
+    request_sched_b_reuse_m * request_sched_slot0_chunks
+    + request_sched_a_reuse_n * request_sched_slot1_chunks
+)
+request_sched_derived_node_chunk_credit = (
+    request_sched_active_workers
+    * request_sched_window_buffers
+    * request_sched_per_worker_ab_chunks
+)
+if request_scheduler_initial_chunk_credit_env is not None and request_scheduler_initial_chunk_credit_env.strip() != "":
     request_scheduler_initial_chunk_credit = request_scheduler_initial_chunk_credit_env
 else:
-    request_scheduler_initial_chunk_credit = str(
-        int(request_scheduler_legacy_node_credit_env) * request_sched_max_transfer_chunks
-    )
+    request_scheduler_initial_chunk_credit = str(request_sched_derived_node_chunk_credit)
 
 # Current MAC-array model:
 # - num_cu semantically equals hardware output size
@@ -420,11 +465,19 @@ if verbosity > 0:
     print(f"[GOLEM] RoCC type={rocc_type}")
     print(f"[GOLEM] Array type={array_type}")
     print(f"[GOLEM] GlobalMemory per-core stride={GLOBAL_STRIDE} bytes")
+    print(f"[GOLEM] GlobalMemory link_bw={gm_link_bw}")
     print(f"[GOLEM] GlobalMemory link buffer_length={gm_buffer_length}")
     print(f"[GOLEM] GlobalMemory dma_read_max_inflight={gm_dma_max_inflight}")
     print(f"[GOLEM] GlobalMemory dma_read_retry_ticks={gm_dma_retry_ticks}")
     print(f"[GOLEM] GlobalMemory dma_read_max_retries={gm_dma_max_retries}")
     print(f"[GOLEM] GlobalMemory dma_burst_bytes={gm_dma_burst_bytes}")
+    print(f"[GOLEM] Scheduler panel_chunk_bytes={request_scheduler_panel_chunk_bytes}")
+    print(
+        f"[GOLEM] Scheduler node_chunk_credit={request_scheduler_initial_chunk_credit} "
+        f"(residentK={request_sched_resident_k_tiles}, active_workers={request_sched_active_workers}, "
+        f"window_buffers={request_sched_window_buffers})"
+    )
+    print(f"[GOLEM] Scheduler issue_budget_per_tick={request_scheduler_issue_budget_per_tick}")
     print(f"[GOLEM] GlobalMemory trans_latency={gm_trans_latency}")
     print(
         f"[GOLEM] MVM op latency cycles: gm2imat={mvm_latency_gm2imat}, gm2ivec={mvm_latency_gm2ivec}, ovec2gm={mvm_latency_ovec2gm}"
@@ -622,7 +675,7 @@ class CPU_Builder:
                 "baseAddr": hex(GLOBAL_BASE + cpuId * GLOBAL_STRIDE),
                 "size": hex(GLOBAL_STRIDE),
                 "src_id": cpuId,
-                "link_bw": "100GB/s",  # 增加到 100GB/s 与 NoC 保持一致
+                "link_bw": gm_link_bw,
                 "buffer_length": gm_buffer_length,
                 "num_vns": 3,  # 与 NoC 保持一致
                 "identityWindowBase": hex(SPLIT_BASE),
@@ -630,9 +683,6 @@ class CPU_Builder:
                 "dma_read_retry_ticks": gm_dma_retry_ticks,
                 "dma_read_max_retries": gm_dma_max_retries,
                 "dma_burst_bytes": gm_dma_burst_bytes,
-                "dma_credit_chunk_bytes": request_scheduler_node_credit_chunk_bytes,
-                "dma_partial_credit_enable": request_scheduler_partial_credit_enable,
-                "dma_response_chunk_bytes": gm_dma_response_chunk_bytes,
                 "globalMemTransLatency": gm_trans_latency,
                 "dma_retry_tick_cpu_cycles": gm_retry_tick_cpu_cycles,
                 "dma_progress_heartbeat": progress_heartbeat,
@@ -681,14 +731,14 @@ class CPU_Builder:
                         "queue_depth": request_scheduler_queue_depth,
                         "initial_node_chunk_credit": request_scheduler_initial_chunk_credit,
                         "node_credit_chunk_bytes": request_scheduler_node_credit_chunk_bytes,
-                        "dma_prefetch_depth": request_scheduler_prefetch_depth,
+                        "panel_chunk_bytes": request_scheduler_panel_chunk_bytes,
+                        "manager_issue_budget_per_tick": request_scheduler_issue_budget_per_tick,
                         "submit_batch_size": request_scheduler_submit_batch_size,
                         "done_batch_size": request_scheduler_done_batch_size,
-                        "issue_budget_per_tick": request_scheduler_issue_budget,
-                        "smooth_stream_enable": request_scheduler_smooth_enable,
-                        "smooth_read_bw_bytes_per_cycle": request_scheduler_smooth_read_bw,
-                        "smooth_write_bw_bytes_per_cycle": request_scheduler_smooth_write_bw,
-                        "smooth_token_burst_bytes": request_scheduler_smooth_burst,
+                        "prefetch_windows": wcp_prefetch_windows,
+                        "local_slot_count": os.getenv("GOLEM_DMA_SLOT_COUNT", "2"),
+                        "a_reuse_n_tiles": os.getenv("GOLEM_A_REUSE_N_TILES", "1"),
+                        "b_reuse_m_tiles": os.getenv("GOLEM_B_REUSE_M_TILES", "1"),
                         "window_k_tiles": os.getenv("GOLEM_DMA_WINDOW_K_TILES", "4"),
                         "num_memory_nodes": os.getenv("GOLEM_NUM_MEMORY_NODES", "5"),
                         "ctrl_latency": ctrl_link_latency,
@@ -713,8 +763,7 @@ class CPU_Builder:
                         "verbose": worker_command_processor_verbose,
                         "dtype_is_float": 1 if "Float" in rocc_type else 0,
                         "stage3_trace": os.getenv("GOLEM_WCP_STAGE3_TRACE", "0"),
-                        "stream_ktile_windows": os.getenv("GOLEM_WCP_STREAM_KTILE_WINDOWS", "0"),
-                        "ready_reuse_queue": os.getenv("GOLEM_WCP_READY_REUSE_QUEUE", "0"),
+                        "prefetch_windows": wcp_prefetch_windows,
                         "window_k_tiles": os.getenv("GOLEM_DMA_WINDOW_K_TILES", "4"),
                     }
                 )

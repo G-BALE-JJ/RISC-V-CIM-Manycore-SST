@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <utility>
 #include <vector>
 
 #include <sst/core/component.h>
@@ -59,6 +60,7 @@ struct WorkerTaskListHeader {
     uint32_t n_group_count = 0;
     uint32_t b_reuse_m_tiles = 1;
     uint32_t m_group_count = 0;
+    uint32_t data_node_map_mode = 0;
 };
 
 struct WorkerWindowDescriptor {
@@ -120,8 +122,7 @@ public:
         {"verbose", "Verbosity", "0"},
         {"dtype_is_float", "Output vector stores float elements", "0"},
         {"stage3_trace", "Enable Stage3 2D window trace", "0"},
-        {"stream_ktile_windows", "Use one-k-tile 2D windows to make WCP prefetch a steady stream", "0"},
-        {"ready_reuse_queue", "Schedule ready 2D reuse C tiles within the active K-window", "0"},
+        {"prefetch_windows", "Number of 2D K-windows to prefetch ahead of the active window", "1"},
         {"window_k_tiles", "WCP K-tiles per scheduler transaction", "4"})
 
     WorkerCommandProcessorLocal(ComponentId_t id, SST::Params& params)
@@ -129,8 +130,7 @@ public:
           verbose_(params.find<int>("verbose", 0)),
           outputIsFloat_(params.find<int>("dtype_is_float", 0) != 0),
           stage3Trace_(params.find<int>("stage3_trace", 0) != 0),
-          streamKTileWindows_(params.find<int>("stream_ktile_windows", 0) != 0),
-          readyReuseQueue_(params.find<int>("ready_reuse_queue", 0) != 0),
+          prefetchWindowDepth_(static_cast<uint32_t>(std::max(1, params.find<int>("prefetch_windows", 1)))),
           windowKtiles_(std::max(1, params.find<int>("window_k_tiles", 4))),
           output_("WorkerCommandProcessor[@p:@l]: ", verbose_, 0, SST::Output::STDOUT) {}
 
@@ -178,8 +178,8 @@ public:
         if (reuseM > 1 && reuseN > 1 && residentK == 0) {
             if (extOutput_ != nullptr) {
                 extOutput_->output(
-                    "[Core %u] [wcp] ERROR: 2D K-window reuse needs enough slots for at least one ping-pong K tile, got k_tiles=%u local_slot_count=%u reuse_m=%u reuse_n=%u\n",
-                    coreId_, kTiles, header.local_slot_count, reuseM, reuseN);
+                    "[Core %u] [wcp] ERROR: 2D K-window reuse needs enough slots for active+prefetch window buffers, got k_tiles=%u local_slot_count=%u reuse_m=%u reuse_n=%u prefetch_windows=%u\n",
+                    coreId_, kTiles, header.local_slot_count, reuseM, reuseN, prefetchWindowDepth_);
             }
             return false;
         }
@@ -211,6 +211,8 @@ public:
                 coreId_, header_.worker_slot, header_.task_count, header_.block_n);
         }
         lastAccountCycle_ = 0;
+        workerStartCycle_ = 0;
+        workerEndCycle_ = 0;
         totalWindowCycles_ = 0;
         computeCycles_ = 0;
         tileReadyWaitCycles_ = 0;
@@ -243,6 +245,9 @@ public:
         if (!busy_) {
             return false;
         }
+        if (workerStartCycle_ == 0) {
+            workerStartCycle_ = cycle;
+        }
 
         accountCycles(cycle);
 
@@ -257,7 +262,10 @@ public:
                 if (tile >= 0) {
                     if (activeComputeTileIndex_ < 0) {
                         activeComputeTileIndex_ = tile;
-                        activeComputeSlotIndex_ = static_cast<int>(static_cast<uint32_t>(tile) % std::max<uint32_t>(header_.local_slot_count, 1u));
+                        activeComputeSlotIndex_ = static_cast<int>(
+                            use2DWindowEngine()
+                                ? groupMatSlotFor(static_cast<uint32_t>(tile))
+                                : (static_cast<uint32_t>(tile) % std::max<uint32_t>(header_.local_slot_count, 1u)));
                         activeMicroKStep_ = 0;
                         if (activeComputeSlotIndex_ >= 0 && activeComputeSlotIndex_ < static_cast<int>(buffers_.size())) {
                             buffers_[activeComputeSlotIndex_].in_use = true;
@@ -350,6 +358,7 @@ public:
             phase_ = Phase::DONE;
             break;
         case Phase::DONE:
+            workerEndCycle_ = cycle;
             if (extOutput_ != nullptr) {
                 const uint64_t dma_time = tileReadyWaitCycles_ + txnWaitCycles_ + writebackWaitCycles_;
                 extOutput_->output(
@@ -365,13 +374,14 @@ public:
                     " window_activate=%" PRIu64 " window_advance_wait_prefetch=%" PRIu64
                     " group_wait=0 poll_iters=0 overlap_issue=0 overlap_wait=0"
                     " issue_block_q=0 issue_write=0 ov_issue_block_q=0 ov_issue_write=0"
-                    " task_desc=0 nloop=0 submit_pack=0 finish_publish=0 total=%" PRIu64 "\n",
+                    " task_desc=0 nloop=0 submit_pack=0 finish_publish=0 total=%" PRIu64
+                    " start_cycle=%" PRIu64 " end_cycle=%" PRIu64 "\n",
                     coreId_, dma_time, dma_time, computeCycles_, computeCycles_,
                     writebackWaitCycles_, tileReadyWaitCycles_, txnWaitCycles_,
                     writebackWaitCycles_, wait2DActivateCycles_, wait2DActiveNotReadyCycles_,
                     waitNon2DTxnCycles_, waitNoActiveTxnCycles_, windowSubmitActiveCount_,
                     windowSubmitPrefetchCount_, windowActivateCount_, windowAdvanceWaitPrefetchCount_,
-                    totalWindowCycles_);
+                    totalWindowCycles_, workerStartCycle_, workerEndCycle_);
             }
             if (header_.finished_mailbox_addr != 0) {
                 std::vector<uint8_t> one(sizeof(uint64_t), 0);
@@ -438,6 +448,14 @@ private:
         bool valid = false;
     };
 
+    struct Prefetch2DWindow {
+        uint64_t txnId = 0;
+        std::vector<uint64_t> txnIds;
+        uint32_t kBegin = 0;
+        uint32_t kCount = 0;
+        uint32_t buffer = 0;
+    };
+
     void resetPipelineState() {
         const uint32_t slotCount = std::max<uint32_t>(header_.local_slot_count, 1u);
         buffers_.assign(slotCount, BufferSlot{});
@@ -481,12 +499,8 @@ private:
             activeWindowBuffer_ = 0;
             activeWindowValid_ = false;
             next2DPrefetchK_ = activeWindowKCount_;
-            prefetchTxnId_ = 0;
             active2DTxnIds_.clear();
-            prefetch2DTxnIds_.clear();
-            prefetchTxnKBegin_ = 0;
-            prefetchTxnKCount_ = 0;
-            prefetchTxnBuffer_ = 1;
+            prefetch2DWindows_.clear();
             current_.k_begin = activeWindowKBegin_;
             current_.k_count = activeWindowKCount_;
             const size_t partialCount = static_cast<size_t>(std::max<uint32_t>(header_.b_reuse_m_tiles, 1u)) *
@@ -504,12 +518,8 @@ private:
             activeWindowBuffer_ = 0;
             activeWindowValid_ = false;
             next2DPrefetchK_ = 0;
-            prefetchTxnId_ = 0;
             active2DTxnIds_.clear();
-            prefetch2DTxnIds_.clear();
-            prefetchTxnKBegin_ = 0;
-            prefetchTxnKCount_ = 0;
-            prefetchTxnBuffer_ = 0;
+            prefetch2DWindows_.clear();
             partialCTiles_.clear();
             partialValid_.clear();
             windowReuseDone_.clear();
@@ -526,16 +536,37 @@ private:
     }
 
     uint32_t residentKTileCount(const WorkerTaskListHeader& header, bool pingPong) const {
-        if (streamKTileWindows_) {
-            return 1;
-        }
         const uint32_t reuseN = std::max<uint32_t>(header.a_reuse_n_tiles, 1u);
         const uint32_t reuseM = std::max<uint32_t>(header.b_reuse_m_tiles, 1u);
         const uint32_t slotCount = std::max<uint32_t>(header.local_slot_count, 1u);
-        const uint32_t buffers = pingPong ? 2u : 1u;
+        const uint32_t buffers = pingPong ? twoDWindowBufferCount() : 1u;
         const uint32_t matLimit = slotCount / (buffers * reuseM);
         const uint32_t vecLimit = slotCount / (buffers * reuseN);
-        return std::min<uint32_t>(std::max<uint32_t>(windowKtiles_, 1u), std::min<uint32_t>(matLimit, vecLimit));
+        const uint32_t requestedWindowK = std::max<uint32_t>(windowKtiles_, 1u);
+        return std::min<uint32_t>(requestedWindowK, std::min<uint32_t>(matLimit, vecLimit));
+    }
+
+    uint32_t twoDWindowBufferCount() const {
+        return std::max<uint32_t>(prefetchWindowDepth_ + 1u, 2u);
+    }
+
+    bool allocatePrefetchWindowBuffer(uint32_t& buffer) const {
+        const uint32_t bufferCount = twoDWindowBufferCount();
+        for (uint32_t off = 1; off < bufferCount; ++off) {
+            const uint32_t candidate = (activeWindowBuffer_ + off) % bufferCount;
+            bool inUse = (candidate == activeWindowBuffer_);
+            for (const auto& window : prefetch2DWindows_) {
+                if (window.buffer == candidate) {
+                    inUse = true;
+                    break;
+                }
+            }
+            if (!inUse) {
+                buffer = candidate;
+                return true;
+            }
+        }
+        return false;
     }
 
     uint32_t activeResidentKTileCount() const {
@@ -559,14 +590,15 @@ private:
         }
         const bool activeReady = !active2DTxnIds_.empty() &&
                                  are2DTransactionsReady(active2DTxnIds_, twoDWindowTransactionTileCount(activeWindowKCount_), false);
-        const bool prefetchReady = !prefetch2DTxnIds_.empty() &&
-                                  are2DTransactionsReady(prefetch2DTxnIds_, twoDWindowTransactionTileCount(prefetchTxnKCount_), false);
+        const Prefetch2DWindow* frontPrefetch = prefetch2DWindows_.empty() ? nullptr : &prefetch2DWindows_.front();
+        const bool prefetchReady = frontPrefetch != nullptr &&
+                                  are2DTransactionsReady(frontPrefetch->txnIds, twoDWindowTransactionTileCount(frontPrefetch->kCount), false);
         extOutput_->output(
             "[Core %u] [wcp] STAGE3_TRACE event=%s cycle=%" PRIu64
             " task_idx=%u task=%" PRIu64 " macro=%u reuseM=%u/%u reuseN=%u/%u"
             " win_valid=%u win_k=%u+%u win_buf=%u totalK=%u residentK=%u"
             " active_txn=%" PRIu64 " active_ids=%zu active_ready=%u retired=%u/%u"
-            " prefetch_txn=%" PRIu64 " prefetch_ids=%zu prefetch_ready=%u prefetch_k=%u+%u next_prefetch=%u"
+            " prefetch_txn=%" PRIu64 " prefetch_ids=%zu prefetch_ready=%u prefetch_k=%u+%u prefetch_buf=%u prefetch_queue=%zu/%u next_prefetch=%u"
             " all_sched=%u compute=%u active_tile=%d slot=%d buffers_busy=%u partial_idx=%zu final_win=%u\n",
             coreId_, event, cycle,
             taskIndex_, current_.task_id, currentMacroTaskId_,
@@ -575,8 +607,13 @@ private:
             totalKTileCount_, residentKTileCount_,
             activeTxnId_, active2DTxnIds_.size(), activeReady ? 1u : 0u,
             activeTxnRetiredTileCount_, activeTxnTileCount_,
-            prefetchTxnId_, prefetch2DTxnIds_.size(), prefetchReady ? 1u : 0u,
-            prefetchTxnKBegin_, prefetchTxnKCount_, next2DPrefetchK_,
+            frontPrefetch != nullptr ? frontPrefetch->txnId : 0,
+            frontPrefetch != nullptr ? frontPrefetch->txnIds.size() : 0,
+            prefetchReady ? 1u : 0u,
+            frontPrefetch != nullptr ? frontPrefetch->kBegin : 0,
+            frontPrefetch != nullptr ? frontPrefetch->kCount : 0,
+            frontPrefetch != nullptr ? frontPrefetch->buffer : 0,
+            prefetch2DWindows_.size(), prefetchWindowDepth_, next2DPrefetchK_,
             allTilesScheduled_ ? 1u : 0u, computeInFlight_ ? 1u : 0u,
             activeComputeTileIndex_, activeComputeSlotIndex_, noBuffersBusy() ? 0u : 1u,
             currentPartialIndex(), isFinal2DWindow() ? 1u : 0u);
@@ -596,7 +633,8 @@ private:
     uint32_t groupMatSlotFor(uint32_t kTile) const {
         const uint32_t kTiles = std::max<uint32_t>(current_.k_count, 1u);
         if (use2DWindowEngine()) {
-            const uint32_t perBufferSlots = std::max<uint32_t>(activeWindowKCount_, 1u) * std::max<uint32_t>(header_.b_reuse_m_tiles, 1u);
+            const uint32_t windowKCapacity = std::max<uint32_t>(residentKTileCount_, 1u);
+            const uint32_t perBufferSlots = windowKCapacity * std::max<uint32_t>(header_.b_reuse_m_tiles, 1u);
             return activeWindowBuffer_ * perBufferSlots + reuseMIndex_ * std::max<uint32_t>(activeWindowKCount_, 1u) + kTile;
         }
         return is2DReuse() ? (reuseMIndex_ * kTiles + kTile) : kTile;
@@ -605,7 +643,8 @@ private:
     uint32_t groupVecSlotFor(uint32_t kTile) const {
         const uint32_t kTiles = std::max<uint32_t>(current_.k_count, 1u);
         if (use2DWindowEngine()) {
-            const uint32_t perBufferSlots = std::max<uint32_t>(activeWindowKCount_, 1u) * std::max<uint32_t>(header_.a_reuse_n_tiles, 1u);
+            const uint32_t windowKCapacity = std::max<uint32_t>(residentKTileCount_, 1u);
+            const uint32_t perBufferSlots = windowKCapacity * std::max<uint32_t>(header_.a_reuse_n_tiles, 1u);
             return activeWindowBuffer_ * perBufferSlots + reuseNIndex_ * std::max<uint32_t>(activeWindowKCount_, 1u) + kTile;
         }
         return is2DReuse() ? (reuseNIndex_ * kTiles + kTile) : kTile;
@@ -994,8 +1033,9 @@ private:
         }
         const uint32_t reuseM = std::max<uint32_t>(header_.b_reuse_m_tiles, 1u);
         const uint32_t reuseN = std::max<uint32_t>(header_.a_reuse_n_tiles, 1u);
-        const uint32_t perBufferMatSlots = reuseM * kCount;
-        const uint32_t perBufferVecSlots = reuseN * kCount;
+        const uint32_t windowKCapacity = std::max<uint32_t>(residentKTileCount_, kCount);
+        const uint32_t perBufferMatSlots = reuseM * windowKCapacity;
+        const uint32_t perBufferVecSlots = reuseN * windowKCapacity;
         const uint64_t matGroupBase = current_.mat_base_addr - static_cast<uint64_t>(reuseMIndex_) * static_cast<uint64_t>(totalKTileCount_) * current_.mat_stride_bytes;
         const uint64_t vecGroupBase = current_.vec_base_addr - static_cast<uint64_t>(reuseNIndex_) * static_cast<uint64_t>(totalKTileCount_) * current_.vec_stride_bytes;
         const uint64_t localMatBufferBase = header_.local_mat_ping_gm_addr + static_cast<uint64_t>(buffer) * perBufferMatSlots * header_.local_mat_slot_stride_bytes;
@@ -1155,14 +1195,22 @@ private:
         const bool splitK = hasSplitKTransactions(active2DTxnIds_, activeWindowKCount_);
         const uint32_t matIdx = splitK ? reuseM : (reuseM * activeWindowKCount_ + localTileIdx);
         const uint32_t vecIdx = splitK ? reuseN : (reuseN * activeWindowKCount_ + localTileIdx);
-        bool matReady = false;
-        bool vecReady = false;
         const size_t txnBegin = splitK ? static_cast<size_t>(localTileIdx) : 0;
         const size_t txnEnd = splitK ? std::min<size_t>(txnBegin + 1, active2DTxnIds_.size()) : active2DTxnIds_.size();
         for (size_t txnIdx = txnBegin; txnIdx < txnEnd; ++txnIdx) {
             const uint64_t txnId = active2DTxnIds_[txnIdx];
-            matReady = requestScheduler_->isTileReady(txnId, matIdx);
-            vecReady = requestScheduler_->isTileReady(txnId, vecIdx);
+            bool matReady = false;
+            bool ignoredVecReady = false;
+            bool ignoredMatReady = false;
+            bool vecReady = false;
+            const bool haveMatState = requestScheduler_->getTileKStepReadiness(
+                txnId, matIdx, 0, matReady, ignoredVecReady);
+            const bool haveVecState = requestScheduler_->getTileKStepReadiness(
+                txnId, vecIdx, 0, ignoredMatReady, vecReady);
+            if (!haveMatState || !haveVecState) {
+                matReady = requestScheduler_->isTileReady(txnId, matIdx);
+                vecReady = requestScheduler_->isTileReady(txnId, vecIdx);
+            }
             if (matReady && vecReady) {
                 return true;
             }
@@ -1170,8 +1218,8 @@ private:
         return false;
     }
 
-    bool selectNextReuseForActiveWindow(uint32_t& nextM, uint32_t& nextN) const {
-        if (!readyReuseQueue_ || !use2DWindowEngine() || !activeWindowValid_) {
+    bool selectNextReuseForActiveWindow(uint32_t& nextM, uint32_t& nextN, bool requireReady = false) const {
+        if (!use2DWindowEngine()) {
             return false;
         }
         const size_t count = static_cast<size_t>(currentReuseMCount_) * static_cast<size_t>(currentReuseNCount_);
@@ -1203,7 +1251,7 @@ private:
                 }
             }
         }
-        if (haveFallback) {
+        if (!requireReady && haveFallback) {
             nextM = fallbackM;
             nextN = fallbackN;
             return true;
@@ -1247,7 +1295,15 @@ private:
                 traceStage3("SUBMIT_ACTIVE_WINDOW", lastAccountCycle_);
             }
             retireReady2DTransactions(active2DTxnIds_, twoDWindowTransactionTileCount(activeWindowKCount_), active2DSchedulerTileRetired_);
-            if (is2DComputeTileReady(0)) {
+            uint32_t readyM = reuseMIndex_;
+            uint32_t readyN = reuseNIndex_;
+            if (selectNextReuseForActiveWindow(readyM, readyN, true)) {
+                reuseMIndex_ = readyM;
+                reuseNIndex_ = readyN;
+                deriveTask(taskIndex_, false);
+                traceStage3("ACTIVE_WINDOW_READY_REUSE", lastAccountCycle_);
+                activate2DWindow(activeWindowKBegin_, activeWindowKCount_, activeWindowBuffer_);
+            } else if (is2DComputeTileReady(0)) {
                 traceStage3("ACTIVE_WINDOW_PROGRESSIVE_READY", lastAccountCycle_);
                 activate2DWindow(activeWindowKBegin_, activeWindowKCount_, activeWindowBuffer_);
             } else if (are2DTransactionsReady(active2DTxnIds_, twoDWindowTransactionTileCount(activeWindowKCount_))) {
@@ -1257,17 +1313,33 @@ private:
                 traceStage3("ACTIVE_WINDOW_READY", lastAccountCycle_);
                 activate2DWindow(activeWindowKBegin_, activeWindowKCount_, activeWindowBuffer_);
             }
+            if (!active2DTxnIds_.empty() || activeWindowValid_) {
+                fill2DPrefetchQueue(totalK);
+            }
             return;
         }
         retireReady2DTransactions(active2DTxnIds_, twoDWindowTransactionTileCount(activeWindowKCount_), active2DSchedulerTileRetired_);
-        if (prefetchTxnId_ == 0 && next2DPrefetchK_ < totalK) {
-            prefetchTxnKBegin_ = next2DPrefetchK_;
-            prefetchTxnKCount_ = std::min<uint32_t>(residentKTileCount_, totalK - next2DPrefetchK_);
-            prefetchTxnBuffer_ = 1u - activeWindowBuffer_;
-            prefetch2DTxnIds_ = submit2DWindowTransactions(prefetchTxnKBegin_, prefetchTxnKCount_, prefetchTxnBuffer_);
+        fill2DPrefetchQueue(totalK);
+    }
+
+    void fill2DPrefetchQueue(uint32_t totalK) {
+        while (prefetch2DWindows_.size() < prefetchWindowDepth_ && next2DPrefetchK_ < totalK) {
+            uint32_t buffer = 0;
+            if (!allocatePrefetchWindowBuffer(buffer)) {
+                break;
+            }
+            Prefetch2DWindow window{};
+            window.kBegin = next2DPrefetchK_;
+            window.kCount = std::min<uint32_t>(residentKTileCount_, totalK - next2DPrefetchK_);
+            window.buffer = buffer;
+            window.txnIds = submit2DWindowTransactions(window.kBegin, window.kCount, window.buffer);
+            if (window.txnIds.empty()) {
+                break;
+            }
             windowSubmitPrefetchCount_++;
-            prefetchTxnId_ = prefetch2DTxnIds_.empty() ? 0 : prefetch2DTxnIds_.front();
-            next2DPrefetchK_ += prefetchTxnKCount_;
+            window.txnId = window.txnIds.front();
+            next2DPrefetchK_ += window.kCount;
+            prefetch2DWindows_.push_back(std::move(window));
             traceStage3("SUBMIT_PREFETCH_WINDOW", lastAccountCycle_);
         }
     }
@@ -1281,6 +1353,28 @@ private:
                 if (idx < activeTxnTileRetired_.size() && activeTxnTileRetired_[idx] == 0) {
                     if (is2DComputeTileReady(idx)) {
                         return static_cast<int>(idx);
+                    }
+                }
+            }
+            if (activeTxnRetiredTileCount_ == 0 &&
+                !computeInFlight_ && activeComputeTileIndex_ < 0 &&
+                !taskAccumInitialized_ && !activeTilePayloadLoaded_) {
+                uint32_t readyM = reuseMIndex_;
+                uint32_t readyN = reuseNIndex_;
+                if (selectNextReuseForActiveWindow(readyM, readyN, true) &&
+                    (readyM != reuseMIndex_ || readyN != reuseNIndex_)) {
+                    reuseMIndex_ = readyM;
+                    reuseNIndex_ = readyN;
+                    deriveTask(taskIndex_, false);
+                    resetComputeOnlyStateForNextTile();
+                    allTilesScheduled_ = true;
+                    traceStage3("SELECT_READY_REUSE", lastAccountCycle_);
+                    for (uint32_t idx = 0; idx < activeWindowKCount_; ++idx) {
+                        if (idx < activeTxnTileRetired_.size() && activeTxnTileRetired_[idx] == 0) {
+                            if (is2DComputeTileReady(idx)) {
+                                return static_cast<int>(idx);
+                            }
+                        }
                     }
                 }
             }
@@ -1526,7 +1620,7 @@ private:
 
     bool advance2DWindowEngine() {
         traceStage3("ADVANCE_ENTER", lastAccountCycle_);
-        if (readyReuseQueue_ && activeWindowValid_ && !allReuseDoneForWindow()) {
+        if (activeWindowValid_ && !allReuseDoneForWindow()) {
             uint32_t nextM = reuseMIndex_;
             uint32_t nextN = reuseNIndex_;
             if (selectNextReuseForActiveWindow(nextM, nextN)) {
@@ -1539,7 +1633,7 @@ private:
                 return true;
             }
         }
-        if (readyReuseQueue_ && activeWindowValid_ && allReuseDoneForWindow()) {
+        if (activeWindowValid_ && allReuseDoneForWindow()) {
             reuseNIndex_ = 0;
             reuseMIndex_ = 0;
         } else {
@@ -1576,39 +1670,31 @@ private:
             traceStage3("ADVANCE_FINAL_WINDOW_DONE", lastAccountCycle_);
             return false;
         }
-        if (prefetchTxnId_ != 0) {
-            if (!are2DTransactionsReady(prefetch2DTxnIds_, twoDWindowTransactionTileCount(prefetchTxnKCount_))) {
+        if (!prefetch2DWindows_.empty()) {
+            Prefetch2DWindow nextWindow = std::move(prefetch2DWindows_.front());
+            prefetch2DWindows_.pop_front();
+            if (!are2DTransactionsReady(nextWindow.txnIds, twoDWindowTransactionTileCount(nextWindow.kCount), false)) {
                 windowAdvanceWaitPrefetchCount_++;
                 traceStage3("ADVANCE_WAIT_PREFETCH", lastAccountCycle_);
                 activeWindowValid_ = false;
-                activeTxnId_ = prefetchTxnId_;
-                active2DTxnIds_ = prefetch2DTxnIds_;
-                activeTxnTileCount_ = prefetchTxnKCount_;
+                activeTxnId_ = nextWindow.txnId;
+                active2DTxnIds_ = std::move(nextWindow.txnIds);
+                activeTxnTileCount_ = nextWindow.kCount;
+                activeWindowKBegin_ = nextWindow.kBegin;
+                activeWindowKCount_ = nextWindow.kCount;
+                activeWindowBuffer_ = nextWindow.buffer;
                 active2DSchedulerTileRetired_.assign(twoDWindowTransactionTileCount(activeWindowKCount_), 0);
-                activeWindowKBegin_ = prefetchTxnKBegin_;
-                activeWindowKCount_ = prefetchTxnKCount_;
-                activeWindowBuffer_ = prefetchTxnBuffer_;
                 windowReuseDone_.assign(static_cast<size_t>(currentReuseMCount_) * static_cast<size_t>(currentReuseNCount_), 0);
-                prefetchTxnId_ = 0;
-                prefetch2DTxnIds_.clear();
-                prefetchTxnKBegin_ = 0;
-                prefetchTxnKCount_ = 0;
-                prefetchTxnBuffer_ = 1u - activeWindowBuffer_;
                 deriveTask(taskIndex_, false);
                 resetComputeOnlyStateForNextTile();
                 return true;
             }
-            retire2DTransactions(prefetch2DTxnIds_, twoDWindowTransactionTileCount(prefetchTxnKCount_));
+            retire2DTransactions(nextWindow.txnIds, twoDWindowTransactionTileCount(nextWindow.kCount));
             activeTxnId_ = 0;
             active2DTxnIds_.clear();
             active2DSchedulerTileRetired_.clear();
             traceStage3("ADVANCE_PREFETCH_READY", lastAccountCycle_);
-            activate2DWindow(prefetchTxnKBegin_, prefetchTxnKCount_, prefetchTxnBuffer_);
-            prefetchTxnId_ = 0;
-            prefetch2DTxnIds_.clear();
-            prefetchTxnKBegin_ = 0;
-            prefetchTxnKCount_ = 0;
-            prefetchTxnBuffer_ = 1u - activeWindowBuffer_;
+            activate2DWindow(nextWindow.kBegin, nextWindow.kCount, nextWindow.buffer);
         } else {
             traceStage3("ADVANCE_NO_PREFETCH", lastAccountCycle_);
             const uint32_t nextK = activeWindowKBegin_ + activeWindowKCount_;
@@ -1616,7 +1702,12 @@ private:
             activeWindowValid_ = false;
             activeWindowKBegin_ = nextK;
             activeWindowKCount_ = nextCount;
-            activeWindowBuffer_ = 1u - activeWindowBuffer_;
+            uint32_t buffer = 0;
+            if (allocatePrefetchWindowBuffer(buffer)) {
+                activeWindowBuffer_ = buffer;
+            } else {
+                activeWindowBuffer_ = (activeWindowBuffer_ + 1u) % twoDWindowBufferCount();
+            }
             windowReuseDone_.assign(static_cast<size_t>(currentReuseMCount_) * static_cast<size_t>(currentReuseNCount_), 0);
             next2DPrefetchK_ = nextK + nextCount;
         }
@@ -1786,12 +1877,14 @@ private:
         const uint64_t output_task_id = static_cast<uint64_t>(m_tile) * n_tiles + n_tile;
         const uint32_t owner_slot = macro_task_id % header_.active_worker_cores;
         const uint32_t group_id = header_.total_groups > 0 ? (owner_slot % header_.total_groups) : 0;
-        const uint32_t node_idx = 1 + (header_.data_memory_node_count > 0 ? (group_id % header_.data_memory_node_count) : 0);
+        const uint32_t dataMapKey = header_.data_node_map_mode != 0 ? owner_slot : group_id;
+        const uint32_t node_idx = 1 + (header_.data_memory_node_count > 0 ? (dataMapKey % header_.data_memory_node_count) : 0);
         uint32_t macro_slot = 0;
         for (uint32_t i = 0; i < macro_task_id; ++i) {
             const uint32_t prev_owner_slot = i % header_.active_worker_cores;
             const uint32_t prev_group_id = header_.total_groups > 0 ? (prev_owner_slot % header_.total_groups) : 0;
-            const uint32_t prev_node_idx = 1 + (header_.data_memory_node_count > 0 ? (prev_group_id % header_.data_memory_node_count) : 0);
+            const uint32_t prevDataMapKey = header_.data_node_map_mode != 0 ? prev_owner_slot : prev_group_id;
+            const uint32_t prev_node_idx = 1 + (header_.data_memory_node_count > 0 ? (prevDataMapKey % header_.data_memory_node_count) : 0);
             if (prev_node_idx == node_idx) {
                 macro_slot++;
             }
@@ -1841,8 +1934,7 @@ private:
     int verbose_ = 0;
     bool outputIsFloat_ = false;
     bool stage3Trace_ = false;
-    bool streamKTileWindows_ = false;
-    bool readyReuseQueue_ = false;
+    uint32_t prefetchWindowDepth_ = 1;
     uint32_t windowKtiles_ = 4;
     SST::Output output_;
     uint32_t coreId_ = 0;
@@ -1878,14 +1970,12 @@ private:
     uint32_t activeWindowBuffer_ = 0;
     bool activeWindowValid_ = false;
     uint32_t next2DPrefetchK_ = 0;
-    uint64_t prefetchTxnId_ = 0;
     std::vector<uint64_t> active2DTxnIds_;
-    std::vector<uint64_t> prefetch2DTxnIds_;
+    std::deque<Prefetch2DWindow> prefetch2DWindows_;
     std::vector<uint8_t> active2DSchedulerTileRetired_;
-    uint32_t prefetchTxnKBegin_ = 0;
-    uint32_t prefetchTxnKCount_ = 0;
-    uint32_t prefetchTxnBuffer_ = 0;
     uint64_t lastAccountCycle_ = 0;
+    uint64_t workerStartCycle_ = 0;
+    uint64_t workerEndCycle_ = 0;
     uint64_t totalWindowCycles_ = 0;
     uint64_t computeCycles_ = 0;
     uint64_t tileReadyWaitCycles_ = 0;

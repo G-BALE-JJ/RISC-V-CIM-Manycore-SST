@@ -107,9 +107,9 @@ Derived resident window:
 
 ```text
 resident_k_tiles = min(
-  GOLEM_DMA_PREFETCH_DEPTH,
-  mat_slot_count / GOLEM_B_REUSE_M_TILES,
-  vec_slot_count / GOLEM_A_REUSE_N_TILES
+  GOLEM_DMA_WINDOW_K_TILES,
+  local_slot_count / ((GOLEM_WCP_PREFETCH_WINDOWS + 1) * GOLEM_B_REUSE_M_TILES),
+  local_slot_count / ((GOLEM_WCP_PREFETCH_WINDOWS + 1) * GOLEM_A_REUSE_N_TILES)
 )
 ```
 

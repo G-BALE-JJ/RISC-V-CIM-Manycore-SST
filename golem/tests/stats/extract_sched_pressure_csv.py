@@ -9,17 +9,19 @@ PRESSURE_RE = re.compile(
     r"\[RequestScheduler\]\[core=(?P<core>\d+)\] SCHED_PRESSURE: "
     r"ticks=(?P<ticks>\d+) pending_nonempty_ticks=(?P<pending_nonempty_ticks>\d+) "
     r"no_issue_ticks=(?P<no_issue_ticks>\d+) issued_requests=(?P<issued_requests>\d+) "
-    r"issued_pairs=(?P<issued_pairs>\d+) "
     r"pending_q\(n=(?P<pending_q_n>\d+) mean=(?P<pending_q_mean>[0-9.]+) "
     r"p50=(?P<pending_q_p50>\d+) p95=(?P<pending_q_p95>\d+) max=(?P<pending_q_max>\d+)\)"
     r" worker_used_max\(n=(?P<worker_used_n>\d+) mean=(?P<worker_used_mean>[0-9.]+) "
     r"p50=(?P<worker_used_p50>\d+) p95=(?P<worker_used_p95>\d+) max=(?P<worker_used_max>\d+) cap=(?P<worker_credit_cap>\d+)\)"
     r" node_used_max\(n=(?P<node_used_n>\d+) mean=(?P<node_used_mean>[0-9.]+) "
     r"p50=(?P<node_used_p50>\d+) p95=(?P<node_used_p95>\d+) max=(?P<node_used_max>\d+) cap=(?P<node_credit_cap>\d+)"
-    r"(?: chunk_bytes=(?P<node_credit_chunk_bytes>\d+))?\)"
-    r" blocked\(worker_credit=(?P<blocked_worker_credit>\d+) node_credit=(?P<blocked_node_credit>\d+) "
-    r"issue_budget=(?P<blocked_issue_budget>\d+) smooth=(?P<blocked_smooth>\d+) "
-    r"no_sibling=(?P<blocked_no_sibling>\d+)\)"
+    r"(?: chunk_bytes=(?P<node_credit_chunk_bytes>\d+))?"
+    r"(?: panel_chunk_bytes=(?P<panel_chunk_bytes>\d+))?\)"
+    r" blocked\(worker_credit=(?P<blocked_worker_credit>\d+) node_credit=(?P<blocked_node_credit>\d+)"
+    r"(?: issue_pace=(?P<blocked_issue_pace>\d+))?"
+    r"(?: network_send=(?P<blocked_network_send>\d+))?"
+    r"\)"
+    r"(?: priority_pair\(attempts=(?P<priority_pair_attempts>\d+) issued=(?P<priority_pair_issued>\d+)\))?"
 )
 
 
@@ -42,6 +44,16 @@ def parse_records(paths):
             rec = m.groupdict()
             if rec.get("node_credit_chunk_bytes") is None:
                 rec["node_credit_chunk_bytes"] = "0"
+            if rec.get("panel_chunk_bytes") is None:
+                rec["panel_chunk_bytes"] = "0"
+            if rec.get("blocked_issue_pace") is None:
+                rec["blocked_issue_pace"] = "0"
+            if rec.get("blocked_network_send") is None:
+                rec["blocked_network_send"] = "0"
+            if rec.get("priority_pair_attempts") is None:
+                rec["priority_pair_attempts"] = "0"
+            if rec.get("priority_pair_issued") is None:
+                rec["priority_pair_issued"] = "0"
             core = int(rec["core"])
             latest[core] = rec
     return [latest[k] for k in sorted(latest)]

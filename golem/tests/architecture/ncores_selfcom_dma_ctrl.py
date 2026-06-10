@@ -353,8 +353,9 @@ for idx, router_id in enumerate(MEMORY_ROUTERS):
             "network_output_buffer_size": os.getenv(
                 "GOLEM_NOC_OUTPUT_BUF_SIZE", "64KB"
             ),
-            "golem_dma_response_chunk_bytes": os.getenv("GOLEM_DMA_RESPONSE_CHUNK_BYTES", "0"),
-            "golem_dma_response_vn": os.getenv("GOLEM_DMA_RESPONSE_VN", "0"),
+            "golem_dma_response_drain_limit": os.getenv(
+                "GOLEM_DMA_RESPONSE_DRAIN_LIMIT", "0"
+            ),
             "golem_dma_trace": os.getenv("GOLEM_DMA_TRACE", "0"),
         }
     )

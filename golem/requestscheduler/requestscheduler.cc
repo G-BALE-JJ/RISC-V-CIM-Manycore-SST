@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cctype>
+#include <cstddef>
 #include <cmath>
+#include <mutex>
 
 namespace {
 constexpr uint64_t SCHED_LOCAL_MAILBOX_BASE = 0x1A00;
@@ -28,6 +30,16 @@ constexpr uint64_t SCHED_LOCAL_DONE_ID_OFF = 0x00;
 constexpr uint64_t SCHED_LOCAL_SUBMIT_RING_DEPTH = 8;
 constexpr uint64_t SCHED_LOCAL_DONE_RING_DEPTH = 8;
 constexpr uint8_t SCHED_PAIR_SLOT_MARKER = 0xFE;
+constexpr uint32_t WINDOW_REQUEST_TILE_BITS = 8;
+constexpr uint64_t WINDOW_REQUEST_TILE_MASK = (1ULL << WINDOW_REQUEST_TILE_BITS) - 1ULL;
+
+int makeMerlinTraceId(uint64_t requestId) {
+    const uint64_t core = (requestId >> 56) & 0xffULL;
+    const uint64_t slot = (requestId >> 48) & 0xffULL;
+    const uint64_t node = (requestId >> 32) & 0xffULL;
+    const uint64_t seq = requestId & 0xfULL;
+    return static_cast<int>((core << 20) | (slot << 12) | (node << 4) | seq);
+}
 
 inline uint64_t submitEntryOff(uint64_t ringIdx, uint64_t fieldOff) {
     const uint64_t slot = ringIdx % SCHED_LOCAL_SUBMIT_RING_DEPTH;
@@ -41,12 +53,82 @@ inline uint64_t doneEntryOff(uint64_t ringIdx, uint64_t fieldOff = SCHED_LOCAL_D
 
 struct TraceStats {
     size_t count = 0;
+    uint64_t sum = 0;
     double mean = 0.0;
     uint64_t p50 = 0;
     uint64_t p95 = 0;
     uint64_t min = 0;
     uint64_t max = 0;
 };
+
+struct GlobalNodeCreditState {
+    std::mutex mutex;
+    bool initialized = false;
+    uint32_t numNodes = 0;
+    uint32_t creditCap = 1;
+    std::vector<uint32_t> credits;
+};
+
+GlobalNodeCreditState& globalNodeCreditState() {
+    static GlobalNodeCreditState state;
+    return state;
+}
+
+void ensureGlobalNodeCredits(uint32_t numNodes, uint32_t creditCap) {
+    auto& state = globalNodeCreditState();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    const uint32_t cap = std::max<uint32_t>(creditCap, 1u);
+    if (!state.initialized) {
+        state.initialized = true;
+        state.numNodes = std::max<uint32_t>(numNodes, 1u);
+        state.creditCap = cap;
+        state.credits.assign(state.numNodes, state.creditCap);
+        return;
+    }
+
+    if (numNodes > state.numNodes) {
+        state.credits.resize(numNodes, state.creditCap);
+        state.numNodes = numNodes;
+    }
+}
+
+bool acquireGlobalNodeCredits(uint16_t node, uint32_t units) {
+    auto& state = globalNodeCreditState();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (!state.initialized || node >= state.credits.size()) {
+        return false;
+    }
+    if (state.credits[node] < units) {
+        return false;
+    }
+    state.credits[node] -= units;
+    return true;
+}
+
+void releaseGlobalNodeCredits(uint16_t node, uint32_t units) {
+    auto& state = globalNodeCreditState();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (!state.initialized || node >= state.credits.size() || units == 0) {
+        return;
+    }
+    state.credits[node] = std::min<uint32_t>(state.creditCap, state.credits[node] + units);
+}
+
+uint64_t globalNodeUsedMax(uint32_t expectedNodes) {
+    auto& state = globalNodeCreditState();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (!state.initialized) {
+        return 0;
+    }
+    const uint32_t count = std::min<uint32_t>(expectedNodes, static_cast<uint32_t>(state.credits.size()));
+    uint64_t maxUsed = 0;
+    for (uint32_t node = 0; node < count; ++node) {
+        if (state.creditCap > state.credits[node]) {
+            maxUsed = std::max<uint64_t>(maxUsed, static_cast<uint64_t>(state.creditCap - state.credits[node]));
+        }
+    }
+    return maxUsed;
+}
 
 TraceStats buildTraceStats(const std::vector<uint64_t>& samples) {
     TraceStats out{};
@@ -56,6 +138,7 @@ TraceStats buildTraceStats(const std::vector<uint64_t>& samples) {
     out.count = samples.size();
     long double sum = 0.0;
     for (uint64_t v : samples) {
+        out.sum += v;
         sum += static_cast<long double>(v);
     }
     out.mean = static_cast<double>(sum / static_cast<long double>(samples.size()));
@@ -68,6 +151,18 @@ TraceStats buildTraceStats(const std::vector<uint64_t>& samples) {
     out.p50 = sorted[idx50];
     out.p95 = sorted[idx95];
     return out;
+}
+
+TraceStats buildCombinedTraceStats(const std::vector<uint64_t>& lhs, const std::vector<uint64_t>& rhs) {
+    std::vector<uint64_t> combined;
+    combined.reserve(lhs.size() + rhs.size());
+    combined.insert(combined.end(), lhs.begin(), lhs.end());
+    combined.insert(combined.end(), rhs.begin(), rhs.end());
+    return buildTraceStats(combined);
+}
+
+uint64_t avgCycles(const TraceStats& stats) {
+    return stats.count == 0 ? 0 : stats.sum / static_cast<uint64_t>(stats.count);
 }
 
 int envFlagDefault(const char* name, int defaultValue) {
@@ -96,15 +191,17 @@ RequestSchedulerEndpoint::RequestSchedulerEndpoint(SST::ComponentId_t id, SST::P
       initialNodeCredit_(parseU32Param(params, "initial_node_chunk_credit",
                                        parseU32Param(params, "initial_node_credit", 2))),
       nodeCreditChunkBytes_(parseU32Param(params, "node_credit_chunk_bytes", 512)),
-      dmaPrefetchDepth_(parseU32Param(params, "dma_prefetch_depth", 2)),
+      panelChunkBytes_(parseU32Param(params, "panel_chunk_bytes",
+                                     parseU32Param(params, "node_credit_chunk_bytes", 2048))),
       workerCreditCap_(0),
+      workerSoftIssueCap_(0),
+      managerIssueBudgetPerTick_(parseU32Param(params, "manager_issue_budget_per_tick", 2)),
       submitBatchSize_(parseU32Param(params, "submit_batch_size", 4)),
       doneBatchSize_(parseU32Param(params, "done_batch_size", 4)),
-      issueBudgetPerTick_(parseU32Param(params, "issue_budget_per_tick", 0)),
-      smoothStreamEnable_(parseI32Param(params, "smooth_stream_enable", 0) != 0),
-      smoothReadBwBytesPerCycle_(static_cast<double>(parseU32Param(params, "smooth_read_bw_bytes_per_cycle", 0))),
-      smoothWriteBwBytesPerCycle_(static_cast<double>(parseU32Param(params, "smooth_write_bw_bytes_per_cycle", 0))),
-      smoothTokenBurstBytes_(parseU32Param(params, "smooth_token_burst_bytes", 65536)),
+      prefetchWindowDepth_(parseU32Param(params, "prefetch_windows", 1)),
+      localSlotCount_(parseU32Param(params, "local_slot_count", 2)),
+      aReuseNTiles_(parseU32Param(params, "a_reuse_n_tiles", 1)),
+      bReuseMTiles_(parseU32Param(params, "b_reuse_m_tiles", 1)),
       windowKtiles_(parseU32Param(params, "window_k_tiles", 1)),
       numMemoryNodes_(parseU32Param(params, "num_memory_nodes", 5)),
       inferSubmitBytes_(parseI32Param(params, "infer_submit_bytes", 0) != 0),
@@ -120,20 +217,22 @@ RequestSchedulerEndpoint::RequestSchedulerEndpoint(SST::ComponentId_t id, SST::P
       linkControl_(nullptr),
       networkId_(-1),
       gm_(nullptr),
-      scheduleCursor_(0),
+      nodeIssueCursor_(0),
       submitSeen_(false),
       doneSeen_(false),
       nextWindowTxnId_(1),
-      lastTickCycle_(0)
+      lastTickCycle_(0),
+      issueBudgetCycle_(0),
+      issuedThisCycle_(0)
 {
-    if (dmaPrefetchDepth_ == 0) {
-        dmaPrefetchDepth_ = 1;
-    }
     if (submitBatchSize_ == 0) {
         submitBatchSize_ = 1;
     }
     if (doneBatchSize_ == 0) {
         doneBatchSize_ = 1;
+    }
+    if (managerIssueBudgetPerTick_ == 0) {
+        managerIssueBudgetPerTick_ = 1;
     }
     if (windowKtiles_ == 0) {
         windowKtiles_ = 1;
@@ -141,14 +240,31 @@ RequestSchedulerEndpoint::RequestSchedulerEndpoint(SST::ComponentId_t id, SST::P
     if (nodeCreditChunkBytes_ == 0) {
         nodeCreditChunkBytes_ = 512;
     }
-    workerCreditCap_ = dmaPrefetchDepth_ * 2;
+    if (panelChunkBytes_ == 0) {
+        panelChunkBytes_ = nodeCreditChunkBytes_;
+    }
+    if (prefetchWindowDepth_ == 0) {
+        prefetchWindowDepth_ = 1;
+    }
+    if (localSlotCount_ == 0) {
+        localSlotCount_ = 1;
+    }
+    if (aReuseNTiles_ == 0) {
+        aReuseNTiles_ = 1;
+    }
+    if (bReuseMTiles_ == 0) {
+        bReuseMTiles_ = 1;
+    }
+    workerCreditCap_ = computeWorkerCreditCap();
+    workerSoftIssueCap_ = computeWorkerSoftIssueCap();
     reqIn_.resize(4, nullptr);
-    nodeCredits_.resize(numMemoryNodes_, initialNodeCredit_ == 0 ? 1 : initialNodeCredit_);
-    smoothReadTokens_.resize(numMemoryNodes_, static_cast<double>(smoothTokenBurstBytes_));
-    smoothNodeWorkerCursor_.resize(numMemoryNodes_, 0);
-    // Keep dma_prefetch_depth as a tile-pair knob. Node credits may be
-    // chunk-based, but worker credits track logical mat/vec tile requests.
+    nodeWorkerQueues_.resize(numMemoryNodes_);
+    nodeWorkerIssueCursor_.resize(numMemoryNodes_, 0);
+    for (auto& perNode : nodeWorkerQueues_) {
+        perNode.resize(reqIn_.size());
+    }
     workerCredits_.resize(reqIn_.size(), workerCreditCap_);
+    initGlobalNodeFlow();
     configureLinks(params);
     registerClock("1GHz", new SST::Clock::Handler<RequestSchedulerEndpoint>(this, &RequestSchedulerEndpoint::tick));
 }
@@ -248,7 +364,7 @@ void RequestSchedulerEndpoint::setup() {
 
 void RequestSchedulerEndpoint::finish() {
     if (role_ == RequestSchedulerRole::MANAGER) {
-        output_.verbose(CALL_INFO, 1, 0, "manager core=%u pending=%zu\n", coreId_, pendingQ_.size());
+        output_.verbose(CALL_INFO, 1, 0, "manager core=%u pending=%zu\n", coreId_, managerPendingCount());
         emitManagerTraceSummary();
         emitManagerPressureSummary();
     }
@@ -262,9 +378,74 @@ uint64_t RequestSchedulerEndpoint::decodeSiblingRequestId(uint64_t requestId) {
     return requestId ^ (1ULL << 48);
 }
 
+uint32_t RequestSchedulerEndpoint::computeWorkerResidentK() const {
+    const uint64_t reuseM = std::max<uint32_t>(bReuseMTiles_, 1u);
+    const uint64_t reuseN = std::max<uint32_t>(aReuseNTiles_, 1u);
+    const uint64_t windowBuffers = std::max<uint32_t>(prefetchWindowDepth_ + 1u, 1u);
+    const uint64_t slotCount = std::max<uint32_t>(localSlotCount_, 1u);
+    const bool reuse2D = reuseM > 1 || reuseN > 1;
+    uint64_t residentK = std::max<uint32_t>(windowKtiles_, 1u);
+
+    if (reuse2D) {
+        const uint64_t matLimit = slotCount / std::max<uint64_t>(1ULL, windowBuffers * reuseM);
+        const uint64_t vecLimit = slotCount / std::max<uint64_t>(1ULL, windowBuffers * reuseN);
+        const uint64_t slotLimited = std::min(matLimit, vecLimit);
+        residentK = std::max<uint64_t>(1ULL, std::min(residentK, slotLimited));
+    }
+
+    return static_cast<uint32_t>(std::min<uint64_t>(residentK, 4096ULL));
+}
+
+uint32_t RequestSchedulerEndpoint::computeWorkerCreditCap() const {
+    const uint64_t reuseM = std::max<uint32_t>(bReuseMTiles_, 1u);
+    const uint64_t reuseN = std::max<uint32_t>(aReuseNTiles_, 1u);
+    const uint64_t creditWindowBuffers = std::max<uint32_t>(prefetchWindowDepth_ + 1u, 1u);
+    const uint64_t residentK = std::max<uint32_t>(computeWorkerResidentK(), 1u);
+    const uint64_t requestsPerWindow = residentK * (reuseM + reuseN);
+    const uint64_t cap = std::max<uint64_t>(reuseM + reuseN, creditWindowBuffers * requestsPerWindow);
+    return static_cast<uint32_t>(std::min<uint64_t>(cap, 4096ULL));
+}
+
+uint32_t RequestSchedulerEndpoint::computeWorkerSoftIssueCap() const {
+    return workerCreditCap_ == 0 ? computeWorkerCreditCap() : workerCreditCap_;
+}
+
+uint64_t RequestSchedulerEndpoint::composeWindowRequestId(
+    uint8_t slot,
+    uint16_t targetNode,
+    uint64_t txnId,
+    uint32_t tileIdx) const {
+    const uint64_t seq =
+        ((txnId & 0x00ffffffULL) << WINDOW_REQUEST_TILE_BITS) |
+        (static_cast<uint64_t>(tileIdx) & WINDOW_REQUEST_TILE_MASK);
+    return (static_cast<uint64_t>(coreId_ & 0xff) << 56) |
+           (static_cast<uint64_t>(slot) << 48) |
+           (static_cast<uint64_t>(targetNode & 0xffff) << 32) |
+           (seq & 0xffffffffULL);
+}
+
 uint32_t RequestSchedulerEndpoint::nodeCreditUnitsForBytes(uint32_t bytes) const {
     const uint32_t chunkBytes = nodeCreditChunkBytes_ == 0 ? 512u : nodeCreditChunkBytes_;
     return std::max<uint32_t>(1u, (bytes + chunkBytes - 1u) / chunkBytes);
+}
+
+uint32_t RequestSchedulerEndpoint::chunkBytesForTransfer(const PendingTransfer& req) const {
+    if (req.issuedBytes >= req.bytes) {
+        return 0;
+    }
+    const uint32_t remaining = req.bytes - req.issuedBytes;
+    const uint32_t chunkLimit = panelChunkBytes_ == 0 ? remaining : panelChunkBytes_;
+    return std::min<uint32_t>(remaining, std::max<uint32_t>(chunkLimit, 1u));
+}
+
+size_t RequestSchedulerEndpoint::managerPendingCount() const {
+    size_t total = 0;
+    for (const auto& perNode : nodeWorkerQueues_) {
+        for (const auto& q : perNode) {
+            total += q.size();
+        }
+    }
+    return total;
 }
 
 void RequestSchedulerEndpoint::traceSubmitAtManager(uint64_t requestId, uint8_t workerSlot, uint16_t targetNode) {
@@ -297,10 +478,11 @@ void RequestSchedulerEndpoint::traceIssueAtManager(uint64_t requestId) {
     if (traceEvents_) {
         output_.output(
             "[RequestScheduler][core=%u] TRACE_REQ_ISSUE cycle=%" PRIu64 " req=%" PRIu64
-            " slot=%u worker_slot=%u target_node=%u\n",
+            " trace_id=%d slot=%u worker_slot=%u target_node=%u\n",
             coreId_,
             state.issueCycle,
             requestId,
+            makeMerlinTraceId(requestId),
             static_cast<unsigned>(state.requestSlot),
             static_cast<unsigned>(state.workerSlot),
             static_cast<unsigned>(state.targetNode));
@@ -430,6 +612,10 @@ void RequestSchedulerEndpoint::emitManagerTraceSummary() const {
     const TraceStats s2dVec = buildTraceStats(traceSubmitToDoneVec_);
     const TraceStats pairIssue = buildTraceStats(tracePairIssueGap_);
     const TraceStats pairDone = buildTraceStats(tracePairDoneGap_);
+    const TraceStats strictRtt = buildCombinedTraceStats(traceIssueToPendingClearMat_,
+                                                         traceIssueToPendingClearVec_);
+    const TraceStats strictE2eRtt = buildCombinedTraceStats(traceIssueToDoneMat_,
+                                                            traceIssueToDoneVec_);
 
     output_.output(
         "[RequestScheduler][core=%u] TRACE_SUBMIT_READY_BREAKDOWN(cycles): "
@@ -458,6 +644,16 @@ void RequestSchedulerEndpoint::emitManagerTraceSummary() const {
         s2dVec.count, s2dVec.mean, s2dVec.p50, s2dVec.p95, s2dVec.min, s2dVec.max,
         pairIssue.count, pairIssue.mean, pairIssue.p50, pairIssue.p95, pairIssue.min, pairIssue.max,
         pairDone.count, pairDone.mean, pairDone.p50, pairDone.p95, pairDone.min, pairDone.max);
+
+    output_.output(
+        "[RequestScheduler][core=%u] STRICT_RTT_SUMMARY(cycles): "
+        "strict_rtt_samples=%zu strict_rtt_cycles_sum=%" PRIu64
+        " strict_avg_rtt_cycles=%" PRIu64 " strict_max_rtt_cycles=%" PRIu64
+        " strict_e2e_rtt_samples=%zu strict_e2e_rtt_cycles_sum=%" PRIu64
+        " strict_avg_e2e_rtt_cycles=%" PRIu64 " strict_max_e2e_rtt_cycles=%" PRIu64 "\n",
+        coreId_,
+        strictRtt.count, strictRtt.sum, avgCycles(strictRtt), strictRtt.max,
+        strictE2eRtt.count, strictE2eRtt.sum, avgCycles(strictE2eRtt), strictE2eRtt.max);
 }
 
 void RequestSchedulerEndpoint::sampleManagerPressure() {
@@ -465,8 +661,9 @@ void RequestSchedulerEndpoint::sampleManagerPressure() {
         return;
     }
     pressureTicks_++;
-    pressurePendingQSamples_.push_back(static_cast<uint64_t>(pendingQ_.size()));
-    if (!pendingQ_.empty()) {
+    const size_t pendingCount = managerPendingCount();
+    pressurePendingQSamples_.push_back(static_cast<uint64_t>(pendingCount));
+    if (pendingCount != 0) {
         pressurePendingNonEmptyTicks_++;
     }
 
@@ -478,14 +675,7 @@ void RequestSchedulerEndpoint::sampleManagerPressure() {
     }
     pressureWorkerUsedMaxSamples_.push_back(maxWorkerUsed);
 
-    uint64_t maxNodeUsed = 0;
-    const uint32_t nodeCreditCap = initialNodeCredit_ == 0 ? 1 : initialNodeCredit_;
-    for (uint32_t credit : nodeCredits_) {
-        if (nodeCreditCap > credit) {
-            maxNodeUsed = std::max<uint64_t>(maxNodeUsed, static_cast<uint64_t>(nodeCreditCap - credit));
-        }
-    }
-    pressureNodeUsedMaxSamples_.push_back(maxNodeUsed);
+    pressureNodeUsedMaxSamples_.push_back(globalNodeUsedMax(numMemoryNodes_));
 }
 
 void RequestSchedulerEndpoint::emitManagerPressureSummary() const {
@@ -498,21 +688,48 @@ void RequestSchedulerEndpoint::emitManagerPressureSummary() const {
     output_.output(
         "[RequestScheduler][core=%u] SCHED_PRESSURE: "
         "ticks=%" PRIu64 " pending_nonempty_ticks=%" PRIu64 " no_issue_ticks=%" PRIu64
-        " issued_requests=%" PRIu64 " issued_pairs=%" PRIu64
+        " issued_requests=%" PRIu64
         " pending_q(n=%zu mean=%.2f p50=%" PRIu64 " p95=%" PRIu64 " max=%" PRIu64 ")"
         " worker_used_max(n=%zu mean=%.2f p50=%" PRIu64 " p95=%" PRIu64 " max=%" PRIu64 " cap=%u)"
-        " node_used_max(n=%zu mean=%.2f p50=%" PRIu64 " p95=%" PRIu64 " max=%" PRIu64 " cap=%u chunk_bytes=%u)"
-        " blocked(worker_credit=%" PRIu64 " node_credit=%" PRIu64 " issue_budget=%" PRIu64
-        " smooth=%" PRIu64 " no_sibling=%" PRIu64 ")\n",
+        " node_used_max(n=%zu mean=%.2f p50=%" PRIu64 " p95=%" PRIu64 " max=%" PRIu64 " cap=%u chunk_bytes=%u panel_chunk_bytes=%u)"
+        " blocked(worker_credit=%" PRIu64 " node_credit=%" PRIu64
+        " issue_pace=%" PRIu64 " network_send=%" PRIu64 ")"
+        " priority_pair(attempts=%" PRIu64 " issued=%" PRIu64 ")\n",
         coreId_,
         pressureTicks_, pressurePendingNonEmptyTicks_, pressureNoIssueTicks_,
-        pressureIssuedRequests_, pressureIssuedPairs_,
+        pressureIssuedRequests_,
         pending.count, pending.mean, pending.p50, pending.p95, pending.max,
         workerUsed.count, workerUsed.mean, workerUsed.p50, workerUsed.p95, workerUsed.max, workerCreditCap_,
         nodeUsed.count, nodeUsed.mean, nodeUsed.p50, nodeUsed.p95, nodeUsed.max,
-        initialNodeCredit_ == 0 ? 1 : initialNodeCredit_, nodeCreditChunkBytes_,
-        pressureWorkerCreditBlocked_, pressureNodeCreditBlocked_, pressureIssueBudgetBlocked_,
-        pressureSmoothBlocked_, pressureNoSiblingBlocked_);
+        initialNodeCredit_ == 0 ? 1 : initialNodeCredit_, nodeCreditChunkBytes_, panelChunkBytes_,
+        pressureWorkerCreditBlocked_, pressureNodeCreditBlocked_, pressureIssuePaceBlocked_,
+        pressureNetworkSendBlocked_,
+        pressurePriorityPairAttempts_, pressurePriorityPairIssued_);
+}
+
+void RequestSchedulerEndpoint::initGlobalNodeFlow() {
+    if (role_ != RequestSchedulerRole::MANAGER) {
+        return;
+    }
+    ensureGlobalNodeCredits(
+        std::max<uint32_t>(numMemoryNodes_, 1u),
+        initialNodeCredit_ == 0 ? 1u : initialNodeCredit_);
+}
+
+bool RequestSchedulerEndpoint::acquireNodeBudget(const PendingTransfer& req, uint32_t nodeNeed) {
+    if (acquireGlobalNodeCredits(req.targetNode, nodeNeed)) {
+        return true;
+    }
+    pressureNodeCreditBlocked_++;
+    return false;
+}
+
+void RequestSchedulerEndpoint::releaseNodeCredits(uint16_t targetNode, uint32_t units) {
+    releaseGlobalNodeCredits(targetNode, units);
+}
+
+void RequestSchedulerEndpoint::refundNodeBudget(uint16_t targetNode, uint32_t units) {
+    releaseGlobalNodeCredits(targetNode, units);
 }
 
 uint64_t RequestSchedulerEndpoint::submitWindowTransaction(const WcpWindowTransaction& txn)
@@ -540,13 +757,8 @@ void RequestSchedulerEndpoint::enqueueWindowTiles(WorkerWindowTxnState& state)
     if (gm_ == nullptr) {
         return;
     }
-    uint32_t inFlightTiles = 0;
-    for (const auto& tile : state.tiles) {
-        if (tile.issued && !tile.retired) {
-            inFlightTiles++;
-        }
-    }
-    for (uint32_t i = 0; i < state.tiles.size() && inFlightTiles < dmaPrefetchDepth_; ++i) {
+
+    for (uint32_t i = 0; i < state.tiles.size(); ++i) {
         auto& tile = state.tiles[i];
         if (tile.issued) {
             continue;
@@ -555,9 +767,9 @@ void RequestSchedulerEndpoint::enqueueWindowTiles(WorkerWindowTxnState& state)
         const uint32_t slotIdx = i % slotCount;
         const uint32_t kWindowTiles = std::max<uint32_t>(state.txn.kWindowTiles, 1u);
         const uint32_t totalKTileCount = std::max<uint32_t>(state.txn.totalKTileCount, kWindowTiles);
-        const bool matValid = !state.txn.skipMatRead &&
+        const bool matValid = state.txn.matStrideBytes > 0 && !state.txn.skipMatRead &&
                               (!state.txn.useIndependentMatVecTiles || i < state.txn.matTileCount);
-        const bool vecValid = !state.txn.skipVecRead &&
+        const bool vecValid = state.txn.vecStrideBytes > 0 && !state.txn.skipVecRead &&
                               (!state.txn.useIndependentMatVecTiles || i < state.txn.vecTileCount);
         const uint32_t matGroupIdx = state.txn.useIndependentMatVecTiles ? (i / kWindowTiles) : 0;
         const uint32_t matKIdx = state.txn.useIndependentMatVecTiles ? (i % kWindowTiles) : i;
@@ -581,43 +793,17 @@ void RequestSchedulerEndpoint::enqueueWindowTiles(WorkerWindowTxnState& state)
         const uint16_t vecTargetNode = (state.txn.memNodeSize > 0)
             ? static_cast<uint16_t>((vecSrcBase / state.txn.memNodeSize) % std::max<uint32_t>(numMemoryNodes_, 1u))
             : 0;
-        const uint64_t seqBase = (state.txnId << 20) | (static_cast<uint64_t>(i) & 0xfffffULL);
-        const uint64_t matRequestId = !matValid
-            ? 0
-            : ((static_cast<uint64_t>(coreId_ & 0xff) << 56) |
-               (static_cast<uint64_t>(0) << 48) |
-               (static_cast<uint64_t>(matTargetNode & 0xffff) << 32) |
-               (seqBase & 0xffffffffULL));
-        const uint64_t vecRequestId = !vecValid
-            ? 0
-            : ((static_cast<uint64_t>(coreId_ & 0xff) << 56) |
-               (static_cast<uint64_t>(1) << 48) |
-               (static_cast<uint64_t>(vecTargetNode & 0xffff) << 32) |
-               (seqBase & 0xffffffffULL));
 
-        tile.matRequestIds.assign(matValid ? 1 : 0, matRequestId);
-        tile.vecRequestIds.assign(vecValid ? 1 : 0, vecRequestId);
-        tile.matDoneSentKStep.assign(matValid ? 1 : 0, 0);
-        tile.vecDoneSentKStep.assign(vecValid ? 1 : 0, 0);
-
-        if (matValid) {
-            gm_->ctrlRegisterPendingReadRequest(matRequestId, matDstBase, gm_->ctrlGetReadFlagAddr(0),
-                                                matRequestId & 0xffffffffULL, state.txn.matStrideBytes);
-            pendingQ_.push_back({static_cast<uint8_t>(workerSlot_), static_cast<uint16_t>(coreId_), matRequestId,
-                                 matSrcBase, matDstBase, static_cast<uint32_t>(state.txn.matStrideBytes), matTargetNode,
-                                 gm_->ctrlGetReadFlagAddr(0), matRequestId & 0xffffffffULL});
-        }
-        if (vecValid) {
-            gm_->ctrlRegisterPendingReadRequest(vecRequestId, vecDstBase, gm_->ctrlGetReadFlagAddr(1),
-                                                vecRequestId & 0xffffffffULL, state.txn.vecStrideBytes);
-            pendingQ_.push_back({static_cast<uint8_t>(workerSlot_), static_cast<uint16_t>(coreId_), vecRequestId,
-                                 vecSrcBase, vecDstBase, static_cast<uint32_t>(state.txn.vecStrideBytes), vecTargetNode,
-                                 gm_->ctrlGetReadFlagAddr(1), vecRequestId & 0xffffffffULL});
-        }
+        tile.matRequestIds.clear();
+        tile.vecRequestIds.clear();
+        tile.matRequestIds.reserve(matValid ? 1 : 0);
+        tile.vecRequestIds.reserve(vecValid ? 1 : 0);
+        tile.matDoneSentKStep.clear();
+        tile.vecDoneSentKStep.clear();
 
         tile.kStepCount = 1;
-        tile.matRequestId = tile.matRequestIds.empty() ? 0 : tile.matRequestIds.front();
-        tile.vecRequestId = tile.vecRequestIds.empty() ? 0 : tile.vecRequestIds.front();
+        tile.matRequestId = 0;
+        tile.vecRequestId = 0;
         tile.submitCycle = lastTickCycle_;
         tile.matDoneCycle = matValid ? 0 : lastTickCycle_;
         tile.vecDoneCycle = vecValid ? 0 : lastTickCycle_;
@@ -626,7 +812,41 @@ void RequestSchedulerEndpoint::enqueueWindowTiles(WorkerWindowTxnState& state)
         tile.matDoneSent = !matValid;
         tile.vecDoneSent = !vecValid;
         tile.retired = false;
-        inFlightTiles++;
+
+        auto enqueuePanel = [&](uint8_t slot,
+                                uint64_t srcAddr,
+                                uint64_t dstAddr,
+                                uint32_t bytes,
+                                uint16_t targetNode) {
+            if (bytes == 0) {
+                return;
+            }
+            const uint64_t requestId = composeWindowRequestId(slot, targetNode, state.txnId, i);
+            const uint64_t flagAddr = gm_->ctrlGetReadFlagAddr(slot);
+            gm_->ctrlRegisterPendingReadRequest(requestId, dstAddr, flagAddr, requestId & 0xffffffffULL, bytes);
+            workerSubmitQ_.push_back({static_cast<uint8_t>(workerSlot_), static_cast<uint16_t>(coreId_), requestId,
+                                      srcAddr, dstAddr, bytes, targetNode,
+                                      flagAddr, requestId & 0xffffffffULL});
+
+            if (slot == 0) {
+                tile.matRequestId = requestId;
+                tile.matRequestIds.push_back(requestId);
+                tile.matDoneSentKStep.push_back(0);
+            } else {
+                tile.vecRequestId = requestId;
+                tile.vecRequestIds.push_back(requestId);
+                tile.vecDoneSentKStep.push_back(0);
+            }
+        };
+
+        if (matValid) {
+            enqueuePanel(0, matSrcBase, matDstBase,
+                         static_cast<uint32_t>(state.txn.matStrideBytes), matTargetNode);
+        }
+        if (vecValid) {
+            enqueuePanel(1, vecSrcBase, vecDstBase,
+                         static_cast<uint32_t>(state.txn.vecStrideBytes), vecTargetNode);
+        }
     }
 }
 
@@ -667,12 +887,23 @@ bool RequestSchedulerEndpoint::getTileKStepReadiness(
     }
     const auto& tile = txnIt->second.tiles[localTileIdx];
     if (!tile.matRequestIds.empty() || !tile.vecRequestIds.empty()) {
-        const size_t kSteps = std::max(tile.matRequestIds.size(), tile.vecRequestIds.size());
-        if (kStep >= kSteps) {
+        if (kStep > 0) {
             return false;
         }
-        matReady = kStep >= tile.matRequestIds.size() || !gm_->ctrlIsReadRequestPending(tile.matRequestIds[kStep]);
-        vecReady = kStep >= tile.vecRequestIds.size() || !gm_->ctrlIsReadRequestPending(tile.vecRequestIds[kStep]);
+        matReady = true;
+        for (uint64_t reqId : tile.matRequestIds) {
+            if (gm_->ctrlIsReadRequestPending(reqId)) {
+                matReady = false;
+                break;
+            }
+        }
+        vecReady = true;
+        for (uint64_t reqId : tile.vecRequestIds) {
+            if (gm_->ctrlIsReadRequestPending(reqId)) {
+                vecReady = false;
+                break;
+            }
+        }
         return true;
     }
     if (kStep > 0) {
@@ -773,9 +1004,30 @@ void RequestSchedulerEndpoint::handleReq(SST::Event* ev, int slot) {
                                   uint64_t completionFlagAddr,
                                   uint64_t completionValue) {
             traceSubmitAtManager(requestId, static_cast<uint8_t>(slot), targetNode);
-            if (pendingQ_.size() < queueDepth_) {
-                pendingQ_.push_back({static_cast<uint8_t>(slot), msg->srcCoreId, requestId, srcAddr, dstAddr,
-                                     bytes, targetNode, completionFlagAddr, completionValue});
+            if (targetNode >= nodeWorkerQueues_.size()) {
+                output_.verbose(CALL_INFO, 1, 0,
+                                "manager core=%u drop req=%" PRIu64 " invalid target node=%u\n",
+                                coreId_, requestId, targetNode);
+                return;
+            }
+            const size_t worker = static_cast<size_t>(slot);
+            if (worker >= nodeWorkerQueues_[targetNode].size()) {
+                output_.verbose(CALL_INFO, 1, 0,
+                                "manager core=%u drop req=%" PRIu64 " invalid worker slot=%zu\n",
+                                coreId_, requestId, worker);
+                return;
+            }
+            if (managerPendingCount() < queueDepth_) {
+                nodeWorkerQueues_[targetNode][worker].push_back({
+                    static_cast<uint8_t>(slot),
+                    msg->srcCoreId,
+                    requestId,
+                    srcAddr,
+                    dstAddr,
+                    bytes,
+                    targetNode,
+                    completionFlagAddr,
+                    completionValue});
             }
         };
 
@@ -808,50 +1060,20 @@ void RequestSchedulerEndpoint::handleReq(SST::Event* ev, int slot) {
                            msg->completionFlagAddr,
                            msg->completionValue);
         }
-    } else if (msg->type == RequestSchedulerMsgType::PARTIAL_CREDIT) {
-        auto recycle_partial = [&](uint64_t requestId, uint32_t units) {
-            if (requestId == 0 || units == 0) {
-                return;
-            }
-            const uint16_t node = static_cast<uint16_t>((requestId >> 32) & 0xffffULL);
-            if (node >= nodeCredits_.size()) {
-                return;
-            }
-            auto unitsIt = issuedNodeCreditUnits_.find(requestId);
-            if (unitsIt == issuedNodeCreditUnits_.end() || unitsIt->second == 0) {
-                return;
-            }
-            const uint32_t returned = std::min<uint32_t>(units, unitsIt->second);
-            unitsIt->second -= returned;
-            const uint32_t cap = initialNodeCredit_ == 0 ? 1 : initialNodeCredit_;
-            nodeCredits_[node] = std::min<uint32_t>(cap, nodeCredits_[node] + returned);
-        };
-
-        if (msg->batchCount > 0 && !msg->batchRequestIds.empty()) {
-            const size_t validCount = std::min(
-                static_cast<size_t>(msg->batchCount),
-                std::min(msg->batchRequestIds.size(), msg->batchBytes.size()));
-            for (size_t i = 0; i < validCount; ++i) {
-                recycle_partial(msg->batchRequestIds[i], msg->batchBytes[i]);
-            }
-        } else {
-            recycle_partial(msg->requestId, msg->bytes);
-        }
     } else if (msg->type == RequestSchedulerMsgType::DONE) {
         auto recycle_done = [&](uint64_t requestId, uint16_t targetNode, uint64_t pendingClearCycle) {
             uint16_t node = targetNode;
             if (requestId != 0) {
                 node = static_cast<uint16_t>((requestId >> 32) & 0xffffULL);
             }
-            if (node < nodeCredits_.size()) {
+            if (node < numMemoryNodes_) {
                 uint32_t units = 1;
                 auto unitsIt = issuedNodeCreditUnits_.find(requestId);
                 if (unitsIt != issuedNodeCreditUnits_.end()) {
                     units = unitsIt->second;
                     issuedNodeCreditUnits_.erase(unitsIt);
                 }
-                const uint32_t cap = initialNodeCredit_ == 0 ? 1 : initialNodeCredit_;
-                nodeCredits_[node] = std::min<uint32_t>(cap, nodeCredits_[node] + units);
+                releaseNodeCredits(node, units);
             }
             if (slot >= 0 && static_cast<size_t>(slot) < workerCredits_.size()) {
                 uint32_t& credit = workerCredits_[static_cast<size_t>(slot)];
@@ -1054,80 +1276,42 @@ void RequestSchedulerEndpoint::pollWorkerMailbox() {
 }
 
 void RequestSchedulerEndpoint::flushWorkerDirectSubmits() {
-    if (role_ != RequestSchedulerRole::WORKER || reqOut_ == nullptr || pendingQ_.empty()) {
-        return;
-    }
-    while (!pendingQ_.empty()) {
-        auto* msg = new RequestSchedulerMsg(RequestSchedulerMsgType::SUBMIT);
-        msg->groupId = static_cast<uint8_t>(groupId_);
-        msg->workerSlot = static_cast<uint8_t>(workerSlot_);
-        msg->srcCoreId = static_cast<uint16_t>(coreId_);
-        msg->batchCount = 0;
-        msg->batchRequestIds.reserve(submitBatchSize_);
-        msg->batchSrcAddrs.reserve(submitBatchSize_);
-        msg->batchDstAddrs.reserve(submitBatchSize_);
-        msg->batchBytes.reserve(submitBatchSize_);
-        msg->batchTargetNodes.reserve(submitBatchSize_);
-        msg->batchCompletionFlagAddrs.reserve(submitBatchSize_);
-        msg->batchCompletionValues.reserve(submitBatchSize_);
-        for (uint32_t count = 0; count < submitBatchSize_ && !pendingQ_.empty(); ++count) {
-            PendingTransfer req = pendingQ_.front();
-            pendingQ_.pop_front();
-            msg->batchRequestIds.push_back(req.requestId);
-            msg->batchSrcAddrs.push_back(req.srcAddr);
-            msg->batchDstAddrs.push_back(req.dstAddr);
-            msg->batchBytes.push_back(req.bytes);
-            msg->batchTargetNodes.push_back(req.targetNode);
-            msg->batchCompletionFlagAddrs.push_back(req.completionFlagAddr);
-            msg->batchCompletionValues.push_back(req.completionValue);
-        }
-        msg->batchCount = static_cast<uint16_t>(msg->batchRequestIds.size());
-        msg->requestId = msg->batchRequestIds.front();
-        msg->srcAddr = msg->batchSrcAddrs.front();
-        msg->dstAddr = msg->batchDstAddrs.front();
-        msg->bytes = msg->batchBytes.front();
-        msg->targetNode = msg->batchTargetNodes.front();
-        msg->completionFlagAddr = msg->batchCompletionFlagAddrs.front();
-        msg->completionValue = msg->batchCompletionValues.front();
-        reqOut_->send(msg);
-    }
-}
-
-void RequestSchedulerEndpoint::flushWorkerPartialCreditReturns() {
-    if (role_ != RequestSchedulerRole::WORKER || reqOut_ == nullptr || gm_ == nullptr) {
+    if (role_ != RequestSchedulerRole::WORKER || reqOut_ == nullptr || workerSubmitQ_.empty()) {
         return;
     }
 
-    const auto returns = gm_->ctrlDrainReadCreditReturns();
-    if (returns.empty()) {
-        return;
+    auto* msg = new RequestSchedulerMsg(RequestSchedulerMsgType::SUBMIT);
+    msg->groupId = static_cast<uint8_t>(groupId_);
+    msg->workerSlot = static_cast<uint8_t>(workerSlot_);
+    msg->srcCoreId = static_cast<uint16_t>(coreId_);
+    msg->batchCount = 0;
+    msg->batchRequestIds.reserve(submitBatchSize_);
+    msg->batchSrcAddrs.reserve(submitBatchSize_);
+    msg->batchDstAddrs.reserve(submitBatchSize_);
+    msg->batchBytes.reserve(submitBatchSize_);
+    msg->batchTargetNodes.reserve(submitBatchSize_);
+    msg->batchCompletionFlagAddrs.reserve(submitBatchSize_);
+    msg->batchCompletionValues.reserve(submitBatchSize_);
+    for (uint32_t count = 0; count < submitBatchSize_ && !workerSubmitQ_.empty(); ++count) {
+        PendingTransfer req = workerSubmitQ_.front();
+        workerSubmitQ_.pop_front();
+        msg->batchRequestIds.push_back(req.requestId);
+        msg->batchSrcAddrs.push_back(req.srcAddr);
+        msg->batchDstAddrs.push_back(req.dstAddr);
+        msg->batchBytes.push_back(req.bytes);
+        msg->batchTargetNodes.push_back(req.targetNode);
+        msg->batchCompletionFlagAddrs.push_back(req.completionFlagAddr);
+        msg->batchCompletionValues.push_back(req.completionValue);
     }
-
-    const size_t batchLimit = doneBatchSize_ > 0 ? doneBatchSize_ : 1;
-    for (size_t idx = 0; idx < returns.size();) {
-        auto* msg = new RequestSchedulerMsg(RequestSchedulerMsgType::PARTIAL_CREDIT);
-        msg->groupId = static_cast<uint8_t>(groupId_);
-        msg->workerSlot = static_cast<uint8_t>(workerSlot_);
-        msg->srcCoreId = static_cast<uint16_t>(coreId_);
-        msg->batchRequestIds.reserve(batchLimit);
-        msg->batchBytes.reserve(batchLimit);
-        for (; idx < returns.size() && msg->batchRequestIds.size() < batchLimit; ++idx) {
-            if (returns[idx].first == 0 || returns[idx].second == 0) {
-                continue;
-            }
-            msg->batchRequestIds.push_back(returns[idx].first);
-            msg->batchBytes.push_back(returns[idx].second);
-        }
-        if (msg->batchRequestIds.empty()) {
-            delete msg;
-            continue;
-        }
-        msg->batchCount = static_cast<uint16_t>(msg->batchRequestIds.size());
-        msg->requestId = msg->batchRequestIds.front();
-        msg->bytes = msg->batchBytes.front();
-        msg->targetNode = static_cast<uint16_t>((msg->requestId >> 32) & 0xffffULL);
-        reqOut_->send(msg);
-    }
+    msg->batchCount = static_cast<uint16_t>(msg->batchRequestIds.size());
+    msg->requestId = msg->batchRequestIds.front();
+    msg->srcAddr = msg->batchSrcAddrs.front();
+    msg->dstAddr = msg->batchDstAddrs.front();
+    msg->bytes = msg->batchBytes.front();
+    msg->targetNode = msg->batchTargetNodes.front();
+    msg->completionFlagAddr = msg->batchCompletionFlagAddrs.front();
+    msg->completionValue = msg->batchCompletionValues.front();
+    reqOut_->send(msg);
 }
 
 void RequestSchedulerEndpoint::flushWorkerDirectDones() {
@@ -1179,7 +1363,7 @@ void RequestSchedulerEndpoint::flushWorkerDirectDones() {
             if (doneIds.size() >= doneBatchSize_) {
                 flushDone();
             }
-        } else if (!tile.matRequestIds.empty() && !tile.vecRequestIds.empty()) {
+        } else if (!tile.matRequestIds.empty() || !tile.vecRequestIds.empty()) {
                 const size_t matSteps = tile.matRequestIds.size();
                 const size_t vecSteps = tile.vecRequestIds.size();
 
@@ -1408,159 +1592,242 @@ bool RequestSchedulerEndpoint::issueTransfer(const PendingTransfer& req) {
                                          req.requestId);
     snReq->size_in_bits = (sizeof(req.srcAddr) + sizeof(req.bytes) + sizeof(req.dstAddr)) * 8;
     snReq->givePayload(payload);
+    if (traceEvents_) {
+        snReq->setTraceID(makeMerlinTraceId(req.requestId));
+        snReq->setTraceType(SST::Interfaces::SimpleNetwork::Request::FULL);
+    }
     if (!linkControl_->send(snReq, snReq->vn)) {
         output_.verbose(CALL_INFO, 1, 0, "manager core=%u send blocked req=%" PRIu64 " node=%u\n",
                         coreId_, req.requestId, req.targetNode);
+        pressureNetworkSendBlocked_++;
         delete snReq;
         return false;
     }
-    output_.verbose(CALL_INFO, 1, 0, "manager core=%u issued req=%" PRIu64 " worker=%u node=%u src=0x%" PRIx64 " dst=0x%" PRIx64 " ep=%d\n",
-                    coreId_, req.requestId, req.workerCoreId, req.targetNode, req.srcAddr, req.dstAddr, workerEp);
+    output_.verbose(CALL_INFO, 1, 0,
+                    "manager core=%u issued req=%" PRIu64 " worker=%u node=%u src=0x%" PRIx64
+                    " dst=0x%" PRIx64 " bytes=%u ep=%d\n",
+                    coreId_, req.requestId, req.workerCoreId, req.targetNode,
+                    req.srcAddr, req.dstAddr, req.bytes, workerEp);
     traceIssueAtManager(req.requestId);
     return true;
 }
 
 void RequestSchedulerEndpoint::tryIssue() {
     if (role_ != RequestSchedulerRole::MANAGER) return;
-    if (pendingQ_.empty()) return;
-    refillSmoothTokens();
-    uint32_t issuedThisTick = 0;
-    auto hasIssueBudget = [&](uint32_t need) {
-        return issueBudgetPerTick_ == 0 || issuedThisTick + need <= issueBudgetPerTick_;
+    const size_t nodeCount = nodeWorkerQueues_.size();
+    if (nodeCount == 0 || managerPendingCount() == 0) return;
+
+    if (issueBudgetCycle_ != lastTickCycle_) {
+        issueBudgetCycle_ = lastTickCycle_;
+        issuedThisCycle_ = 0;
+    }
+
+    uint32_t issuedThisCall = 0;
+    auto hasIssueBudget = [&]() {
+        return issuedThisCycle_ < managerIssueBudgetPerTick_;
     };
-    auto hasSmoothTokens = [&](const PendingTransfer& req, uint32_t bytesNeed) {
-        if (!smoothStreamEnable_ || smoothReadBwBytesPerCycle_ <= 0.0) {
-            return true;
-        }
-        if (req.targetNode >= smoothReadTokens_.size()) {
-            return false;
-        }
-        return smoothReadTokens_[req.targetNode] + 0.5 >= static_cast<double>(bytesNeed);
+    if (!hasIssueBudget()) {
+        pressureIssuePaceBlocked_++;
+        return;
+    }
+
+    auto requestPriorityKey = [](const PendingTransfer& req) -> uint64_t {
+        const uint64_t seq = req.requestId & 0xffffffffULL;
+        const uint64_t txnSeq = seq >> WINDOW_REQUEST_TILE_BITS;
+        const uint64_t tileIdx = seq & WINDOW_REQUEST_TILE_MASK;
+        const uint64_t slot = decodeRequestSlot(req.requestId);
+        const uint64_t continuation = req.issuedBytes == 0 ? 0ULL : 1ULL;
+        return (txnSeq << 24) | (tileIdx << 8) | (continuation << 4) | (slot & 0x0fULL);
     };
-    auto consumeSmoothTokens = [&](const PendingTransfer& req, uint32_t bytesNeed) {
-        if (!smoothStreamEnable_ || smoothReadBwBytesPerCycle_ <= 0.0 || req.targetNode >= smoothReadTokens_.size()) {
-            return;
-        }
-        smoothReadTokens_[req.targetNode] = std::max<double>(0.0, smoothReadTokens_[req.targetNode] - static_cast<double>(bytesNeed));
+
+    auto hasWorkerCredit = [&](const PendingTransfer& req) {
+        return req.workerSlot < workerCredits_.size() && workerCredits_[req.workerSlot] != 0;
     };
-    auto canIssue = [&](const PendingTransfer& req, uint32_t workerNeed, uint32_t nodeNeed, uint32_t bytesNeed) {
-        if (!hasIssueBudget(workerNeed)) {
-            pressureIssueBudgetBlocked_++;
-            return false;
-        }
-        if (!hasSmoothTokens(req, bytesNeed)) {
-            pressureSmoothBlocked_++;
-            return false;
-        }
-        const bool worker_throttled =
-            req.workerSlot >= workerCredits_.size() ||
-            workerCredits_[req.workerSlot] < workerNeed;
-        if (worker_throttled) {
+
+    auto hasWorkerIssueRoom = [&](const PendingTransfer& req) {
+        return hasWorkerCredit(req);
+    };
+
+    auto canSpendWorker = [&](const PendingTransfer& req) {
+        if (!hasWorkerCredit(req)) {
             pressureWorkerCreditBlocked_++;
-            return false;
-        }
-        if (req.targetNode >= nodeCredits_.size() || nodeCredits_[req.targetNode] < nodeNeed) {
-            pressureNodeCreditBlocked_++;
             return false;
         }
         return true;
     };
-    auto siblingRequestId = [](uint64_t requestId) {
-        return requestId ^ (1ULL << 48);
+
+    auto spendIssued = [&](const PendingTransfer& panel, uint32_t nodeNeed, bool consumeWorkerCredit) {
+        if (consumeWorkerCredit) {
+            workerCredits_[panel.workerSlot]--;
+        }
+        issuedNodeCreditUnits_[panel.requestId] += nodeNeed;
+        issuedThisCycle_++;
+        issuedThisCall++;
+        pressureIssuedRequests_++;
+    };
+
+    auto issueQueueEntry = [&](std::deque<PendingTransfer>& q, size_t idx, PendingTransfer* issuedPanel) -> bool {
+        if (idx >= q.size()) {
+            return false;
+        }
+
+        PendingTransfer panel = q[idx];
+        const uint32_t chunkBytes = chunkBytesForTransfer(panel);
+        if (chunkBytes == 0) {
+            q.erase(q.begin() + static_cast<std::ptrdiff_t>(idx));
+            return false;
+        }
+
+        const bool consumeWorkerCredit = (panel.issuedBytes == 0);
+        if (consumeWorkerCredit && !canSpendWorker(panel)) {
+            return false;
+        }
+
+        PendingTransfer chunk = panel;
+        chunk.srcAddr = panel.srcAddr + panel.issuedBytes;
+        chunk.dstAddr = panel.dstAddr + panel.issuedBytes;
+        chunk.bytes = chunkBytes;
+        chunk.issuedBytes = 0;
+
+        const uint32_t nodeNeed = nodeCreditUnitsForBytes(chunk.bytes);
+        if (!acquireNodeBudget(chunk, nodeNeed)) {
+            return false;
+        }
+        if (!issueTransfer(chunk)) {
+            refundNodeBudget(chunk.targetNode, nodeNeed);
+            return false;
+        }
+
+        panel.issuedBytes += chunkBytes;
+        q.erase(q.begin() + static_cast<std::ptrdiff_t>(idx));
+        if (panel.issuedBytes < panel.bytes) {
+            q.push_back(panel);
+        }
+        spendIssued(panel, nodeNeed, consumeWorkerCredit);
+        if (issuedPanel != nullptr) {
+            *issuedPanel = panel;
+        }
+        return true;
+    };
+
+    auto chooseIssueCandidate = [&](std::deque<PendingTransfer>& q, size_t& chosenIdx) -> bool {
+        bool found = false;
+        uint64_t bestKey = 0;
+        for (size_t idx = 0; idx < q.size();) {
+            const uint32_t chunkBytes = chunkBytesForTransfer(q[idx]);
+            if (chunkBytes == 0) {
+                q.erase(q.begin() + static_cast<std::ptrdiff_t>(idx));
+                continue;
+            }
+            const bool consumeWorkerCredit = (q[idx].issuedBytes == 0);
+            if (consumeWorkerCredit && !hasWorkerIssueRoom(q[idx])) {
+                if (!hasWorkerCredit(q[idx])) {
+                    pressureWorkerCreditBlocked_++;
+                } else {
+                    pressureIssuePaceBlocked_++;
+                }
+                ++idx;
+                continue;
+            }
+            const uint64_t key = requestPriorityKey(q[idx]);
+            if (!found || key < bestKey) {
+                found = true;
+                bestKey = key;
+                chosenIdx = idx;
+            }
+            ++idx;
+        }
+        return found;
+    };
+
+    auto tryIssuePrioritySibling = [&](std::deque<PendingTransfer>& q, const PendingTransfer& issuedPanel) -> bool {
+        if (!hasIssueBudget()) {
+            return false;
+        }
+        const uint8_t slot = decodeRequestSlot(issuedPanel.requestId);
+        if (slot != 0 && slot != 1) {
+            return false;
+        }
+        pressurePriorityPairAttempts_++;
+
+        const uint64_t siblingId = decodeSiblingRequestId(issuedPanel.requestId);
+        size_t siblingIdx = q.size();
+        uint64_t bestKey = 0;
+        bool found = false;
+        for (size_t idx = 0; idx < q.size(); ++idx) {
+            if (q[idx].requestId != siblingId) {
+                continue;
+            }
+            const bool consumeWorkerCredit = (q[idx].issuedBytes == 0);
+            if (consumeWorkerCredit && !hasWorkerIssueRoom(q[idx])) {
+                if (!hasWorkerCredit(q[idx])) {
+                    pressureWorkerCreditBlocked_++;
+                } else {
+                    pressureIssuePaceBlocked_++;
+                }
+                continue;
+            }
+            const uint64_t key = requestPriorityKey(q[idx]);
+            if (!found || key < bestKey) {
+                found = true;
+                bestKey = key;
+                siblingIdx = idx;
+            }
+        }
+        if (!found) {
+            return false;
+        }
+
+        if (issueQueueEntry(q, siblingIdx, nullptr)) {
+            pressurePriorityPairIssued_++;
+            return true;
+        }
+        return false;
+    };
+
+    auto tryIssueFromQueue = [&](std::deque<PendingTransfer>& q) -> bool {
+        if (q.empty()) {
+            return false;
+        }
+
+        size_t idx = 0;
+        if (!chooseIssueCandidate(q, idx)) {
+            return false;
+        }
+
+        PendingTransfer issuedPanel{};
+        if (!issueQueueEntry(q, idx, &issuedPanel)) {
+            return false;
+        }
+        tryIssuePrioritySibling(q, issuedPanel);
+        return true;
     };
 
     bool progress = true;
-    while (progress && !pendingQ_.empty()) {
+    while (progress && managerPendingCount() != 0 && hasIssueBudget()) {
         progress = false;
+        const size_t nodeStart = nodeIssueCursor_;
 
-        for (uint32_t node = 0; node < numMemoryNodes_ && !progress; ++node) {
-            const size_t workerCount = std::max<size_t>(workerCredits_.size(), 1);
-            const size_t cursor = node < smoothNodeWorkerCursor_.size() ? smoothNodeWorkerCursor_[node] : 0;
-            for (size_t workerOff = 0; workerOff < workerCount && !progress; ++workerOff) {
-                const uint8_t worker = static_cast<uint8_t>((cursor + workerOff) % workerCount);
-                for (size_t idx = 0; idx < pendingQ_.size(); ++idx) {
-                    const PendingTransfer& first = pendingQ_[idx];
-                    if (first.targetNode != node || first.workerSlot != worker) {
-                        continue;
-                    }
-                    const uint64_t siblingId = siblingRequestId(first.requestId);
-                    size_t siblingIdx = pendingQ_.size();
-                    for (size_t j = idx + 1; j < pendingQ_.size(); ++j) {
-                        if (pendingQ_[j].requestId == siblingId) {
-                            siblingIdx = j;
-                            break;
-                        }
-                    }
-                    if (siblingIdx == pendingQ_.size()) {
-                        pressureNoSiblingBlocked_++;
-                        continue;
-                    }
-
-                    const PendingTransfer& second = pendingQ_[siblingIdx];
-                    if (first.workerSlot != second.workerSlot || first.targetNode != second.targetNode) {
-                        continue;
-                    }
-                    const uint32_t bytesNeed = first.bytes + second.bytes;
-                    const uint32_t nodeNeed = nodeCreditUnitsForBytes(first.bytes) + nodeCreditUnitsForBytes(second.bytes);
-                    if (!canIssue(first, 2, nodeNeed, bytesNeed)) {
-                        continue;
-                    }
-
-                    PendingTransfer reqA = first;
-                    PendingTransfer reqB = second;
-                    if (!issueTransfer(reqA) || !issueTransfer(reqB)) {
-                        continue;
-                    }
-
-                    const uint32_t reqAUnits = nodeCreditUnitsForBytes(reqA.bytes);
-                    const uint32_t reqBUnits = nodeCreditUnitsForBytes(reqB.bytes);
-                    nodeCredits_[reqA.targetNode] -= nodeNeed;
-                    workerCredits_[reqA.workerSlot] -= 2;
-                    issuedNodeCreditUnits_[reqA.requestId] = reqAUnits;
-                    issuedNodeCreditUnits_[reqB.requestId] = reqBUnits;
-                    consumeSmoothTokens(reqA, bytesNeed);
-                    issuedThisTick += 2;
-                    pressureIssuedRequests_ += 2;
-                    pressureIssuedPairs_++;
-                    pendingQ_.erase(pendingQ_.begin() + static_cast<std::ptrdiff_t>(siblingIdx));
-                    pendingQ_.erase(pendingQ_.begin() + static_cast<std::ptrdiff_t>(idx));
-                    if (node < smoothNodeWorkerCursor_.size()) {
-                        smoothNodeWorkerCursor_[node] = (static_cast<size_t>(worker) + 1) % workerCount;
-                    }
-                    progress = true;
-                    break;
-                }
+        for (size_t off = 0; off < nodeCount; ++off) {
+            const size_t node = (nodeStart + off) % nodeCount;
+            auto& perWorker = nodeWorkerQueues_[node];
+            if (perWorker.empty()) {
+                continue;
             }
-        }
-
-        if (progress || pendingQ_.empty()) {
-            continue;
-        }
-
-        for (uint32_t node = 0; node < numMemoryNodes_ && !progress; ++node) {
-            const size_t workerCount = std::max<size_t>(workerCredits_.size(), 1);
-            const size_t cursor = node < smoothNodeWorkerCursor_.size() ? smoothNodeWorkerCursor_[node] : 0;
-            for (size_t workerOff = 0; workerOff < workerCount && !progress; ++workerOff) {
-                const uint8_t worker = static_cast<uint8_t>((cursor + workerOff) % workerCount);
-                for (size_t idx = 0; idx < pendingQ_.size(); ++idx) {
-                    PendingTransfer req = pendingQ_[idx];
-                    if (req.targetNode != node || req.workerSlot != worker) {
-                        continue;
+            const size_t workerCount = perWorker.size();
+            const size_t startWorker = node < nodeWorkerIssueCursor_.size()
+                                           ? nodeWorkerIssueCursor_[node] % workerCount
+                                           : 0;
+            for (size_t workerOff = 0; workerOff < workerCount; ++workerOff) {
+                const size_t worker = (startWorker + workerOff) % workerCount;
+                if (perWorker[worker].empty()) {
+                    continue;
+                }
+                if (tryIssueFromQueue(perWorker[worker])) {
+                    if (node < nodeWorkerIssueCursor_.size()) {
+                        nodeWorkerIssueCursor_[node] = (worker + 1) % workerCount;
                     }
-                    const uint32_t nodeNeed = nodeCreditUnitsForBytes(req.bytes);
-                    if (!canIssue(req, 1, nodeNeed, req.bytes) || !issueTransfer(req)) {
-                        continue;
-                    }
-                    nodeCredits_[req.targetNode] -= nodeNeed;
-                    workerCredits_[req.workerSlot]--;
-                    issuedNodeCreditUnits_[req.requestId] = nodeNeed;
-                    consumeSmoothTokens(req, req.bytes);
-                    issuedThisTick++;
-                    pressureIssuedRequests_++;
-                    pendingQ_.erase(pendingQ_.begin() + static_cast<std::ptrdiff_t>(idx));
-                    if (node < smoothNodeWorkerCursor_.size()) {
-                        smoothNodeWorkerCursor_[node] = (static_cast<size_t>(worker) + 1) % workerCount;
-                    }
+                    nodeIssueCursor_ = (node + 1) % nodeCount;
                     progress = true;
                     break;
                 }
@@ -1568,18 +1835,12 @@ void RequestSchedulerEndpoint::tryIssue() {
         }
     }
 
-    if (issuedThisTick == 0) {
+    if (managerPendingCount() != 0 && !hasIssueBudget()) {
+        pressureIssuePaceBlocked_++;
+    }
+
+    if (issuedThisCall == 0 && managerPendingCount() != 0 && hasIssueBudget()) {
         pressureNoIssueTicks_++;
-    }
-}
-
-void RequestSchedulerEndpoint::refillSmoothTokens() {
-    if (!smoothStreamEnable_ || smoothReadBwBytesPerCycle_ <= 0.0 || smoothReadTokens_.empty()) {
-        return;
-    }
-    const double cap = static_cast<double>(std::max<uint32_t>(smoothTokenBurstBytes_, 1));
-    for (double& tokens : smoothReadTokens_) {
-        tokens = std::min<double>(cap, tokens + smoothReadBwBytesPerCycle_);
     }
 }
 
@@ -1587,9 +1848,7 @@ bool RequestSchedulerEndpoint::tick(SST::Cycle_t cycle) {
     lastTickCycle_ = cycle;
     if (role_ == RequestSchedulerRole::WORKER) {
         pollWorkerMailbox();
-        flushWorkerPartialCreditReturns();
         flushWorkerDirectSubmits();
-        flushWorkerPartialCreditReturns();
         flushWorkerDirectDones();
         refillWorkerWindows();
         flushWorkerDirectSubmits();

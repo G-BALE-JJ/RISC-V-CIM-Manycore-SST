@@ -20,6 +20,8 @@
 #include <unordered_map>
 #include <queue>
 #include <map>
+#include <algorithm>
+#include <cstddef>
 #include <cstdlib>
 #include <cctype>
 
@@ -47,9 +49,8 @@ class MemNICBase : public MemLinkBase {
         { "group",                       "(int) Group ID. See params 'sources' and 'destinations'. If not specified, the parent component will guess.", "1"},\
         { "sources",                     "(comma-separated list of ints) List of group IDs that serve as sources for this component. If not specified, defaults to 'group - 1'.", "group-1"},\
         { "destinations",                "(comma-separated list of ints) List of group IDs that serve as destinations for this component. If not specified, defaults to 'group + 1'.", "group+1"},\
-        { "golem_dma_response_chunk_bytes", "Internal Golem DMA READ response chunk size; 0 disables response splitting.", "0"},\
-        { "golem_dma_response_vn", "Virtual network used for bridged Golem DMA responses.", "0"},\
-        { "range_check",                 "(int) Enable initial check for overlapping memory ranges. 0=Disabled 1=Enabled", "1"}
+        { "range_check",                 "(int) Enable initial check for overlapping memory ranges. 0=Disabled 1=Enabled", "1"},\
+        { "golem_dma_response_drain_limit", "(int) Max queued Golem DMA responses drained per opportunity. 0 means unlimited.", "0"}
 
         SST_ELI_REGISTER_SUBCOMPONENT_DERIVED_API(SST::MemHierarchy::MemNICBase, SST::MemHierarchy::MemLinkBase)
 
@@ -517,9 +518,18 @@ class MemNICBase : public MemLinkBase {
             return size.getRoundedValue();
         }
 
+        static int makeGolemMerlinTraceId(uint64_t requestId) {
+            const uint64_t core = (requestId >> 56) & 0xffULL;
+            const uint64_t slot = (requestId >> 48) & 0xffULL;
+            const uint64_t node = (requestId >> 32) & 0xffULL;
+            const uint64_t seq = requestId & 0xfULL;
+            return static_cast<int>((core << 20) | (slot << 12) | (node << 4) | seq);
+        }
+
         // Drain a send queue
-        void drainQueue(std::queue<SST::Interfaces::SimpleNetwork::Request*>* queue, SST::Interfaces::SimpleNetwork* linkcontrol) {
-            while (!(queue->empty())) {
+        void drainQueue(std::queue<SST::Interfaces::SimpleNetwork::Request*>* queue, SST::Interfaces::SimpleNetwork* linkcontrol, size_t maxSends = 0) {
+            size_t sends = 0;
+            while (!(queue->empty()) && (maxSends == 0 || sends < maxSends)) {
                 SST::Interfaces::SimpleNetwork::Request* head = queue->front();
 #ifdef __SST_DEBUG_OUTPUT__
                 MemEventBase* ev = (static_cast<MemRtrEvent*>(head->inspectPayload()))->inspectEvent();
@@ -530,6 +540,7 @@ class MemNICBase : public MemLinkBase {
                 uint64_t golemTraceReq = 0;
                 uint64_t golemTraceAddr = 0;
                 size_t golemTraceLen = 0;
+                int golemTraceId = head->getTraceID();
                 if (auto* nd = dynamic_cast<SST::Golem::NetworkDataEvent*>(head->inspectPayload())) {
                     if (nd->getType() == SST::Golem::NetworkDataEvent::DMA_READ_COMPLETE) {
                         golemTraceReq = nd->getRequestId();
@@ -541,9 +552,10 @@ class MemNICBase : public MemLinkBase {
                 if (linkcontrol->spaceToSend(vn, head->size_in_bits) && linkcontrol->send(head, vn)) {
                     if (golem_dma_trace && golemTraceReq != 0) {
                         fprintf(stderr, "[memNICBase bridge] TRACE_REQ_RESP_CHUNK_SEND cycle=%" PRIu64
-                                        " req=%" PRIu64 " addr=0x%" PRIx64 " len=%zu queued=1 vn=%u\n",
-                                getCurrentSimCycle(), golemTraceReq, golemTraceAddr, golemTraceLen,
-                                static_cast<unsigned>(head->vn));
+                                        " req=%" PRIu64 " trace_id=%d addr=0x%" PRIx64
+                                        " len=%zu queued=1 vn=%u\n",
+                                getCurrentSimCycle(), golemTraceReq, golemTraceId, golemTraceAddr,
+                                golemTraceLen, static_cast<unsigned>(head->vn));
                     }
 
 #ifdef __SST_DEBUG_OUTPUT__
@@ -553,6 +565,7 @@ class MemNICBase : public MemLinkBase {
                     }
 #endif
                     queue->pop();
+                    sends++;
                 } else {
                     break;
                 }
@@ -560,7 +573,7 @@ class MemNICBase : public MemLinkBase {
         }
 
         MemRtrEvent* doRecv(SST::Interfaces::SimpleNetwork* linkcontrol) {
-            drainQueue(&golem_dma_send_queue_, linkcontrol);
+            drainQueue(&golem_dma_send_queue_, linkcontrol, golem_dma_response_drain_limit);
             SST::Interfaces::SimpleNetwork::Request* req = linkcontrol->recv(0);
             if (req != nullptr) {
                 Event* payload = req->takePayload();
@@ -681,10 +694,23 @@ class MemNICBase : public MemLinkBase {
 
             const uint64_t dest = info.returnEndpoint >= 0 ? static_cast<uint64_t>(info.returnEndpoint) : lookupNetworkAddress(ev->getDst());
 
-            auto sendOrQueue = [&](SST::Interfaces::SimpleNetwork::Request* req) {
-                if (!linkcontrol->send(req, static_cast<int>(req->vn))) {
+            auto sendOrQueue = [&](SST::Interfaces::SimpleNetwork::Request* req) -> bool {
+                const int vn = static_cast<int>(req->vn);
+                if (golem_dma_send_queue_.empty() &&
+                    linkcontrol->spaceToSend(vn, req->size_in_bits) &&
+                    linkcontrol->send(req, vn)) {
+                    if (golem_dma_trace && info.requestId != 0) {
+                        fprintf(stderr, "[memNICBase bridge] TRACE_REQ_RESP_CHUNK_SEND cycle=%" PRIu64
+                                        " req=%" PRIu64 " trace_id=%d addr=0x%" PRIx64
+                                        " len=%u queued=0 vn=%u\n",
+                                getCurrentSimCycle(), info.requestId, req->getTraceID(),
+                                info.returnAddr, info.size, static_cast<unsigned>(req->vn));
+                    }
+                    return false;
+                } else {
                     dbg.debug(_L2_, "%s failed to send bridged DMA response (buffer full), queueing retry.\n", getName().c_str());
                     golem_dma_send_queue_.push(req);
+                    return true;
                 }
             };
 
@@ -708,45 +734,40 @@ class MemNICBase : public MemLinkBase {
                 if (golem_dma_trace) {
                     fprintf(stderr, "[memNICBase bridge] send READ_RESP cycle=%" PRIu64
                                     " dst_ep=%" PRIu64 " return_addr=0x%" PRIx64
-                                    " size=%u data=%zu req=%" PRIu64
+                                    " size=%u data=%zu req=%" PRIu64 " trace_id=%d"
                                     " flag=0x%" PRIx64 " val=%" PRIu64 "\n",
                             getCurrentSimCycle(), dest, info.returnAddr, info.size, data.size(),
-                            info.requestId, info.completionFlagAddr, info.completionValue);
+                            info.requestId, makeGolemMerlinTraceId(info.requestId),
+                            info.completionFlagAddr, info.completionValue);
                 }
-                const size_t total = data.size();
-                const size_t responseChunk = (golem_dma_response_chunk_bytes > 0 && golem_dma_response_chunk_bytes < total)
-                    ? static_cast<size_t>(golem_dma_response_chunk_bytes)
-                    : total;
-                for (size_t offset = 0; offset < total; offset += responseChunk) {
-                    const size_t xfer = std::min(responseChunk, total - offset);
-                    std::vector<uint8_t> chunk(data.begin() + offset, data.begin() + offset + xfer);
-                    auto* req = new SST::Interfaces::SimpleNetwork::Request();
-                    req->src = this->info.addr;
-                    req->dest = dest;
-                    req->vn = golem_dma_response_vn;
-                    auto* respEv = new SST::Golem::NetworkDataEvent(
-                        SST::Golem::NetworkDataEvent::DMA_READ_COMPLETE,
-                        info.returnAddr + offset,
-                        xfer,
-                        chunk,
-                        info.returnAddr,
-                        info.returnEndpoint,
-                        info.completionFlagAddr,
-                        info.completionValue,
-                        info.requestId);
-                    req->size_in_bits = (sizeof(info.returnAddr) + sizeof(size_t) + chunk.size()) * 8;
-                    req->givePayload(respEv);
-                    if (linkcontrol->send(req, static_cast<int>(req->vn))) {
-                        if (golem_dma_trace) {
-                        fprintf(stderr, "[memNICBase bridge] TRACE_REQ_RESP_CHUNK_SEND cycle=%" PRIu64
-                                        " req=%" PRIu64 " addr=0x%" PRIx64 " len=%zu queued=0 vn=%u\n",
-                                getCurrentSimCycle(), info.requestId, info.returnAddr + offset, xfer,
-                                static_cast<unsigned>(req->vn));
-                        }
-                    } else {
-                        dbg.debug(_L2_, "%s failed to send bridged DMA response (buffer full), queueing retry.\n", getName().c_str());
-                        golem_dma_send_queue_.push(req);
-                    }
+                auto* req = new SST::Interfaces::SimpleNetwork::Request();
+                req->src = this->info.addr;
+                req->dest = dest;
+                req->vn = golem_dma_response_vn;
+                auto* respEv = new SST::Golem::NetworkDataEvent(
+                    SST::Golem::NetworkDataEvent::DMA_READ_COMPLETE,
+                    info.returnAddr,
+                    data.size(),
+                    data,
+                    info.returnAddr,
+                    info.returnEndpoint,
+                    info.completionFlagAddr,
+                    info.completionValue,
+                    info.requestId);
+                req->size_in_bits = (sizeof(info.returnAddr) + sizeof(size_t) + data.size()) * 8;
+                req->givePayload(respEv);
+                if (golem_dma_trace && info.requestId != 0) {
+                    req->setTraceID(makeGolemMerlinTraceId(info.requestId));
+                    req->setTraceType(SST::Interfaces::SimpleNetwork::Request::FULL);
+                }
+                const bool queued = sendOrQueue(req);
+                if (golem_dma_trace && queued) {
+                    fprintf(stderr, "[memNICBase bridge] TRACE_REQ_RESP_CHUNK_ENQUEUE cycle=%" PRIu64
+                                    " req=%" PRIu64 " trace_id=%d addr=0x%" PRIx64
+                                    " len=%zu queue=%zu vn=%u\n",
+                            getCurrentSimCycle(), info.requestId, req->getTraceID(),
+                            info.returnAddr, data.size(), golem_dma_send_queue_.size(),
+                            static_cast<unsigned>(req->vn));
                 }
             }
 
@@ -773,9 +794,9 @@ class MemNICBase : public MemLinkBase {
         // Other parameters
         std::unordered_set<uint32_t> sourceIDs, destIDs; // IDs which this endpoint cares about
         uint32_t range_check = true; // Enable overlapping range check
-        uint32_t golem_dma_response_chunk_bytes = 0;
         uint32_t golem_dma_response_vn = 0;
         uint32_t golem_dma_trace = 0;
+        size_t golem_dma_response_drain_limit = 0;
 
     private:
         static uint32_t envFlagDefault(const char* name, uint32_t defaultValue) {
@@ -816,9 +837,9 @@ class MemNICBase : public MemLinkBase {
             // range_check current is off(0) or on(1) but is using a uint32_t to 
             // allow for future selection of different algorithms.
             range_check=params.find<uint32_t>("range_check", 1);
-            golem_dma_response_chunk_bytes=params.find<uint32_t>("golem_dma_response_chunk_bytes", 0);
-            golem_dma_response_vn=params.find<uint32_t>("golem_dma_response_vn", 0);
+            golem_dma_response_vn=params.find<uint32_t>("num_vns", 1) >= 2 ? 1 : 0;
             golem_dma_trace=params.find<uint32_t>("golem_dma_trace", envFlagDefault("GOLEM_DMA_TRACE", 0));
+            golem_dma_response_drain_limit=params.find<size_t>("golem_dma_response_drain_limit", 0);
 
             std::stringstream sources, destinations;
             uint32_t id;

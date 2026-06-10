@@ -160,9 +160,6 @@ public:
         {"dma_read_max_retries", "Maximum retry attempts per DMA READ chunk", "8"},
         {"dma_read_max_inflight", "Maximum in-flight DMA READ chunks per core", "8"},
         {"dma_burst_bytes", "DMA chunk size in bytes for read/write burst splitting", "64"},
-        {"dma_credit_chunk_bytes", "Bytes represented by one scheduler node credit unit", "8192"},
-        {"dma_partial_credit_enable", "Return scheduler node credits as response chunks arrive", "1"},
-        {"dma_response_chunk_bytes", "Internal network response chunk size for logical READ replies; 0 disables splitting", "0"},
         {"dma_retry_tick_cpu_cycles", "CPU cycles represented by one DMA retry tick", "1"},
         {"memoryRouters", "Comma-separated memory router IDs for DMA fallback routing (e.g., \"24,0,1,2,3\")", ""}
     })
@@ -216,7 +213,6 @@ public:
                                         uint64_t completionFlagAddr, uint64_t completionValue,
                                         size_t totalLength = 0);
     bool ctrlIsReadRequestPending(uint64_t requestId) const;
-    std::vector<std::pair<uint64_t, uint32_t>> ctrlDrainReadCreditReturns();
     uint32_t getRequestVn() const { return request_vn; }
 
     SST::Output* output;
@@ -280,6 +276,8 @@ private:
         bool first_send_seen = false;
         uint64_t first_send_tick = 0;
         uint64_t last_send_tick = 0;
+        uint64_t first_send_cycle = 0;
+        uint64_t last_send_cycle = 0;
     };
 
     struct PendingReadReply {
@@ -293,7 +291,7 @@ private:
         uint64_t completion_value = 0;
         size_t total_len = 0;
         size_t received_len = 0;
-        uint32_t credit_units_returned = 0;
+        uint64_t submit_cycle = 0;
     };
 
     uint64_t baseAddr = 0;
@@ -321,7 +319,6 @@ private:
     std::unordered_map<uint64_t, bool> dma_completion_tokens;
     std::unordered_map<uint64_t, PendingReadReply> read_pending;
     std::unordered_map<uint64_t, PendingReadRequest> request_pending;
-    std::unordered_map<uint64_t, uint32_t> request_credit_returns;
     uint64_t next_dma_completion_token = 1;
     uint64_t next_dma_request_id = 1;
 
@@ -363,9 +360,6 @@ private:
     uint32_t dma_read_max_retries = 8;
     uint32_t dma_read_max_inflight = 8;
     uint32_t dma_burst_bytes = 64;
-    uint32_t dma_credit_chunk_bytes = 8192;
-    bool dma_partial_credit_enable = true;
-    uint32_t dma_response_chunk_bytes = 0;
     uint64_t dma_retry_tick_cpu_cycles = 1;
     bool gm_dump_data = false;
     bool dma_trace = false;
@@ -393,6 +387,15 @@ private:
     uint64_t dma_read_e2e_rtt_samples = 0;
     uint64_t dma_read_e2e_rtt_ticks_sum = 0;
     uint64_t dma_read_e2e_rtt_ticks_max = 0;
+    uint64_t dma_read_strict_rtt_samples = 0;
+    uint64_t dma_read_strict_rtt_cycles_sum = 0;
+    uint64_t dma_read_strict_rtt_cycles_max = 0;
+    uint64_t dma_read_strict_e2e_rtt_samples = 0;
+    uint64_t dma_read_strict_e2e_rtt_cycles_sum = 0;
+    uint64_t dma_read_strict_e2e_rtt_cycles_max = 0;
+    uint64_t request_read_submit_ready_samples = 0;
+    uint64_t request_read_submit_ready_cycles_sum = 0;
+    uint64_t request_read_submit_ready_cycles_max = 0;
     size_t send_retry_queue_max_depth = 0;
     std::unordered_map<SST::Interfaces::SimpleNetwork::Request*, uint64_t> dma_read_req_to_key;
 

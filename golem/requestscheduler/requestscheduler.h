@@ -22,7 +22,6 @@ namespace Golem {
 enum class RequestSchedulerMsgType : uint8_t {
     SUBMIT = 0,
     DONE = 1,
-    PARTIAL_CREDIT = 2,
 };
 
 enum class RequestSchedulerRole : uint8_t {
@@ -168,17 +167,17 @@ public:
         {"gm_size", "Local GM size", "0"},
         {"ctrl_latency", "Control link latency", "2ns"},
         {"queue_depth", "Manager queue depth", "64"},
-        {"initial_node_credit", "Legacy initial per-node transfer outstanding credit", "2"},
-        {"initial_node_chunk_credit", "Initial per-node DRAM-side chunk outstanding credit", "0"},
+        {"initial_node_credit", "Initial per-node transfer outstanding credit", "2"},
+        {"initial_node_chunk_credit", "Initial per-node byte-window credit", "0"},
         {"node_credit_chunk_bytes", "Bytes represented by one node credit unit", "512"},
-        {"dma_prefetch_depth", "Max in-flight tile pairs per worker", "2"},
+        {"panel_chunk_bytes", "Scheduler issue chunk size for one logical A/B panel", "2048"},
+        {"manager_issue_budget_per_tick", "Max manager-issued read requests per scheduler tick", "2"},
+        {"prefetch_windows", "WCP prefetch windows; 2D worker issue credit is derived from active+prefetch windows", "1"},
+        {"local_slot_count", "WCP local panel slot count used to derive worker credits", "2"},
+        {"a_reuse_n_tiles", "A reuse fanout used to derive worker credits", "1"},
+        {"b_reuse_m_tiles", "B reuse fanout used to derive worker credits", "1"},
         {"submit_batch_size", "Max logical submits packed into one worker->manager ctrl msg", "4"},
         {"done_batch_size", "Max local done entries packed into one worker->manager ctrl msg", "4"},
-        {"issue_budget_per_tick", "Max subrequests issued by a manager per tick; 0 means unlimited", "0"},
-        {"smooth_stream_enable", "Enable per-HBM-node token bucket smoothing", "0"},
-        {"smooth_read_bw_bytes_per_cycle", "Read token refill rate per target node in bytes/cycle", "0"},
-        {"smooth_write_bw_bytes_per_cycle", "Reserved for write token refill rate in bytes/cycle", "0"},
-        {"smooth_token_burst_bytes", "Per-node max accumulated read tokens", "65536"},
         {"num_memory_nodes", "HBM/data node count", "5"},
         {"infer_submit_bytes", "Infer submit bytes from request slot instead of mailbox bytes", "0"},
         {"slot0_bytes", "Inferred bytes for slot0 requests", "0"},
@@ -230,6 +229,7 @@ private:
         uint16_t targetNode;
         uint64_t completionFlagAddr;
         uint64_t completionValue;
+        uint32_t issuedBytes = 0;
     };
 
     struct WorkerTileRequestState {
@@ -284,16 +284,25 @@ private:
     bool handleSendAvailable(int vn);
     bool tick(SST::Cycle_t cycle);
     void pollWorkerMailbox();
-    void flushWorkerPartialCreditReturns();
     void flushWorkerDirectSubmits();
     void flushWorkerDirectDones();
     void flushDoneForWindowTransaction(WorkerWindowTxnState& state);
     void enqueueWindowTiles(WorkerWindowTxnState& state);
     void refillWorkerWindows();
-    void refillSmoothTokens();
     void tryIssue();
     bool issueTransfer(const PendingTransfer& req);
+    void initGlobalNodeFlow();
+    bool acquireNodeBudget(const PendingTransfer& req, uint32_t nodeNeed);
+    void releaseNodeCredits(uint16_t targetNode, uint32_t units);
+    void refundNodeBudget(uint16_t targetNode, uint32_t units);
+    uint32_t computeWorkerResidentK() const;
+    uint32_t computeWorkerCreditCap() const;
+    uint32_t computeWorkerSoftIssueCap() const;
+    uint64_t composeWindowRequestId(uint8_t slot, uint16_t targetNode, uint64_t txnId,
+                                    uint32_t tileIdx) const;
+    uint32_t chunkBytesForTransfer(const PendingTransfer& req) const;
     uint32_t nodeCreditUnitsForBytes(uint32_t bytes) const;
+    size_t managerPendingCount() const;
     void traceSubmitAtManager(uint64_t requestId, uint8_t workerSlot, uint16_t targetNode);
     void traceIssueAtManager(uint64_t requestId);
     void traceDoneAtManager(uint64_t requestId, uint64_t pendingClearCycle);
@@ -314,15 +323,16 @@ private:
     uint32_t queueDepth_;
     uint32_t initialNodeCredit_;
     uint32_t nodeCreditChunkBytes_;
-    uint32_t dmaPrefetchDepth_;
+    uint32_t panelChunkBytes_;
     uint32_t workerCreditCap_;
+    uint32_t workerSoftIssueCap_;
+    uint32_t managerIssueBudgetPerTick_;
     uint32_t submitBatchSize_;
     uint32_t doneBatchSize_;
-    uint32_t issueBudgetPerTick_;
-    bool smoothStreamEnable_;
-    double smoothReadBwBytesPerCycle_;
-    double smoothWriteBwBytesPerCycle_;
-    uint32_t smoothTokenBurstBytes_;
+    uint32_t prefetchWindowDepth_;
+    uint32_t localSlotCount_;
+    uint32_t aReuseNTiles_;
+    uint32_t bReuseMTiles_;
     uint32_t numMemoryNodes_;
     bool inferSubmitBytes_;
     bool traceEvents_;
@@ -340,18 +350,19 @@ private:
     int networkId_;
     GlobalMemoryImplement* gm_;
 
-    std::deque<PendingTransfer> pendingQ_;
-    std::vector<uint32_t> nodeCredits_;
+    std::deque<PendingTransfer> workerSubmitQ_;
+    std::vector<std::vector<std::deque<PendingTransfer>>> nodeWorkerQueues_;
     std::vector<uint32_t> workerCredits_;
     std::unordered_map<uint64_t, uint32_t> issuedNodeCreditUnits_;
-    std::vector<double> smoothReadTokens_;
-    std::vector<size_t> smoothNodeWorkerCursor_;
-    size_t scheduleCursor_;
+    size_t nodeIssueCursor_;
+    std::vector<size_t> nodeWorkerIssueCursor_;
     bool submitSeen_;
     bool doneSeen_;
     uint32_t windowKtiles_;
     uint64_t nextWindowTxnId_;
     uint64_t lastTickCycle_;
+    uint64_t issueBudgetCycle_;
+    uint32_t issuedThisCycle_;
     std::unordered_map<uint64_t, WorkerWindowTxnState> workerWindowTxns_;
     std::unordered_map<uint64_t, RequestTraceState> requestTrace_;
     std::unordered_set<uint64_t> tracePairIssueCounted_;
@@ -375,12 +386,12 @@ private:
     uint64_t pressurePendingNonEmptyTicks_ = 0;
     uint64_t pressureNoIssueTicks_ = 0;
     uint64_t pressureIssuedRequests_ = 0;
-    uint64_t pressureIssuedPairs_ = 0;
     uint64_t pressureWorkerCreditBlocked_ = 0;
     uint64_t pressureNodeCreditBlocked_ = 0;
-    uint64_t pressureIssueBudgetBlocked_ = 0;
-    uint64_t pressureSmoothBlocked_ = 0;
-    uint64_t pressureNoSiblingBlocked_ = 0;
+    uint64_t pressureIssuePaceBlocked_ = 0;
+    uint64_t pressureNetworkSendBlocked_ = 0;
+    uint64_t pressurePriorityPairAttempts_ = 0;
+    uint64_t pressurePriorityPairIssued_ = 0;
 };
 
 } // namespace Golem

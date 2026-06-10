@@ -83,16 +83,12 @@ GlobalMemoryImplement::GlobalMemoryImplement(ComponentId_t id, Params& params)
     dma_read_max_retries = params.find<uint32_t>("dma_read_max_retries", 8);
     dma_read_max_inflight = params.find<uint32_t>("dma_read_max_inflight", 8);
     dma_burst_bytes = params.find<uint32_t>("dma_burst_bytes", 64);
-    dma_credit_chunk_bytes = params.find<uint32_t>("dma_credit_chunk_bytes", 8192);
-    dma_partial_credit_enable = params.find<int>("dma_partial_credit_enable", 1) != 0;
-    dma_response_chunk_bytes = params.find<uint32_t>("dma_response_chunk_bytes", 0);
     dma_retry_tick_cpu_cycles = params.find<uint64_t>("dma_retry_tick_cpu_cycles", 1);
     gm_dump_data = params.find<int>("dump_data", 0) != 0;
     dma_trace = params.find<int>("dma_trace", envFlagDefault("GOLEM_DMA_TRACE", false) ? 1 : 0) != 0;
     if (dma_read_retry_ticks == 0) dma_read_retry_ticks = 1;
     if (dma_read_max_inflight == 0) dma_read_max_inflight = 1;
     if (dma_burst_bytes == 0) dma_burst_bytes = 64;
-    if (dma_credit_chunk_bytes == 0) dma_credit_chunk_bytes = 8192;
     if (dma_retry_tick_cpu_cycles == 0) dma_retry_tick_cpu_cycles = 1;
     core_id = params.find<int>("src_id", -1);
     if (core_id < 0) {
@@ -315,6 +311,7 @@ void GlobalMemoryImplement::ctrlRegisterPendingReadRequest(uint64_t requestId, u
     pending.completion_value = completionValue;
     pending.total_len = totalLength;
     pending.received_len = 0;
+    pending.submit_cycle = getCurrentSimCycle();
     request_pending[requestId] = pending;
     output->verbose(CALL_INFO, 1, 2,
                     "ctrlRegisterPendingReadRequest: core=%d req=%" PRIu64 " dst=0x%" PRIx64
@@ -325,19 +322,6 @@ void GlobalMemoryImplement::ctrlRegisterPendingReadRequest(uint64_t requestId, u
 bool GlobalMemoryImplement::ctrlIsReadRequestPending(uint64_t requestId) const
 {
     return request_pending.find(requestId) != request_pending.end();
-}
-
-std::vector<std::pair<uint64_t, uint32_t>> GlobalMemoryImplement::ctrlDrainReadCreditReturns()
-{
-    std::vector<std::pair<uint64_t, uint32_t>> out;
-    out.reserve(request_credit_returns.size());
-    for (const auto& entry : request_credit_returns) {
-        if (entry.second != 0) {
-            out.push_back(entry);
-        }
-    }
-    request_credit_returns.clear();
-    return out;
 }
 
 bool GlobalMemoryImplement::try_send_or_queue(SST::Interfaces::SimpleNetwork::Request* req, const char* context)
@@ -627,10 +611,12 @@ bool GlobalMemoryImplement::mark_dma_read_sent(SST::Interfaces::SimpleNetwork::R
 
     if (!op.first_send_seen) {
         op.first_send_tick = dma_retry_tick_counter;
+        op.first_send_cycle = getCurrentSimCycle();
         op.first_send_seen = true;
     }
     op.request_sent = true;
     op.last_send_tick = dma_retry_tick_counter;
+    op.last_send_cycle = getCurrentSimCycle();
     op.retry_ticks_left = dma_read_retry_ticks;
     return true;
 }
@@ -689,32 +675,14 @@ size_t GlobalMemoryImplement::count_issued_dma_reads() const {
 }
 
 void GlobalMemoryImplement::issue_pending_dma_read_window() {
-    auto is_direct_wcp_dma_read = [](const PendingDmaOp& op) {
-        return op.kind == PendingDmaOp::READ_TO_GM &&
-               op.completion_flag_addr == 0 &&
-               op.completion_value == 0 &&
-               op.completion_token != 0;
-    };
-
     size_t in_flight = count_issued_dma_reads();
     if (in_flight >= dma_read_max_inflight) {
         return;
     }
 
-    size_t direct_wcp_in_flight = 0;
-    for (const auto& entry : dma_pending) {
-        const PendingDmaOp& op = entry.second;
-        if (op.request_issued && is_direct_wcp_dma_read(op)) {
-            direct_wcp_in_flight++;
-        }
-    }
-
     for (auto& entry : dma_pending) {
         PendingDmaOp& op = entry.second;
         if (op.kind != PendingDmaOp::READ_TO_GM || op.request_issued) {
-            continue;
-        }
-        if (is_direct_wcp_dma_read(op) && direct_wcp_in_flight >= 1) {
             continue;
         }
 
@@ -723,12 +691,11 @@ void GlobalMemoryImplement::issue_pending_dma_read_window() {
         op.first_send_seen = false;
         op.first_send_tick = 0;
         op.last_send_tick = 0;
+        op.first_send_cycle = 0;
+        op.last_send_cycle = 0;
         op.retry_ticks_left = dma_read_retry_ticks;
         issue_dma_read_chunk(op, "dma_read_issue_window");
         in_flight++;
-        if (is_direct_wcp_dma_read(op)) {
-            direct_wcp_in_flight++;
-        }
         if (in_flight >= dma_read_max_inflight) {
             break;
         }
@@ -921,6 +888,15 @@ void GlobalMemoryImplement::finish() {
                                      : 0;
     uint64_t avg_e2e_rtt_cpu_cycles = avg_e2e_rtt_ticks * dma_retry_tick_cpu_cycles;
     uint64_t max_e2e_rtt_cpu_cycles = dma_read_e2e_rtt_ticks_max * dma_retry_tick_cpu_cycles;
+    uint64_t strict_avg_rtt_cycles = (dma_read_strict_rtt_samples > 0)
+                                         ? (dma_read_strict_rtt_cycles_sum / dma_read_strict_rtt_samples)
+                                         : 0;
+    uint64_t strict_avg_e2e_rtt_cycles = (dma_read_strict_e2e_rtt_samples > 0)
+                                             ? (dma_read_strict_e2e_rtt_cycles_sum / dma_read_strict_e2e_rtt_samples)
+                                             : 0;
+    uint64_t request_avg_submit_ready_cycles = (request_read_submit_ready_samples > 0)
+                                                   ? (request_read_submit_ready_cycles_sum / request_read_submit_ready_samples)
+                                                   : 0;
     output->output("GlobalMemory core=%d DMA READ stats: immediate_send=%" PRIu64
                    " queued_send=%" PRIu64 " flushed_send=%" PRIu64
                    " read_issue_count=%" PRIu64 " write_issue_count=%" PRIu64
@@ -933,6 +909,9 @@ void GlobalMemoryImplement::finish() {
                    " avg_rtt_cycles=%" PRIu64 " max_rtt_cycles=%" PRIu64
                    " avg_e2e_rtt_ticks=%" PRIu64 " max_e2e_rtt_ticks=%" PRIu64
                    " avg_e2e_rtt_cycles=%" PRIu64 " max_e2e_rtt_cycles=%" PRIu64
+                   " strict_avg_rtt_cycles=%" PRIu64 " strict_max_rtt_cycles=%" PRIu64
+                   " strict_avg_e2e_rtt_cycles=%" PRIu64 " strict_max_e2e_rtt_cycles=%" PRIu64
+                   " request_avg_submit_ready_cycles=%" PRIu64 " request_max_submit_ready_cycles=%" PRIu64
                    " send_retry_q_max=%zu\n",
                    core_id,
                    dma_read_send_immediate_count,
@@ -957,6 +936,12 @@ void GlobalMemoryImplement::finish() {
                    dma_read_e2e_rtt_ticks_max,
                    avg_e2e_rtt_cpu_cycles,
                    max_e2e_rtt_cpu_cycles,
+                   strict_avg_rtt_cycles,
+                   dma_read_strict_rtt_cycles_max,
+                   strict_avg_e2e_rtt_cycles,
+                   dma_read_strict_e2e_rtt_cycles_max,
+                   request_avg_submit_ready_cycles,
+                   request_read_submit_ready_cycles_max,
                    send_retry_queue_max_depth);
     link_control->finish();
 }
@@ -1292,19 +1277,16 @@ bool GlobalMemoryImplement::handle_receives(int vn) {
                 const uint64_t flagValue = pending.completion_value;
                 wr_to_globalmem(writeAddr, ev->getLength(), ev->getData());
                 pending.received_len += ev->getLength();
-                if (dma_partial_credit_enable && pending.total_len > 0) {
-                    const uint32_t totalUnits = static_cast<uint32_t>(
-                        (pending.total_len + dma_credit_chunk_bytes - 1) / dma_credit_chunk_bytes);
-                    const uint32_t readyUnits = pending.received_len >= pending.total_len
-                        ? totalUnits
-                        : static_cast<uint32_t>(pending.received_len / dma_credit_chunk_bytes);
-                    if (readyUnits > pending.credit_units_returned) {
-                        const uint32_t delta = readyUnits - pending.credit_units_returned;
-                        pending.credit_units_returned = readyUnits;
-                        request_credit_returns[ev->getRequestId()] += delta;
-                    }
-                }
                 if (pending.total_len == 0 || pending.received_len >= pending.total_len) {
+                    const uint64_t completeCycle = getCurrentSimCycle();
+                    if (completeCycle >= pending.submit_cycle) {
+                        const uint64_t submitReadyCycles = completeCycle - pending.submit_cycle;
+                        request_read_submit_ready_samples++;
+                        request_read_submit_ready_cycles_sum += submitReadyCycles;
+                        if (submitReadyCycles > request_read_submit_ready_cycles_max) {
+                            request_read_submit_ready_cycles_max = submitReadyCycles;
+                        }
+                    }
                     write_u64_to_storage(flagAddr, flagValue);
                     request_pending.erase(req_it);
                 }
@@ -1343,33 +1325,24 @@ bool GlobalMemoryImplement::handle_receives(int vn) {
             const int responseEndpoint = ev->getReturnEndpoint();
             const uint64_t completionFlagAddr = ev->getCompletionFlagAddr();
             const uint64_t completionValue = ev->getCompletionValue();
-            const size_t length = ev->getLength();
-            const size_t responseChunk = (dma_response_chunk_bytes > 0 && dma_response_chunk_bytes < length)
-                ? static_cast<size_t>(dma_response_chunk_bytes)
-                : length;
-            for (size_t offset = 0; offset < length; offset += responseChunk) {
-                const size_t xfer = std::min(responseChunk, length - offset);
-                std::vector<uint8_t> chunk(readData.begin() + static_cast<std::ptrdiff_t>(offset),
-                                           readData.begin() + static_cast<std::ptrdiff_t>(offset + xfer));
-                NetworkDataEvent* respEv = new NetworkDataEvent(
-                    NetworkDataEvent::WRITE,
-                    responseAddr + offset,
-                    xfer,
-                    chunk,
-                    responseAddr,
-                    responseEndpoint,
-                    completionFlagAddr,
-                    completionValue,
-                    ev->getRequestId());
-                SST::Interfaces::SimpleNetwork::Request* respReq = new SST::Interfaces::SimpleNetwork::Request();
-                respReq->src = network_id;
-                respReq->dest = (responseEndpoint >= 0) ? static_cast<SST::Interfaces::SimpleNetwork::nid_t>(responseEndpoint) : req->src;
-                size_t total_size_bytes = sizeof(ev->getAddr()) + sizeof(ev->getLength()) + chunk.size();
-                respReq->size_in_bits = total_size_bytes * 8;
-                respReq->vn = response_vn;
-                respReq->givePayload(respEv);
-                try_send_or_queue(respReq, "handle_receives:READ_reply");
-            }
+            NetworkDataEvent* respEv = new NetworkDataEvent(
+                NetworkDataEvent::WRITE,
+                responseAddr,
+                length,
+                readData,
+                responseAddr,
+                responseEndpoint,
+                completionFlagAddr,
+                completionValue,
+                ev->getRequestId());
+            SST::Interfaces::SimpleNetwork::Request* respReq = new SST::Interfaces::SimpleNetwork::Request();
+            respReq->src = network_id;
+            respReq->dest = (responseEndpoint >= 0) ? static_cast<SST::Interfaces::SimpleNetwork::nid_t>(responseEndpoint) : req->src;
+            size_t total_size_bytes = sizeof(ev->getAddr()) + sizeof(ev->getLength()) + readData.size();
+            respReq->size_in_bits = total_size_bytes * 8;
+            respReq->vn = response_vn;
+            respReq->givePayload(respEv);
+            try_send_or_queue(respReq, "handle_receives:READ_reply");
         }
         else if (ev->getType() == NetworkDataEvent::DMA_WRITE) {
             // DMA 写请求：直接写入本地内存
@@ -1408,6 +1381,7 @@ bool GlobalMemoryImplement::handle_receives(int vn) {
                 if (op.kind == PendingDmaOp::READ_TO_GM) {
                     dma_read_completion_count++;
                     if (op.request_sent) {
+                        const uint64_t completeCycle = getCurrentSimCycle();
                         const uint64_t last_try_rtt_ticks = dma_retry_tick_counter - op.last_send_tick;
                         dma_read_rtt_samples++;
                         dma_read_rtt_ticks_sum += last_try_rtt_ticks;
@@ -1422,6 +1396,23 @@ bool GlobalMemoryImplement::handle_receives(int vn) {
                         dma_read_e2e_rtt_ticks_sum += e2e_rtt_ticks;
                         if (e2e_rtt_ticks > dma_read_e2e_rtt_ticks_max) {
                             dma_read_e2e_rtt_ticks_max = e2e_rtt_ticks;
+                        }
+
+                        if (completeCycle >= op.last_send_cycle) {
+                            const uint64_t strictRttCycles = completeCycle - op.last_send_cycle;
+                            dma_read_strict_rtt_samples++;
+                            dma_read_strict_rtt_cycles_sum += strictRttCycles;
+                            if (strictRttCycles > dma_read_strict_rtt_cycles_max) {
+                                dma_read_strict_rtt_cycles_max = strictRttCycles;
+                            }
+                        }
+                        if (op.first_send_seen && completeCycle >= op.first_send_cycle) {
+                            const uint64_t strictE2eRttCycles = completeCycle - op.first_send_cycle;
+                            dma_read_strict_e2e_rtt_samples++;
+                            dma_read_strict_e2e_rtt_cycles_sum += strictE2eRttCycles;
+                            if (strictE2eRttCycles > dma_read_strict_e2e_rtt_cycles_max) {
+                                dma_read_strict_e2e_rtt_cycles_max = strictE2eRttCycles;
+                            }
                         }
                     }
                     // 写入数据到本地 GlobalMemory
@@ -1468,19 +1459,16 @@ bool GlobalMemoryImplement::handle_receives(int vn) {
                                 getCurrentSimCycle(), ev->getRequestId(), writeAddr, ev->getLength(),
                                 pending.received_len, pending.total_len);
                     }
-                    if (dma_partial_credit_enable && pending.total_len > 0) {
-                        const uint32_t totalUnits = static_cast<uint32_t>(
-                            (pending.total_len + dma_credit_chunk_bytes - 1) / dma_credit_chunk_bytes);
-                        const uint32_t readyUnits = pending.received_len >= pending.total_len
-                            ? totalUnits
-                            : static_cast<uint32_t>(pending.received_len / dma_credit_chunk_bytes);
-                        if (readyUnits > pending.credit_units_returned) {
-                            const uint32_t delta = readyUnits - pending.credit_units_returned;
-                            pending.credit_units_returned = readyUnits;
-                            request_credit_returns[ev->getRequestId()] += delta;
-                        }
-                    }
                     if (pending.total_len == 0 || pending.received_len >= pending.total_len) {
+                        const uint64_t completeCycle = getCurrentSimCycle();
+                        if (completeCycle >= pending.submit_cycle) {
+                            const uint64_t submitReadyCycles = completeCycle - pending.submit_cycle;
+                            request_read_submit_ready_samples++;
+                            request_read_submit_ready_cycles_sum += submitReadyCycles;
+                            if (submitReadyCycles > request_read_submit_ready_cycles_max) {
+                                request_read_submit_ready_cycles_max = submitReadyCycles;
+                            }
+                        }
                         write_u64_to_storage(flagAddr, flagValue);
                         if (dma_trace) {
                             fprintf(stderr, "[GlobalMemory] TRACE_REQ_PENDING_CLEAR cycle=%" PRIu64
@@ -1489,9 +1477,9 @@ bool GlobalMemoryImplement::handle_receives(int vn) {
                                     getCurrentSimCycle(), ev->getRequestId(), pending.received_len,
                                     pending.total_len, flagAddr, flagValue);
                         }
+                        dma_read_completion_count++;
                         request_pending.erase(req_it);
                     }
-                    dma_read_completion_count++;
                     output->verbose(CALL_INFO, 1, 2,
                                     "handle_receives: DMA_READ_COMPLETE req=%" PRIu64 " dst=0x%" PRIx64
                                     " flag=0x%" PRIx64 " val=%" PRIu64 " len=%zu\n",
@@ -1678,34 +1666,26 @@ bool GlobalMemoryImplement::handleDmaReceives(int vn) {
             std::vector<uint8_t> readData;
             rd_from_globalmem(addr, length, readData);
 
-            const size_t responseChunk = (dma_response_chunk_bytes > 0 && dma_response_chunk_bytes < length)
-                ? static_cast<size_t>(dma_response_chunk_bytes)
-                : length;
-            for (size_t offset = 0; offset < length; offset += responseChunk) {
-                const size_t xfer = std::min(responseChunk, length - offset);
-                std::vector<uint8_t> chunk(readData.begin() + static_cast<std::ptrdiff_t>(offset),
-                                           readData.begin() + static_cast<std::ptrdiff_t>(offset + xfer));
-                NetworkDataEvent* respEv = new NetworkDataEvent(
-                    NetworkDataEvent::DMA_READ_COMPLETE,
-                    ev->getReturnAddr() + offset,
-                    xfer,
-                    chunk,
-                    ev->getReturnAddr(),
-                    ev->getReturnEndpoint(),
-                    ev->getCompletionFlagAddr(),
-                    ev->getCompletionValue(),
-                    ev->getRequestId());
-                auto* respReq = new SST::Interfaces::SimpleNetwork::Request();
-                respReq->src = network_id;
-                respReq->dest = (ev->getReturnEndpoint() >= 0)
-                                    ? static_cast<SST::Interfaces::SimpleNetwork::nid_t>(ev->getReturnEndpoint())
-                                    : req->src;
-                respReq->vn = 0;
-                respReq->size_in_bits = (sizeof(addr) + sizeof(length) + chunk.size()) * 8;
-                respReq->givePayload(respEv);
+            NetworkDataEvent* respEv = new NetworkDataEvent(
+                NetworkDataEvent::DMA_READ_COMPLETE,
+                ev->getReturnAddr(),
+                length,
+                readData,
+                ev->getReturnAddr(),
+                ev->getReturnEndpoint(),
+                ev->getCompletionFlagAddr(),
+                ev->getCompletionValue(),
+                ev->getRequestId());
+            auto* respReq = new SST::Interfaces::SimpleNetwork::Request();
+            respReq->src = network_id;
+            respReq->dest = (ev->getReturnEndpoint() >= 0)
+                                ? static_cast<SST::Interfaces::SimpleNetwork::nid_t>(ev->getReturnEndpoint())
+                                : req->src;
+            respReq->vn = response_vn;
+            respReq->size_in_bits = (sizeof(addr) + sizeof(length) + readData.size()) * 8;
+            respReq->givePayload(respEv);
 
-                try_send_or_queue(respReq, "handleDmaReceives:DMA_READ_COMPLETE_reply");
-            }
+            try_send_or_queue(respReq, "handleDmaReceives:DMA_READ_COMPLETE_reply");
         }
         else if (ev->getType() == NetworkDataEvent::DMA_READ_COMPLETE) {
             // DMA 读完成通知：写入数据到本地 GlobalMemory 并调用回调
@@ -1729,12 +1709,48 @@ bool GlobalMemoryImplement::handleDmaReceives(int vn) {
             }
 
             // 查找对应的 pending 操作
-            auto it = dma_pending.find(ev->getAddr());
+            auto it = dma_pending.find(ev->getRequestId());
             if (it != dma_pending.end()) {
                 PendingDmaOp op = it->second;
                 dma_pending.erase(it);
 
                 if (op.kind == PendingDmaOp::READ_TO_GM) {
+                    dma_read_completion_count++;
+                    if (op.request_sent) {
+                        const uint64_t completeCycle = getCurrentSimCycle();
+                        const uint64_t last_try_rtt_ticks = dma_retry_tick_counter - op.last_send_tick;
+                        dma_read_rtt_samples++;
+                        dma_read_rtt_ticks_sum += last_try_rtt_ticks;
+                        if (last_try_rtt_ticks > dma_read_rtt_ticks_max) {
+                            dma_read_rtt_ticks_max = last_try_rtt_ticks;
+                        }
+
+                        const uint64_t e2e_rtt_ticks = op.first_send_seen
+                                                           ? (dma_retry_tick_counter - op.first_send_tick)
+                                                           : last_try_rtt_ticks;
+                        dma_read_e2e_rtt_samples++;
+                        dma_read_e2e_rtt_ticks_sum += e2e_rtt_ticks;
+                        if (e2e_rtt_ticks > dma_read_e2e_rtt_ticks_max) {
+                            dma_read_e2e_rtt_ticks_max = e2e_rtt_ticks;
+                        }
+
+                        if (completeCycle >= op.last_send_cycle) {
+                            const uint64_t strictRttCycles = completeCycle - op.last_send_cycle;
+                            dma_read_strict_rtt_samples++;
+                            dma_read_strict_rtt_cycles_sum += strictRttCycles;
+                            if (strictRttCycles > dma_read_strict_rtt_cycles_max) {
+                                dma_read_strict_rtt_cycles_max = strictRttCycles;
+                            }
+                        }
+                        if (op.first_send_seen && completeCycle >= op.first_send_cycle) {
+                            const uint64_t strictE2eRttCycles = completeCycle - op.first_send_cycle;
+                            dma_read_strict_e2e_rtt_samples++;
+                            dma_read_strict_e2e_rtt_cycles_sum += strictE2eRttCycles;
+                            if (strictE2eRttCycles > dma_read_strict_e2e_rtt_cycles_max) {
+                                dma_read_strict_e2e_rtt_cycles_max = strictE2eRttCycles;
+                            }
+                        }
+                    }
                     // 写入数据到本地 GlobalMemory
                     wr_to_globalmem(op.gm_dst_addr, ev->getData().size(), ev->getData());
 
@@ -1745,6 +1761,9 @@ bool GlobalMemoryImplement::handleDmaReceives(int vn) {
                             if (op.ctx->completion_enabled) {
                                 write_u64_to_storage(op.ctx->completion_flag_addr, op.ctx->completion_value);
                             }
+                            if (op.ctx->completion_token != 0) {
+                                dma_completion_tokens[op.ctx->completion_token] = true;
+                            }
                             if (op.ctx->cb) {
                                 op.ctx->cb(op.ctx->ok);
                             }
@@ -1753,15 +1772,55 @@ bool GlobalMemoryImplement::handleDmaReceives(int vn) {
                         if (op.completion_enabled) {
                             write_u64_to_storage(op.completion_flag_addr, op.completion_value);
                         }
+                        if (op.completion_token != 0) {
+                            dma_completion_tokens[op.completion_token] = true;
+                        }
                         if (op.cb) {
                             op.cb(true);
                         }
                     }
                 }
             } else {
-                output->verbose(CALL_INFO, 1, 2,
-                                "handleDmaReceives: No pending DMA operation found for request\n");
+                auto req_it = request_pending.find(ev->getRequestId());
+                if (req_it != request_pending.end()) {
+                    PendingReadRequest& pending = req_it->second;
+                    const uint64_t writeAddr = pending.total_len > 0 ? ev->getAddr() : pending.gm_dst_addr;
+                    const uint64_t flagAddr = pending.completion_flag_addr;
+                    const uint64_t flagValue = pending.completion_value;
+                    wr_to_globalmem(writeAddr, ev->getLength(), ev->getData());
+                    pending.received_len += ev->getLength();
+                    if (pending.total_len == 0 || pending.received_len >= pending.total_len) {
+                        const uint64_t completeCycle = getCurrentSimCycle();
+                        if (completeCycle >= pending.submit_cycle) {
+                            const uint64_t submitReadyCycles = completeCycle - pending.submit_cycle;
+                            request_read_submit_ready_samples++;
+                            request_read_submit_ready_cycles_sum += submitReadyCycles;
+                            if (submitReadyCycles > request_read_submit_ready_cycles_max) {
+                                request_read_submit_ready_cycles_max = submitReadyCycles;
+                            }
+                        }
+                        write_u64_to_storage(flagAddr, flagValue);
+                        dma_read_completion_count++;
+                        request_pending.erase(req_it);
+                    }
+                    output->verbose(CALL_INFO, 1, 2,
+                                    "handleDmaReceives: DMA_READ_COMPLETE req=%" PRIu64 " dst=0x%" PRIx64
+                                    " flag=0x%" PRIx64 " val=%" PRIu64 " len=%zu\n",
+                                    ev->getRequestId(), writeAddr,
+                                    flagAddr, flagValue,
+                                    ev->getLength());
+                } else if (ev->getCompletionFlagAddr() != 0) {
+                    wr_to_globalmem(ev->getAddr(), ev->getLength(), ev->getData());
+                    write_u64_to_storage(ev->getCompletionFlagAddr(), ev->getCompletionValue());
+                    dma_read_completion_count++;
+                } else {
+                    dma_read_completion_no_pending_count++;
+                    output->verbose(CALL_INFO, 1, 2,
+                                    "handleDmaReceives: No pending DMA operation found (requestId=%" PRIu64 ")\n",
+                                    ev->getRequestId());
+                }
             }
+            issue_pending_dma_read_window();
         }
 
         delete ev;

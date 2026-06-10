@@ -416,9 +416,6 @@ def infer_memnic_cycle_scale(issue_cycle_map, recv_cycle_map):
             continue
         ratios.append(recv / issue)
 
-    if len(ratios) < 32:
-        return 1.0
-
     ratios.sort()
     med = ratios[len(ratios) // 2]
     if 0.25 <= med <= 4.0:

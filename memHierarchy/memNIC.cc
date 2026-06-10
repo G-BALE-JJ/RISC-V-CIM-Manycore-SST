@@ -70,7 +70,7 @@ void MemNIC::complete(unsigned int phase) {
  * Returns whether anything sent this cycle
  */
 bool MemNIC::clock(SimTime_t cycle) {
-    drainQueue(&golem_dma_send_queue_, link_control);
+    drainQueue(&golem_dma_send_queue_, link_control, golem_dma_response_drain_limit);
     drainQueue(&sendQueue, link_control);
     if (sendQueue.empty() && golem_dma_send_queue_.empty()) {
         clockOn = false;

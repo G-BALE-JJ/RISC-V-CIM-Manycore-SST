@@ -102,10 +102,13 @@ GOLEM_WORKER_COMMAND_PROCESSOR_ENABLE="${GOLEM_WORKER_COMMAND_PROCESSOR_ENABLE:-
 GOLEM_A_REUSE_N_TILES="${GOLEM_A_REUSE_N_TILES:-1}"
 GOLEM_B_REUSE_M_TILES="${GOLEM_B_REUSE_M_TILES:-1}"
 GOLEM_ARCH_SCRIPT="${GOLEM_ARCH_SCRIPT:-architecture/ncores_selfcom_dma_ctrl.py}"
+GOLEM_DRAMSIM3_CONFIG="${GOLEM_DRAMSIM3_CONFIG:-$SCRIPT_DIR/architecture/dram/HBM_4Gb_x128.ini}"
 GOLEM_DMA_NODE_CREDITS="${GOLEM_DMA_NODE_CREDITS:-4}"
 GOLEM_DMA_NODE_CHUNK_CREDITS="${GOLEM_DMA_NODE_CHUNK_CREDITS:-}"
-GOLEM_DMA_PREFETCH_DEPTH="${GOLEM_DMA_PREFETCH_DEPTH:-2}"
+GOLEM_WCP_PREFETCH_WINDOWS="${GOLEM_WCP_PREFETCH_WINDOWS:-2}"
+GOLEM_DMA_WINDOW_K_TILES="${GOLEM_DMA_WINDOW_K_TILES:-4}"
 GOLEM_SCHED_SUBMIT_BATCH_SIZE="${GOLEM_SCHED_SUBMIT_BATCH_SIZE:-4}"
+GOLEM_SCHED_DONE_BATCH_SIZE="${GOLEM_SCHED_DONE_BATCH_SIZE:-8}"
 GOLEM_GEMM_M="${GOLEM_GEMM_M:-$GOLEM_ARRAY_OUTPUT_SIZE}"
 GOLEM_GEMM_N="${GOLEM_GEMM_N:-$GOLEM_NUM_ARRAYS}"
 GOLEM_GEMM_K="${GOLEM_GEMM_K:-$GOLEM_ARRAY_INPUT_SIZE}"
@@ -120,10 +123,11 @@ GOLEM_BIAS_ENABLE="${GOLEM_BIAS_ENABLE:-0}"
 GOLEM_BIAS_VALUE="${GOLEM_BIAS_VALUE:-0}"
 GOLEM_DMA_READ_RETRY_TICKS="${GOLEM_DMA_READ_RETRY_TICKS:-256}"
 GOLEM_DMA_READ_MAX_RETRIES="${GOLEM_DMA_READ_MAX_RETRIES:-8}"
-GOLEM_DMA_BURST_BYTES="${GOLEM_DMA_BURST_BYTES:-512}"
+GOLEM_DMA_BURST_BYTES="${GOLEM_DMA_BURST_BYTES:-16384}"
+GOLEM_DMA_PANEL_CHUNK_BYTES="${GOLEM_DMA_PANEL_CHUNK_BYTES:-16384}"
 GOLEM_DMA_CREDIT_CHUNK_BYTES="${GOLEM_DMA_CREDIT_CHUNK_BYTES:-8192}"
-GOLEM_DMA_PARTIAL_CREDIT_ENABLE="${GOLEM_DMA_PARTIAL_CREDIT_ENABLE:-1}"
-GOLEM_DMA_RESPONSE_CHUNK_BYTES="${GOLEM_DMA_RESPONSE_CHUNK_BYTES:-$GOLEM_DMA_CREDIT_CHUNK_BYTES}"
+GOLEM_DMA_RESPONSE_DRAIN_LIMIT="${GOLEM_DMA_RESPONSE_DRAIN_LIMIT:-0}"
+GOLEM_SCHED_ISSUE_BUDGET_PER_TICK="${GOLEM_SCHED_ISSUE_BUDGET_PER_TICK:-2}"
 GOLEM_LATENCY_MVM_GM2IMAT="${GOLEM_LATENCY_MVM_GM2IMAT:-10}"
 GOLEM_LATENCY_MVM_GM2IVEC="${GOLEM_LATENCY_MVM_GM2IVEC:-10}"
 GOLEM_LATENCY_MVM_OVEC2GM="${GOLEM_LATENCY_MVM_OVEC2GM:-10}"
@@ -811,6 +815,10 @@ while [[ $# -gt 0 ]]; do
 			GOLEM_DMA_READ_MAX_RETRIES="$2"; shift 2 ;;
 		--dma-burst-bytes)
 			GOLEM_DMA_BURST_BYTES="$2"; shift 2 ;;
+		--dma-panel-chunk-bytes)
+			GOLEM_DMA_PANEL_CHUNK_BYTES="$2"; shift 2 ;;
+		--dma-response-drain-limit)
+			GOLEM_DMA_RESPONSE_DRAIN_LIMIT="$2"; shift 2 ;;
 		--progress-heartbeat)
 			GOLEM_PROGRESS_HEARTBEAT="$2"; shift 2 ;;
 		--progress-interval-cycles)
@@ -1064,19 +1072,45 @@ if ! [[ "$GOLEM_B_REUSE_M_TILES" =~ ^[0-9]+$ ]] || [[ "$GOLEM_B_REUSE_M_TILES" -
 	exit 1
 fi
 
+if ! [[ "$GOLEM_DMA_WINDOW_K_TILES" =~ ^[0-9]+$ ]] || [[ "$GOLEM_DMA_WINDOW_K_TILES" -le 0 ]]; then
+	echo "[ERROR] GOLEM_DMA_WINDOW_K_TILES 必须为正整数，收到: $GOLEM_DMA_WINDOW_K_TILES" >&2
+	exit 1
+fi
+
+DERIVED_WCP_RESIDENT_K_TILES=$GOLEM_DMA_WINDOW_K_TILES
+if [[ "$DERIVED_WCP_RESIDENT_K_TILES" -gt "$DERIVED_GEMM_K_TILES" ]]; then
+	DERIVED_WCP_RESIDENT_K_TILES=$DERIVED_GEMM_K_TILES
+fi
+
 if [[ "$GOLEM_A_REUSE_N_TILES" -gt 1 && "$GOLEM_B_REUSE_M_TILES" -gt 1 ]]; then
 	if [[ "$GOLEM_A_REUSE_N_TILES" -ne "$GOLEM_B_REUSE_M_TILES" ]]; then
 		echo "[ERROR] 当前 2D full-K 第一版要求 square reuse，收到 A=$GOLEM_A_REUSE_N_TILES B=$GOLEM_B_REUSE_M_TILES" >&2
 		exit 1
 	fi
 	# The worker command processor uses slot-driven K windows for 2D reuse, so local slots
-	# only need to hold ping-pong resident windows rather than all K tiles at once.
+	# only need to hold active+prefetch resident windows rather than all K tiles at once.
 	if [[ "${GOLEM_WORKER_COMMAND_PROCESSOR_ENABLE:-1}" != "0" ]]; then
-		mat_resident_k=$(( GOLEM_DMA_SLOT_COUNT / (2 * GOLEM_B_REUSE_M_TILES) ))
-		vec_resident_k=$(( GOLEM_DMA_SLOT_COUNT / (2 * GOLEM_A_REUSE_N_TILES) ))
-		if [[ "$mat_resident_k" -le 0 || "$vec_resident_k" -le 0 ]]; then
-			echo "[ERROR] 当前 2D K-window 要求 local_slot_count 至少容纳 ping-pong residentK=1，收到 slots=$GOLEM_DMA_SLOT_COUNT A=$GOLEM_A_REUSE_N_TILES B=$GOLEM_B_REUSE_M_TILES" >&2
+		wcp_prefetch_windows=$GOLEM_WCP_PREFETCH_WINDOWS
+		if ! [[ "$wcp_prefetch_windows" =~ ^[0-9]+$ ]] || [[ "$wcp_prefetch_windows" -le 0 ]]; then
+			echo "[ERROR] GOLEM_WCP_PREFETCH_WINDOWS 必须为正整数，收到: $GOLEM_WCP_PREFETCH_WINDOWS" >&2
 			exit 1
+		fi
+		wcp_window_buffers=$(( wcp_prefetch_windows + 1 ))
+		if [[ "$wcp_window_buffers" -lt 2 ]]; then
+			wcp_window_buffers=2
+		fi
+		mat_resident_k=$(( GOLEM_DMA_SLOT_COUNT / (wcp_window_buffers * GOLEM_B_REUSE_M_TILES) ))
+		vec_resident_k=$(( GOLEM_DMA_SLOT_COUNT / (wcp_window_buffers * GOLEM_A_REUSE_N_TILES) ))
+		if [[ "$mat_resident_k" -le 0 || "$vec_resident_k" -le 0 ]]; then
+			echo "[ERROR] 当前 2D K-window 要求 local_slot_count 至少容纳 active+prefetch residentK=1，收到 slots=$GOLEM_DMA_SLOT_COUNT A=$GOLEM_A_REUSE_N_TILES B=$GOLEM_B_REUSE_M_TILES prefetch_windows=$GOLEM_WCP_PREFETCH_WINDOWS buffers=$wcp_window_buffers" >&2
+			exit 1
+		fi
+		slot_resident_k=$mat_resident_k
+		if [[ "$vec_resident_k" -lt "$slot_resident_k" ]]; then
+			slot_resident_k=$vec_resident_k
+		fi
+		if [[ "$DERIVED_WCP_RESIDENT_K_TILES" -gt "$slot_resident_k" ]]; then
+			DERIVED_WCP_RESIDENT_K_TILES=$slot_resident_k
 		fi
 	else
 		mat_slots_needed=$(( GOLEM_B_REUSE_M_TILES * DERIVED_GEMM_K_TILES ))
@@ -1167,28 +1201,60 @@ if ! [[ "$GOLEM_DMA_BURST_BYTES" =~ ^[0-9]+$ ]] || [[ "$GOLEM_DMA_BURST_BYTES" -
 	exit 1
 fi
 
+if ! [[ "$GOLEM_DMA_PANEL_CHUNK_BYTES" =~ ^[0-9]+$ ]] || [[ "$GOLEM_DMA_PANEL_CHUNK_BYTES" -le 0 ]]; then
+	echo "[ERROR] GOLEM_DMA_PANEL_CHUNK_BYTES 必须为正整数，收到: $GOLEM_DMA_PANEL_CHUNK_BYTES" >&2
+	exit 1
+fi
+
 if ! [[ "$GOLEM_DMA_CREDIT_CHUNK_BYTES" =~ ^[0-9]+$ ]] || [[ "$GOLEM_DMA_CREDIT_CHUNK_BYTES" -le 0 ]]; then
 	echo "[ERROR] GOLEM_DMA_CREDIT_CHUNK_BYTES 必须为正整数，收到: $GOLEM_DMA_CREDIT_CHUNK_BYTES" >&2
 	exit 1
 fi
 
-if ! [[ "$GOLEM_DMA_RESPONSE_CHUNK_BYTES" =~ ^[0-9]+$ ]]; then
-	echo "[ERROR] GOLEM_DMA_RESPONSE_CHUNK_BYTES 必须为非负整数，收到: $GOLEM_DMA_RESPONSE_CHUNK_BYTES" >&2
+if ! [[ "$GOLEM_DMA_RESPONSE_DRAIN_LIMIT" =~ ^[0-9]+$ ]]; then
+	echo "[ERROR] GOLEM_DMA_RESPONSE_DRAIN_LIMIT 必须为非负整数，收到: $GOLEM_DMA_RESPONSE_DRAIN_LIMIT" >&2
+	exit 1
+fi
+
+if ! [[ "$GOLEM_SCHED_ISSUE_BUDGET_PER_TICK" =~ ^[0-9]+$ ]] || [[ "$GOLEM_SCHED_ISSUE_BUDGET_PER_TICK" -le 0 ]]; then
+	echo "[ERROR] GOLEM_SCHED_ISSUE_BUDGET_PER_TICK 必须为正整数，收到: $GOLEM_SCHED_ISSUE_BUDGET_PER_TICK" >&2
 	exit 1
 fi
 
 if [[ -z "$GOLEM_DMA_NODE_CHUNK_CREDITS" ]]; then
-	max_sched_transfer_bytes=$(( GOLEM_GEMM_BLOCK_M * GOLEM_GEMM_BLOCK_K * 4 ))
-	vec_sched_transfer_bytes=$(( GOLEM_GEMM_BLOCK_N * GOLEM_GEMM_BLOCK_K * 4 ))
-	if [[ "$vec_sched_transfer_bytes" -gt "$max_sched_transfer_bytes" ]]; then
-		max_sched_transfer_bytes=$vec_sched_transfer_bytes
+	mat_sched_transfer_bytes=$(( GOLEM_GEMM_BLOCK_M * GOLEM_GEMM_BLOCK_K * ELEM_BYTES ))
+	vec_sched_transfer_bytes=$(( GOLEM_GEMM_BLOCK_N * GOLEM_GEMM_BLOCK_K * ELEM_BYTES ))
+	mat_transfer_credit_chunks=$(( (mat_sched_transfer_bytes + GOLEM_DMA_CREDIT_CHUNK_BYTES - 1) / GOLEM_DMA_CREDIT_CHUNK_BYTES ))
+	vec_transfer_credit_chunks=$(( (vec_sched_transfer_bytes + GOLEM_DMA_CREDIT_CHUNK_BYTES - 1) / GOLEM_DMA_CREDIT_CHUNK_BYTES ))
+	wcp_credit_window_buffers=$(( GOLEM_WCP_PREFETCH_WINDOWS + 1 ))
+	if [[ "$wcp_credit_window_buffers" -lt 1 ]]; then
+		wcp_credit_window_buffers=1
 	fi
-	transfer_credit_chunks=$(( (max_sched_transfer_bytes + GOLEM_DMA_CREDIT_CHUNK_BYTES - 1) / GOLEM_DMA_CREDIT_CHUNK_BYTES ))
-	GOLEM_DMA_NODE_CHUNK_CREDITS=$(( GOLEM_DMA_NODE_CREDITS * transfer_credit_chunks ))
+	if [[ "$GOLEM_GROUP_MANAGER_ENABLE" == "1" ]]; then
+		derived_active_workers=$(( GOLEM_TOTAL_GEMM_CORES - GOLEM_TOTAL_GROUPS ))
+	else
+		derived_active_workers=$GOLEM_TOTAL_GEMM_CORES
+	fi
+	if [[ "$derived_active_workers" -le 0 ]]; then
+		echo "[ERROR] 推导 DMA node chunk credit 需要 active worker > 0，收到 gemm_cores=$GOLEM_TOTAL_GEMM_CORES groups=$GOLEM_TOTAL_GROUPS group_manager=$GOLEM_GROUP_MANAGER_ENABLE" >&2
+		exit 1
+	fi
+	per_worker_ab_credit_chunks=$(( DERIVED_WCP_RESIDENT_K_TILES * (GOLEM_B_REUSE_M_TILES * mat_transfer_credit_chunks + GOLEM_A_REUSE_N_TILES * vec_transfer_credit_chunks) ))
+	GOLEM_DMA_NODE_CHUNK_CREDITS=$(( derived_active_workers * wcp_credit_window_buffers * per_worker_ab_credit_chunks ))
 fi
 
 if ! [[ "$GOLEM_DMA_NODE_CHUNK_CREDITS" =~ ^[0-9]+$ ]] || [[ "$GOLEM_DMA_NODE_CHUNK_CREDITS" -le 0 ]]; then
 	echo "[ERROR] GOLEM_DMA_NODE_CHUNK_CREDITS 必须为正整数，收到: $GOLEM_DMA_NODE_CHUNK_CREDITS" >&2
+	exit 1
+fi
+
+if ! [[ "$GOLEM_SCHED_SUBMIT_BATCH_SIZE" =~ ^[0-9]+$ ]] || [[ "$GOLEM_SCHED_SUBMIT_BATCH_SIZE" -le 0 ]]; then
+	echo "[ERROR] GOLEM_SCHED_SUBMIT_BATCH_SIZE 必须为正整数，收到: $GOLEM_SCHED_SUBMIT_BATCH_SIZE" >&2
+	exit 1
+fi
+
+if ! [[ "$GOLEM_SCHED_DONE_BATCH_SIZE" =~ ^[0-9]+$ ]] || [[ "$GOLEM_SCHED_DONE_BATCH_SIZE" -le 0 ]]; then
+	echo "[ERROR] GOLEM_SCHED_DONE_BATCH_SIZE 必须为正整数，收到: $GOLEM_SCHED_DONE_BATCH_SIZE" >&2
 	exit 1
 fi
 
@@ -1359,6 +1425,7 @@ export GOLEM_PRINT_CORE_MAP="$PRINT_CORE_MAP"
 export GOLEM_MVM_VERIFY_SUMMARY_FILE="$MVM_VERIFY_SUMMARY_FILE"
 export GOLEM_VERIFY_MVM="$VERIFY_MVM"
 export GOLEM_VERIFY_C="$VERIFY_C"
+export GOLEM_DRAMSIM3_CONFIG
 export VANADIS_PIPE_TRACE="${VANADIS_PIPE_TRACE:-$LOG_DIR/vanadis_trace.txt}"
 
 export GOLEM_TOTAL_GROUPS
@@ -1382,10 +1449,12 @@ export GOLEM_A_REUSE_N_TILES
 export GOLEM_B_REUSE_M_TILES
 export GOLEM_DMA_NODE_CREDITS
 export GOLEM_DMA_NODE_CHUNK_CREDITS
+export GOLEM_DMA_PANEL_CHUNK_BYTES
 export GOLEM_DMA_CREDIT_CHUNK_BYTES
-export GOLEM_DMA_PARTIAL_CREDIT_ENABLE
-export GOLEM_DMA_RESPONSE_CHUNK_BYTES
+export GOLEM_DMA_RESPONSE_DRAIN_LIMIT
+export GOLEM_SCHED_ISSUE_BUDGET_PER_TICK
 export GOLEM_DMA_SLOT_COUNT
+export GOLEM_DMA_WINDOW_K_TILES
 export GOLEM_GEMM_M
 export GOLEM_GEMM_N
 export GOLEM_GEMM_K
@@ -1447,8 +1516,9 @@ export GOLEM_GM_DUMP_DATA
 export GOLEM_MVM_DUMP_ENABLE
 export GOLEM_MVM_DUMP_DIR
 export GOLEM_MVM_DUMP_MODE
-export GOLEM_DMA_PREFETCH_DEPTH
+export GOLEM_WCP_PREFETCH_WINDOWS
 export GOLEM_SCHED_SUBMIT_BATCH_SIZE
+export GOLEM_SCHED_DONE_BATCH_SIZE
 export GOLEM_TENSOR_A_FILE="$TENSOR_A_FILE"
 export GOLEM_TENSOR_B_FILE="$TENSOR_B_FILE"
 export GOLEM_DUMP_C_FILE="$DUMP_C_FILE"
@@ -1479,12 +1549,16 @@ echo "  GOLEM_A_REUSE_N_TILES=$GOLEM_A_REUSE_N_TILES"
 echo "  GOLEM_B_REUSE_M_TILES=$GOLEM_B_REUSE_M_TILES"
 echo "  GOLEM_DMA_NODE_CREDITS(legacy transfer credits)=$GOLEM_DMA_NODE_CREDITS"
 echo "  GOLEM_DMA_NODE_CHUNK_CREDITS=$GOLEM_DMA_NODE_CHUNK_CREDITS"
+echo "  GOLEM_DMA_PANEL_CHUNK_BYTES=$GOLEM_DMA_PANEL_CHUNK_BYTES"
 echo "  GOLEM_DMA_CREDIT_CHUNK_BYTES=$GOLEM_DMA_CREDIT_CHUNK_BYTES"
-echo "  GOLEM_DMA_PARTIAL_CREDIT_ENABLE=$GOLEM_DMA_PARTIAL_CREDIT_ENABLE"
-echo "  GOLEM_DMA_RESPONSE_CHUNK_BYTES=$GOLEM_DMA_RESPONSE_CHUNK_BYTES"
+echo "  GOLEM_DMA_RESPONSE_DRAIN_LIMIT=$GOLEM_DMA_RESPONSE_DRAIN_LIMIT"
+echo "  GOLEM_SCHED_ISSUE_BUDGET_PER_TICK=$GOLEM_SCHED_ISSUE_BUDGET_PER_TICK"
 echo "  GOLEM_DMA_SLOT_COUNT=$GOLEM_DMA_SLOT_COUNT"
-echo "  GOLEM_DMA_PREFETCH_DEPTH=$GOLEM_DMA_PREFETCH_DEPTH"
+echo "  GOLEM_DMA_WINDOW_K_TILES=$GOLEM_DMA_WINDOW_K_TILES"
+echo "  GOLEM_WCP_PREFETCH_WINDOWS=$GOLEM_WCP_PREFETCH_WINDOWS"
+echo "  GOLEM_WCP_RESIDENT_K_TILES(derived)=$DERIVED_WCP_RESIDENT_K_TILES"
 echo "  GOLEM_SCHED_SUBMIT_BATCH_SIZE=$GOLEM_SCHED_SUBMIT_BATCH_SIZE"
+echo "  GOLEM_SCHED_DONE_BATCH_SIZE=$GOLEM_SCHED_DONE_BATCH_SIZE"
 echo "  GOLEM_GEMM_K_TILES(derived)=$DERIVED_GEMM_K_TILES"
 echo "  GOLEM_GEMM_M=$GOLEM_GEMM_M"
 echo "  GOLEM_GEMM_N=$GOLEM_GEMM_N"
@@ -2028,6 +2102,10 @@ def read_metric_value_csv(path: Path):
                 out[f"{row[0]}_mean"] = row[1]
             if len(row) >= 4:
                 out[f"{row[0]}_p95"] = row[3]
+            if len(row) >= 5:
+                out[f"{row[0]}_min"] = row[4]
+            if len(row) >= 6:
+                out[f"{row[0]}_max"] = row[5]
             if len(row) >= 7:
                 out[f"{row[0]}_sum"] = row[6]
         return out
@@ -2048,11 +2126,37 @@ def _to_float(value, default=0.0):
         return default
 
 
-def compute_hbm_readonly_tccdl_util_pct(execution, memory):
-    total_cycles = _to_float(execution.get("total_cycles", ""), 0.0)
-    if total_cycles <= 0:
-        return "", "", ""
+def _read_ini_number(path: Path, key: str, default=0.0):
+    if not path.exists():
+        return default
+    pat = re.compile(rf"^\s*{re.escape(key)}\s*=\s*([^;#\s]+)")
+    for line in path.read_text(errors="ignore").splitlines():
+        m = pat.match(line)
+        if not m:
+            continue
+        return _to_float(m.group(1), default)
+    return default
 
+
+def _hbm_read_cmd_bytes(default=64.0):
+    if "GOLEM_HBM_READ_BYTES_PER_CMD" in os.environ:
+        return _to_float(os.environ.get("GOLEM_HBM_READ_BYTES_PER_CMD"), default)
+    config = Path(os.environ.get("GOLEM_DRAMSIM3_CONFIG", ""))
+    bl = _read_ini_number(config, "BL", 4.0)
+    bus_width = _read_ini_number(config, "bus_width", 128.0)
+    if bl > 0 and bus_width > 0:
+        return bl * bus_width / 8.0
+    return default
+
+
+def _hbm_tccd_l_cycles(default=3.0):
+    if "GOLEM_HBM_TCCD_L_CYCLES" in os.environ:
+        return _to_float(os.environ.get("GOLEM_HBM_TCCD_L_CYCLES"), default)
+    config = Path(os.environ.get("GOLEM_DRAMSIM3_CONFIG", ""))
+    return _read_ini_number(config, "tCCD_L", default)
+
+
+def compute_hbm_readonly_tccdl_util_pct(execution, memory, backend_window_cycles, backend_active_cycles):
     elem_bytes = 4
     m = _to_int(os.environ.get("GOLEM_GEMM_M", ""))
     n = _to_int(os.environ.get("GOLEM_GEMM_N", ""))
@@ -2063,7 +2167,7 @@ def compute_hbm_readonly_tccdl_util_pct(execution, memory):
     a_reuse_n = max(1, _to_int(os.environ.get("GOLEM_A_REUSE_N_TILES", "1"), 1))
     b_reuse_m = max(1, _to_int(os.environ.get("GOLEM_B_REUSE_M_TILES", "1"), 1))
     if min(m, n, k, block_m, block_n, block_k) <= 0:
-        return "", "", ""
+        return "", "", "", "", "", "", ""
 
     m_tiles = math.ceil(m / block_m)
     n_tiles = math.ceil(n / block_n)
@@ -2083,22 +2187,57 @@ def compute_hbm_readonly_tccdl_util_pct(execution, memory):
 
     data_nodes = max(1, _to_int(os.environ.get("GOLEM_NUM_MEMORY_NODES", "1"), 1) - 1)
     channel_count = max(1, _to_int(memory.get("channel_count", "16"), 16))
-    bytes_per_read_cmd = _to_float(os.environ.get("GOLEM_HBM_READ_BYTES_PER_CMD", "64"), 64.0)
-    tccd_l_cycles = _to_float(os.environ.get("GOLEM_HBM_TCCD_L_CYCLES", "3"), 3.0)
+    bytes_per_read_cmd = _hbm_read_cmd_bytes(64.0)
+    tccd_l_cycles = _hbm_tccd_l_cycles(3.0)
     if bytes_per_read_cmd <= 0 or tccd_l_cycles <= 0:
-        return "", str(useful_read_bytes), ""
+        return "", "", "", "", str(useful_read_bytes), "", ""
 
     roofline_bytes_per_cycle = data_nodes * channel_count * bytes_per_read_cmd / tccd_l_cycles
-    util_pct = 100.0 * useful_read_bytes / (total_cycles * roofline_bytes_per_cycle)
-    return f"{util_pct:.6f}", str(useful_read_bytes), f"{roofline_bytes_per_cycle:.6f}"
+    gemm_system_cycles = _to_float(execution.get("gemm_system_latency_cycles", ""), 0.0)
+    system_pressure_pct = ""
+    if gemm_system_cycles > 0:
+        system_pressure_pct = f"{100.0 * useful_read_bytes / (gemm_system_cycles * roofline_bytes_per_cycle):.6f}"
+
+    worker_total_cycles = _to_float(execution.get("total_cycles", ""), 0.0)
+    worker_pressure_pct = ""
+    if worker_total_cycles > 0:
+        worker_pressure_pct = f"{100.0 * useful_read_bytes / (worker_total_cycles * roofline_bytes_per_cycle):.6f}"
+
+    backend_window_util_pct = ""
+    if backend_window_cycles > 0:
+        backend_window_util_pct = f"{100.0 * useful_read_bytes / (backend_window_cycles * roofline_bytes_per_cycle):.6f}"
+
+    backend_util_pct = ""
+    if backend_active_cycles > 0:
+        backend_util_pct = f"{100.0 * useful_read_bytes / (backend_active_cycles * roofline_bytes_per_cycle):.6f}"
+
+    return (
+        system_pressure_pct,
+        backend_window_util_pct,
+        backend_util_pct,
+        worker_pressure_pct,
+        str(useful_read_bytes),
+        f"{roofline_bytes_per_cycle:.6f}",
+        f"{tccd_l_cycles:.6f}",
+    )
 
 simulated_time = ""
+backend_read_window_cycles = 0
+backend_read_active_cycles = 0
 if log_path.exists():
-    pat = re.compile(r"Simulation is complete, simulated time:\s*(.+)$")
+    sim_pat = re.compile(r"Simulation is complete, simulated time:\s*(.+)$")
+    backend_window_pat = re.compile(r"DRAMSIM3_BACKEND_READ_SERVICE_WINDOW_GLOBAL\b.*\bwindow_cycles=(\d+)")
+    backend_active_pat = re.compile(r"DRAMSIM3_BACKEND_READ_ACTIVE_WINDOW_GLOBAL\b.*\bactive_cycles=(\d+)")
     for line in log_path.read_text(errors="ignore").splitlines():
-        m = pat.search(line)
+        m = sim_pat.search(line)
         if m:
             simulated_time = m.group(1).strip()
+        m = backend_window_pat.search(line)
+        if m:
+            backend_read_window_cycles = _to_int(m.group(1), 0)
+        m = backend_active_pat.search(line)
+        if m:
+            backend_read_active_cycles = _to_int(m.group(1), 0)
 
 execution = read_metric_value_csv(execution_summary)
 dma = read_metric_value_csv(dma_summary)
@@ -2108,10 +2247,13 @@ noc_latency = read_metric_value_csv(noc_latency_summary)
 memory_queue = read_metric_value_csv(memory_queue_summary)
 causal = read_metric_value_csv(causal_summary)
 hotspot = read_metric_value_csv(noc_hotspot_summary)
-hbm_util_pct, hbm_useful_read_bytes, hbm_roofline_bpc = compute_hbm_readonly_tccdl_util_pct(execution, memory)
+hbm_util_pct, hbm_backend_window_util_pct, hbm_backend_active_util_pct, hbm_worker_pressure_pct, hbm_useful_read_bytes, hbm_roofline_bpc, hbm_tccd_l_cycles = compute_hbm_readonly_tccdl_util_pct(
+    execution, memory, backend_read_window_cycles, backend_read_active_cycles
+)
 
 record = {
     "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
+    "run_id": os.environ.get("GOLEM_RUN_ID", ""),
     "log_file": str(log_path),
     "overlap": f"overlap{os.environ.get('GOLEM_DMA_OVERLAP', '0')}",
     "array_input_size": os.environ.get("GOLEM_ARRAY_INPUT_SIZE", ""),
@@ -2128,14 +2270,15 @@ record = {
     "gemm_cores": os.environ.get("GOLEM_TOTAL_GEMM_CORES", ""),
     "num_mem_nodes": os.environ.get("GOLEM_NUM_MEMORY_NODES", ""),
     "dma_node_credits": os.environ.get("GOLEM_DMA_NODE_CREDITS", ""),
-	"dma_node_chunk_credits": os.environ.get("GOLEM_DMA_NODE_CHUNK_CREDITS", ""),
-	"dma_credit_chunk_bytes": os.environ.get("GOLEM_DMA_CREDIT_CHUNK_BYTES", ""),
-	"dma_partial_credit_enable": os.environ.get("GOLEM_DMA_PARTIAL_CREDIT_ENABLE", ""),
-	"dma_response_chunk_bytes": os.environ.get("GOLEM_DMA_RESPONSE_CHUNK_BYTES", ""),
-	"dma_prefetch_depth": os.environ.get("GOLEM_DMA_PREFETCH_DEPTH", ""),
-	"submit_batch_size": os.environ.get("GOLEM_SCHED_SUBMIT_BATCH_SIZE", ""),
+    "dma_node_chunk_credits": os.environ.get("GOLEM_DMA_NODE_CHUNK_CREDITS", ""),
+    "dma_panel_chunk_bytes": os.environ.get("GOLEM_DMA_PANEL_CHUNK_BYTES", ""),
+    "dma_credit_chunk_bytes": os.environ.get("GOLEM_DMA_CREDIT_CHUNK_BYTES", ""),
+    "wcp_prefetch_windows": os.environ.get("GOLEM_WCP_PREFETCH_WINDOWS", ""),
+    "submit_batch_size": os.environ.get("GOLEM_SCHED_SUBMIT_BATCH_SIZE", ""),
+    "done_batch_size": os.environ.get("GOLEM_SCHED_DONE_BATCH_SIZE", ""),
     "dma_retry_ticks": os.environ.get("GOLEM_DMA_READ_RETRY_TICKS", ""),
     "dma_burst_bytes": os.environ.get("GOLEM_DMA_BURST_BYTES", ""),
+    "dma_response_drain_limit": os.environ.get("GOLEM_DMA_RESPONSE_DRAIN_LIMIT", ""),
     "dma_stagger_cycles": os.environ.get("GOLEM_DMA_STAGGER_CYCLES", ""),
     "ctrl_overlap_ab": os.environ.get("GOLEM_CTRL_OVERLAP_AB", ""),
     "noc_link_bw": os.environ.get("GOLEM_NOC_LINK_BW", ""),
@@ -2145,9 +2288,17 @@ record = {
     "wall_time_sec": str(wall_time_sec),
      "simulated_time": simulated_time,
      "exec_total_cycles": execution.get("total_cycles", ""),
+     "gemm_system_latency_cycles": execution.get("gemm_system_latency_cycles", ""),
+     "gemm_system_start_cycle": execution.get("gemm_system_start_cycle", ""),
+     "gemm_system_end_cycle": execution.get("gemm_system_end_cycle", ""),
      "exec_avg_throughput_ops_per_cycle": execution.get("avg_throughput_ops_per_cycle", ""),
+     "exec_system_avg_throughput_ops_per_cycle": execution.get("system_avg_throughput_ops_per_cycle", ""),
      "exec_peak_throughput_ops_per_cycle": execution.get("peak_throughput_ops_per_cycle", ""),
      "exec_array_utilization_pct": execution.get("array_utilization_pct", ""),
+     "exec_system_array_utilization_pct": execution.get("system_array_utilization_pct", ""),
+     "exec_worker_avg_array_efficiency_pct": execution.get("worker_avg_array_efficiency_pct", ""),
+     "exec_worker_p95_total_cycles": execution.get("worker_p95_total_cycles", ""),
+     "exec_worker_max_total_cycles": execution.get("worker_max_total_cycles", ""),
      "exec_breakdown_compute_active_time": execution.get("compute_active_time", ""),
      "exec_breakdown_prefetch_wait_time": execution.get("prefetch_wait_time", ""),
      "exec_breakdown_writeback_wait_time": execution.get("writeback_wait_time", ""),
@@ -2165,6 +2316,14 @@ record = {
     "dma_wait_count_sum": dma.get("wait_count_sum", ""),
     "dma_avg_rtt_cycles_mean": dma.get("avg_rtt_cycles_mean", ""),
     "dma_max_rtt_cycles_p95": dma.get("max_rtt_cycles_p95", ""),
+    "dma_strict_rtt_samples_sum": dma.get("strict_rtt_samples_sum", ""),
+    "dma_strict_rtt_cycles_sum": dma.get("strict_rtt_cycles_sum_sum", ""),
+    "dma_strict_avg_rtt_cycles_mean": dma.get("strict_avg_rtt_cycles_mean", ""),
+    "dma_strict_max_rtt_cycles_max": dma.get("strict_max_rtt_cycles_max", ""),
+    "dma_strict_e2e_rtt_samples_sum": dma.get("strict_e2e_rtt_samples_sum", ""),
+    "dma_strict_e2e_rtt_cycles_sum": dma.get("strict_e2e_rtt_cycles_sum_sum", ""),
+    "dma_strict_avg_e2e_rtt_cycles_mean": dma.get("strict_avg_e2e_rtt_cycles_mean", ""),
+    "dma_strict_max_e2e_rtt_cycles_max": dma.get("strict_max_e2e_rtt_cycles_max", ""),
     "noc_total_xbar_stalls": noc.get("total_xbar_stalls", ""),
     "noc_hotspot_top5pct_port_util_pct": noc.get("hotspot_top5pct_port_util_pct", ""),
     "noc_max_port_util_pct": noc.get("max_port_util_pct", ""),
@@ -2184,8 +2343,15 @@ record = {
     "memory_p95_read_latency_bucket_cycles": memory.get("mem_p95_read_latency_bucket_cycles", ""),
     "memory_read_tail_ge_100_pct": memory.get("mem_read_tail_ge_100_pct", ""),
     "hbm_utilization_pct": hbm_util_pct,
+    "hbm_pressure_vs_gemm_system_pct": hbm_util_pct,
+    "hbm_backend_service_window_utilization_pct": hbm_backend_window_util_pct,
+    "hbm_backend_active_utilization_pct": hbm_backend_active_util_pct,
+    "hbm_backend_read_window_cycles": str(backend_read_window_cycles) if backend_read_window_cycles > 0 else "",
+    "hbm_backend_read_active_cycles": str(backend_read_active_cycles) if backend_read_active_cycles > 0 else "",
+    "hbm_pressure_vs_worker_avg_pct": hbm_worker_pressure_pct,
     "hbm_useful_read_bytes": hbm_useful_read_bytes,
     "hbm_tccdl_roofline_bytes_per_cycle": hbm_roofline_bpc,
+    "hbm_tccd_l_cycles": hbm_tccd_l_cycles,
     "hbm_channel_bandwidth_imbalance": memory.get("hbm_channel_bandwidth_imbalance", ""),
     "memory_queue_delay_avg_cycles": memory_queue.get("memory_queue_delay_avg_cycles", ""),
     "memory_queue_delay_p99_cycles": memory_queue.get("memory_queue_delay_p99_cycles", ""),

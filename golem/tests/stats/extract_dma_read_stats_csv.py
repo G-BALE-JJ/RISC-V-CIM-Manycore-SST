@@ -29,6 +29,12 @@ PATTERN = re.compile(
     r"max_e2e_rtt_ticks=(?P<max_e2e_rtt_ticks>\d+) "
     r"avg_e2e_rtt_cycles=(?P<avg_e2e_rtt_cycles>\d+) "
     r"max_e2e_rtt_cycles=(?P<max_e2e_rtt_cycles>\d+) )?"
+    r"(?:strict_avg_rtt_cycles=(?P<strict_avg_rtt_cycles>\d+) "
+    r"strict_max_rtt_cycles=(?P<strict_max_rtt_cycles>\d+) "
+    r"strict_avg_e2e_rtt_cycles=(?P<strict_avg_e2e_rtt_cycles>\d+) "
+    r"strict_max_e2e_rtt_cycles=(?P<strict_max_e2e_rtt_cycles>\d+) "
+    r"request_avg_submit_ready_cycles=(?P<request_avg_submit_ready_cycles>\d+) "
+    r"request_max_submit_ready_cycles=(?P<request_max_submit_ready_cycles>\d+) )?"
     r"send_retry_q_max=(?P<send_retry_q_max>\d+)"
 )
 
@@ -44,6 +50,18 @@ PATTERN_LEGACY = re.compile(
     r"avg_rtt_ticks=(?P<avg_rtt_ticks>\d+) "
     r"max_rtt_ticks=(?P<max_rtt_ticks>\d+) "
     r"send_retry_q_max=(?P<send_retry_q_max>\d+)"
+)
+
+STRICT_RTT_PATTERN = re.compile(
+    r"\[RequestScheduler\]\[core=(?P<core>\d+)\] STRICT_RTT_SUMMARY\(cycles\): "
+    r"strict_rtt_samples=(?P<strict_rtt_samples>\d+) "
+    r"strict_rtt_cycles_sum=(?P<strict_rtt_cycles_sum>\d+) "
+    r"strict_avg_rtt_cycles=(?P<strict_avg_rtt_cycles>\d+) "
+    r"strict_max_rtt_cycles=(?P<strict_max_rtt_cycles>\d+) "
+    r"strict_e2e_rtt_samples=(?P<strict_e2e_rtt_samples>\d+) "
+    r"strict_e2e_rtt_cycles_sum=(?P<strict_e2e_rtt_cycles_sum>\d+) "
+    r"strict_avg_e2e_rtt_cycles=(?P<strict_avg_e2e_rtt_cycles>\d+) "
+    r"strict_max_e2e_rtt_cycles=(?P<strict_max_e2e_rtt_cycles>\d+)"
 )
 
 FIELDS = [
@@ -70,8 +88,37 @@ FIELDS = [
     "max_e2e_rtt_ticks",
     "avg_e2e_rtt_cycles",
     "max_e2e_rtt_cycles",
+    "strict_rtt_samples",
+    "strict_rtt_cycles_sum",
+    "strict_avg_rtt_cycles",
+    "strict_max_rtt_cycles",
+    "strict_e2e_rtt_samples",
+    "strict_e2e_rtt_cycles_sum",
+    "strict_avg_e2e_rtt_cycles",
+    "strict_max_e2e_rtt_cycles",
+    "request_avg_submit_ready_cycles",
+    "request_max_submit_ready_cycles",
     "send_retry_q_max",
 ]
+
+STRICT_ACTIVE_FIELDS = {
+    "strict_rtt_samples": "strict_rtt_samples",
+    "strict_rtt_cycles_sum": "strict_rtt_samples",
+    "strict_avg_rtt_cycles": "strict_rtt_samples",
+    "strict_max_rtt_cycles": "strict_rtt_samples",
+    "strict_e2e_rtt_samples": "strict_e2e_rtt_samples",
+    "strict_e2e_rtt_cycles_sum": "strict_e2e_rtt_samples",
+    "strict_avg_e2e_rtt_cycles": "strict_e2e_rtt_samples",
+    "strict_max_e2e_rtt_cycles": "strict_e2e_rtt_samples",
+}
+
+STRICT_WEIGHTED_AVG_FIELDS = {
+    "strict_avg_rtt_cycles": ("strict_rtt_cycles_sum", "strict_rtt_samples"),
+    "strict_avg_e2e_rtt_cycles": (
+        "strict_e2e_rtt_cycles_sum",
+        "strict_e2e_rtt_samples",
+    ),
+}
 
 
 def _p95(values):
@@ -95,10 +142,50 @@ def resolve_inputs(log_path: Path | None, log_dir: Path, stdout_glob: str):
     return inputs
 
 
+def empty_record(core):
+    rec = {name: 0 for name in FIELDS}
+    rec["core"] = core
+    return rec
+
+
+def fill_strict_defaults(rec):
+    for name in (
+        "strict_rtt_samples",
+        "strict_rtt_cycles_sum",
+        "strict_e2e_rtt_samples",
+        "strict_e2e_rtt_cycles_sum",
+    ):
+        rec.setdefault(name, 0)
+
+    if rec["strict_rtt_samples"] == 0 and (
+        rec.get("strict_avg_rtt_cycles", 0) or rec.get("strict_max_rtt_cycles", 0)
+    ):
+        rec["strict_rtt_samples"] = max(1, rec.get("read_issue_count", 0))
+        rec["strict_rtt_cycles_sum"] = (
+            rec.get("strict_avg_rtt_cycles", 0) * rec["strict_rtt_samples"]
+        )
+    if rec["strict_e2e_rtt_samples"] == 0 and (
+        rec.get("strict_avg_e2e_rtt_cycles", 0)
+        or rec.get("strict_max_e2e_rtt_cycles", 0)
+    ):
+        rec["strict_e2e_rtt_samples"] = max(1, rec.get("read_issue_count", 0))
+        rec["strict_e2e_rtt_cycles_sum"] = (
+            rec.get("strict_avg_e2e_rtt_cycles", 0)
+            * rec["strict_e2e_rtt_samples"]
+        )
+
+
 def parse_logs(log_paths):
     latest = {}
+    strict_latest = {}
     for log_path in log_paths:
         for line in log_path.read_text(errors="ignore").splitlines():
+            strict = STRICT_RTT_PATTERN.search(line)
+            if strict:
+                rec = {k: int(v) for k, v in strict.groupdict().items()}
+                strict_latest[rec["core"]] = rec
+                continue
+
             m = PATTERN.search(line)
             if m:
                 rec = {
@@ -122,7 +209,39 @@ def parse_logs(log_paths):
                 rec["max_e2e_rtt_ticks"] = 0
                 rec["avg_e2e_rtt_cycles"] = 0
                 rec["max_e2e_rtt_cycles"] = 0
+                rec["strict_avg_rtt_cycles"] = 0
+                rec["strict_max_rtt_cycles"] = 0
+                rec["strict_avg_e2e_rtt_cycles"] = 0
+                rec["strict_max_e2e_rtt_cycles"] = 0
+                rec["request_avg_submit_ready_cycles"] = 0
+                rec["request_max_submit_ready_cycles"] = 0
+            fill_strict_defaults(rec)
             latest[rec["core"]] = rec
+    for core, strict in strict_latest.items():
+        has_strict_samples = (
+            strict["strict_rtt_samples"] > 0 or strict["strict_e2e_rtt_samples"] > 0
+        )
+        if core not in latest:
+            if not has_strict_samples:
+                continue
+            latest[core] = empty_record(core)
+        rec = latest[core]
+        if strict["strict_rtt_samples"] > 0:
+            for name in (
+                "strict_rtt_samples",
+                "strict_rtt_cycles_sum",
+                "strict_avg_rtt_cycles",
+                "strict_max_rtt_cycles",
+            ):
+                rec[name] = strict[name]
+        if strict["strict_e2e_rtt_samples"] > 0:
+            for name in (
+                "strict_e2e_rtt_samples",
+                "strict_e2e_rtt_cycles_sum",
+                "strict_avg_e2e_rtt_cycles",
+                "strict_max_e2e_rtt_cycles",
+            ):
+                rec[name] = strict[name]
     return [latest[k] for k in sorted(latest.keys())]
 
 
@@ -140,14 +259,24 @@ def write_summary_csv(records, path: Path):
         w = csv.writer(f)
         w.writerow(["metric", "mean", "median", "p95", "min", "max", "sum"])
         for name in metric_fields:
-            vals = [r[name] for r in records]
+            active_field = STRICT_ACTIVE_FIELDS.get(name)
+            active_records = records
+            if active_field is not None:
+                active_records = [r for r in records if r.get(active_field, 0) > 0]
+            vals = [r[name] for r in active_records]
             if not vals:
                 w.writerow([name, 0, 0, 0, 0, 0, 0])
                 continue
+            mean_value = int(mean(vals))
+            if name in STRICT_WEIGHTED_AVG_FIELDS:
+                sum_field, sample_field = STRICT_WEIGHTED_AVG_FIELDS[name]
+                total_samples = sum(r.get(sample_field, 0) for r in active_records)
+                total_cycles = sum(r.get(sum_field, 0) for r in active_records)
+                mean_value = int(total_cycles / total_samples) if total_samples else 0
             w.writerow(
                 [
                     name,
-                    int(mean(vals)),
+                    mean_value,
                     int(median(vals)),
                     int(_p95(vals)),
                     min(vals),
