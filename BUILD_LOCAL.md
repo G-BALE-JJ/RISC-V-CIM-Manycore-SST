@@ -3,41 +3,66 @@
 This branch is meant to be used as one branch, one worktree, one local build
 directory, and one local install prefix.
 
-Prepare the local build tree without compiling:
+## One-command build and install
+
+From a fresh checkout/worktree:
 
 ```bash
 cd /data4/lishun/pkg/wt-huti-v0
-scripts/prepare_local_build.sh
+scripts/build_and_install_local.sh
 ```
 
-This creates:
+This does all of the following:
+
+```text
+prepare build/sst-elements
+run ./autogen.sh
+run ./configure
+run make
+run make install
+```
+
+By default it installs this worktree's elements under:
+
+```text
+/data4/lishun/pkg/wt-huti-v0/install/
+```
+
+and keeps generated build files under:
 
 ```text
 /data4/lishun/pkg/wt-huti-v0/build/sst-elements/
 ```
 
-The prepared SST tree links `src/sst/elements` back to this worktree, so future
-builds and `golem/tests` runs use the `wt-huti-v0` branch sources instead of the
-old temporary experiment directory.
+The prepared SST tree links `src/sst/elements` back to this worktree, so builds
+and `golem/tests` runs use the `wt-huti-v0` branch sources instead of the old
+temporary experiment directory.
 
-Build and install later from:
+## Defaults
 
-```bash
-cd /data4/lishun/pkg/wt-huti-v0/build/sst-elements
-./autogen.sh
-./configure \
-  --prefix=/data4/lishun/pkg/wt-huti-v0/install \
-  --with-sst-core=/data4/lishun/pkg/sst_install \
-  --with-dramsim3=/data4/lishun/pkg/DRAMsim3
-make -j
-make install
-```
-
-This keeps the worktree's element libraries under:
+The one-command script assumes these local dependencies:
 
 ```text
-/data4/lishun/pkg/wt-huti-v0/install/lib/sst-elements-library/
+SST core install:      /data4/lishun/pkg/sst_install
+DRAMSim3 source/build: /data4/lishun/pkg/DRAMsim3
+SST source template:   /data4/lishun/pkg/sst-elements
 ```
+
+Override them with environment variables when needed:
+
+```bash
+SST_CORE_PREFIX=/path/to/sst_core_install SST_DRAMSIM3_PREFIX=/path/to/DRAMsim3 SST_ELEMENTS_TEMPLATE=/path/to/full/sst-elements-source JOBS=16 scripts/build_and_install_local.sh
+```
+
+Useful options:
+
+```bash
+scripts/build_and_install_local.sh --clean
+scripts/build_and_install_local.sh --reconfigure
+scripts/build_and_install_local.sh --jobs 32
+```
+
+## Run environment
 
 Before running this branch's experiments, source the local environment:
 
