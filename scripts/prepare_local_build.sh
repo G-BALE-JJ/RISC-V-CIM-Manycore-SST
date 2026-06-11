@@ -10,6 +10,8 @@ Prepare a local SST source/build tree under this worktree.
 Defaults:
   BUILD_ROOT             ./build/sst-elements
   SST_ELEMENTS_TEMPLATE  /data4/lishun/pkg/sst-elements
+  SST_CORE_PREFIX        /data4/lishun/pkg/sst_install
+  SST_DRAMSIM3_PREFIX    /data4/lishun/pkg/DRAMsim3
 
 The prepared tree keeps src/sst/elements as a symlink to this worktree, so
 configure/make and golem/tests runs use the branch checked out here instead of
@@ -26,6 +28,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 ELEMENTS_WORKTREE="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 TEMPLATE="${SST_ELEMENTS_TEMPLATE:-/data4/lishun/pkg/sst-elements}"
 BUILD_ROOT="${1:-$ELEMENTS_WORKTREE/build/sst-elements}"
+INSTALL_PREFIX="$ELEMENTS_WORKTREE/install"
+SST_CORE_PREFIX="${SST_CORE_PREFIX:-/data4/lishun/pkg/sst_install}"
+SST_DRAMSIM3_PREFIX="${SST_DRAMSIM3_PREFIX:-/data4/lishun/pkg/DRAMsim3}"
 
 if [[ ! -d "$TEMPLATE/src/sst" || ! -f "$TEMPLATE/autogen.sh" || ! -f "$TEMPLATE/configure.ac" ]]; then
 	echo "[ERROR] SST_ELEMENTS_TEMPLATE must point to a full SST source tree: $TEMPLATE" >&2
@@ -72,8 +77,13 @@ cat <<EOF
 Use it when you want to build:
   cd "$BUILD_ROOT"
   ./autogen.sh
-  ./configure <your usual configure flags>
+  ./configure --prefix="$INSTALL_PREFIX" --with-sst-core="$SST_CORE_PREFIX" --with-dramsim3="$SST_DRAMSIM3_PREFIX"
   make -j
+  make install
+
+Before running this worktree's experiments:
+  cd "$ELEMENTS_WORKTREE"
+  source scripts/env_local_install.sh
 
 Elements source used by that build:
   $BUILD_ROOT/src/sst/elements -> $ELEMENTS_WORKTREE

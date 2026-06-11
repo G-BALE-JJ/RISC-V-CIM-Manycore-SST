@@ -25,6 +25,7 @@ tags
 *.so
 sst_test_outputs/
 build/
+install/
 .\#*
 \#*\#
 .gdb_history
