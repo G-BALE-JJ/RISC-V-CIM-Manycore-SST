@@ -165,6 +165,7 @@ GOLEM_EXPORT_NOC_HEATMAPS="${GOLEM_EXPORT_NOC_HEATMAPS:-0}"
 GOLEM_SKIP_TENSOR_GEN="${GOLEM_SKIP_TENSOR_GEN:-0}"
 GOLEM_SKIP_HBM_GEN="${GOLEM_SKIP_HBM_GEN:-0}"
 GOLEM_SKIP_BUILD="${GOLEM_SKIP_BUILD:-0}"
+GOLEM_HBM_DUMP_OUTPUT="${GOLEM_HBM_DUMP_OUTPUT:-1}"
 GOLEM_BENCH_QUIET_LOGS="${GOLEM_BENCH_QUIET_LOGS:-0}"
 GOLEM_BENCH_DISABLE_SST_STATS="${GOLEM_BENCH_DISABLE_SST_STATS:-0}"
 
@@ -318,6 +319,104 @@ align_up_int() {
 		return
 	fi
 	printf '%s\n' $(( ((value + align - 1) / align) * align ))
+}
+
+derive_auto_mem_node_size() {
+	python3 - "$@" <<'PY'
+import sys
+
+(
+    gemm_m,
+    gemm_n,
+    gemm_k,
+    block_m,
+    block_n,
+    block_k,
+    elem_bytes,
+    num_memory_nodes,
+    total_groups,
+    total_gemm_cores,
+    group_manager_enable,
+    a_reuse_n,
+    b_reuse_m,
+) = [int(x) for x in sys.argv[1:]]
+
+
+def align_up(value, align):
+    return ((value + align - 1) // align) * align
+
+
+def ceil_div(value, divisor):
+    return (value + divisor - 1) // divisor
+
+
+def next_power_of_two(value):
+    return 1 << (value - 1).bit_length()
+
+
+mm_align = 0x100
+m_tiles = gemm_m // block_m
+n_tiles = gemm_n // block_n
+k_tiles = gemm_k // block_k
+m_groups = ceil_div(m_tiles, b_reuse_m)
+n_groups = ceil_div(n_tiles, a_reuse_n)
+total_macro_tasks = m_groups * n_groups
+data_nodes = list(range(1, num_memory_nodes))
+dedicated_manager_cores = total_groups if group_manager_enable else 0
+active_gemm_cores = total_gemm_cores - dedicated_manager_cores
+first_worker_core = dedicated_manager_cores
+
+
+def owner_core_for_task(task_id):
+    if active_gemm_cores <= 0:
+        return first_worker_core
+    return first_worker_core + (task_id % active_gemm_cores)
+
+
+def group_id_for_core(core_id):
+    return core_id % total_groups if total_groups > 0 else 0
+
+
+def data_node_for_task(task_id):
+    if not data_nodes:
+        return 1
+    group_id = group_id_for_core(owner_core_for_task(task_id))
+    return data_nodes[group_id % len(data_nodes)]
+
+
+def a_data_node_for_m_tile(m_tile):
+    return data_node_for_task(m_tile // b_reuse_m)
+
+
+def b_data_node_for_n_tile(n_tile):
+    return data_node_for_task(n_tile // a_reuse_n)
+
+
+def max_count(items, predicate):
+    out = 0
+    for node_idx in data_nodes:
+        count = sum(1 for item in items if predicate(node_idx, item))
+        out = max(out, count)
+    return out or 1
+
+
+max_a_m_tiles = max_count(range(m_tiles), lambda node, tile: a_data_node_for_m_tile(tile) == node)
+max_b_n_tiles = max_count(range(n_tiles), lambda node, tile: b_data_node_for_n_tile(tile) == node)
+max_macro_tasks = max_count(range(total_macro_tasks), lambda node, task: data_node_for_task(task) == node)
+
+mat_stride = align_up(block_m * block_k * elem_bytes, mm_align)
+vec_stride = align_up(block_k * elem_bytes, mm_align)
+out_stride = align_up(block_m * block_n * elem_bytes, mm_align)
+bias_stride = align_up(gemm_n * elem_bytes, mm_align)
+mat_region_end = max_a_m_tiles * k_tiles * mat_stride
+vec_region_end = mat_region_end + max_b_n_tiles * k_tiles * block_n * vec_stride
+out_reuse_slots = max(1, a_reuse_n) * max(1, b_reuse_m)
+data_region_end = vec_region_end + max_macro_tasks * out_reuse_slots * out_stride
+fixed_aux_region_end = 0x01300000
+required = max(data_region_end + bias_stride, fixed_aux_region_end, 64 * 1024**2)
+chosen = next_power_of_two(required)
+print(chosen, required, data_region_end, bias_stride)
+PY
 }
 
 sst_log_has_fatal() {
@@ -664,6 +763,7 @@ Options:
 	--gemm-cores N       GEMM 并发核心数（默认: 16）
 	--num-cores N        总核心数（同时用于 SST 与 C++ TOTAL_CORES，默认: 16）
 	--num-mem-nodes N    内存节点总数（首节点挂 OS，默认: 4）
+	--mem-node-size N|auto 单个内存节点大小（字节），auto 按当前 GEMM/HBM 布局选 2 的幂
 	--global-stride-kb N  每核 GM 窗口大小（KB，默认: 64）
 	--gemm-m N           GEMM 的 M 维（默认: 跟 --array-out）
 	--gemm-n N           GEMM 的 N 维（默认: 跟 --num-arrays）
@@ -718,6 +818,8 @@ Options:
 	--tensor-a FILE      外部输入 A 矩阵文件（.bin/.csv/.npy，按 --dtype 解释）传给 gen_hbm_init.py
 	--tensor-b FILE      外部输入 B 矩阵文件（.bin/.csv/.npy，按 --dtype 解释）传给 gen_hbm_init.py
 	--dump-c FILE        从 hbm_out_node*.bin 反解输出 C 到 FILE（.bin 或 .csv）
+	--hbm-dump-output N  是否生成 hbm_out_node*.bin（0/1，默认: 1）
+	--no-hbm-dump-output 等价 --hbm-dump-output 0
 	--log FILE           SST 输出日志文件名或绝对路径（默认: test.log，存放到 artifacts/logs）
 	--dry-run            仅打印配置与命令，不实际执行
 	环境变量 GOLEM_SKIP_TENSOR_GEN=1 可跳过 sample tensor 生成
@@ -757,6 +859,8 @@ while [[ $# -gt 0 ]]; do
 			GOLEM_TOTAL_CORES="$2"; shift 2 ;;
 		--num-mem-nodes)
 			GOLEM_NUM_MEMORY_NODES="$2"; shift 2 ;;
+		--mem-node-size)
+			GOLEM_MEM_NODE_SIZE_BYTES="$2"; shift 2 ;;
 		--global-stride-kb)
 			GOLEM_GLOBAL_STRIDE_KB="$2"; shift 2 ;;
 		--gemm-m)
@@ -869,6 +973,10 @@ while [[ $# -gt 0 ]]; do
 			TENSOR_B_FILE="$2"; shift 2 ;;
 		--dump-c)
 			DUMP_C_FILE="$2"; shift 2 ;;
+		--hbm-dump-output)
+			GOLEM_HBM_DUMP_OUTPUT="$2"; shift 2 ;;
+		--no-hbm-dump-output)
+			GOLEM_HBM_DUMP_OUTPUT=0; shift ;;
 		--log)
 			LOG_FILE="$2"; shift 2 ;;
 		--dry-run)
@@ -889,12 +997,19 @@ if [[ "$ARRAY_OUT_SET" -eq 0 ]]; then
 	GOLEM_ARRAY_OUTPUT_SIZE="${GOLEM_ARRAY_OUTPUT_SIZE:-4}"
 fi
 
-for n in "$GOLEM_TOTAL_GROUPS" "$GOLEM_ARRAY_INPUT_SIZE" "$GOLEM_ARRAY_OUTPUT_SIZE" "$GOLEM_NUM_ARRAYS" "$GOLEM_TOTAL_CORES" "$GOLEM_TOTAL_GEMM_CORES" "$GOLEM_NUM_MEMORY_NODES" "$GOLEM_MEM_NODE_SIZE_BYTES" "$GOLEM_GLOBAL_STRIDE_KB"; do
+for n in "$GOLEM_TOTAL_GROUPS" "$GOLEM_ARRAY_INPUT_SIZE" "$GOLEM_ARRAY_OUTPUT_SIZE" "$GOLEM_NUM_ARRAYS" "$GOLEM_TOTAL_CORES" "$GOLEM_TOTAL_GEMM_CORES" "$GOLEM_NUM_MEMORY_NODES" "$GOLEM_GLOBAL_STRIDE_KB"; do
 	if ! [[ "$n" =~ ^[0-9]+$ ]] || [[ "$n" -le 0 ]]; then
 		echo "[ERROR] 参数必须为正整数，收到: $n" >&2
 		exit 1
 	fi
 done
+
+if [[ "$GOLEM_MEM_NODE_SIZE_BYTES" != "auto" ]]; then
+	if ! [[ "$GOLEM_MEM_NODE_SIZE_BYTES" =~ ^[0-9]+$ ]] || [[ "$GOLEM_MEM_NODE_SIZE_BYTES" -le 0 ]]; then
+		echo "[ERROR] GOLEM_MEM_NODE_SIZE_BYTES 必须为正整数或 auto，收到: $GOLEM_MEM_NODE_SIZE_BYTES" >&2
+		exit 1
+	fi
+fi
 
 # Backward compatibility: allow GOLEM_GLOBAL_STRIDE_BYTES override.
 if [[ -n "${GOLEM_GLOBAL_STRIDE_BYTES+x}" ]]; then
@@ -960,6 +1075,16 @@ if [[ "$VERIFY_C" -eq 1 ]]; then
 	if [[ -z "$DUMP_C_FILE" ]]; then
 		DUMP_C_FILE="$STATS_DIR/c_out.csv"
 	fi
+fi
+
+if [[ "$GOLEM_HBM_DUMP_OUTPUT" != "0" && "$GOLEM_HBM_DUMP_OUTPUT" != "1" ]]; then
+	echo "[ERROR] GOLEM_HBM_DUMP_OUTPUT 必须为 0 或 1，收到: $GOLEM_HBM_DUMP_OUTPUT" >&2
+	exit 1
+fi
+
+if [[ "$GOLEM_HBM_DUMP_OUTPUT" -eq 0 && -n "$DUMP_C_FILE" ]]; then
+	echo "[ERROR] GOLEM_HBM_DUMP_OUTPUT=0 时不会生成 hbm_out_node*.bin，不能使用 --dump-c/--verify-c" >&2
+	exit 1
 fi
 
 for n in "$GOLEM_GEMM_BLOCK_M" "$GOLEM_GEMM_BLOCK_N" "$GOLEM_GEMM_BLOCK_K"; do
@@ -1071,6 +1196,27 @@ if ! [[ "$GOLEM_B_REUSE_M_TILES" =~ ^[0-9]+$ ]] || [[ "$GOLEM_B_REUSE_M_TILES" -
 	echo "[ERROR] GOLEM_B_REUSE_M_TILES 必须为正整数，收到: $GOLEM_B_REUSE_M_TILES" >&2
 	exit 1
 fi
+
+GOLEM_MEM_NODE_SIZE_BYTES_AUTO=0
+if [[ "$GOLEM_MEM_NODE_SIZE_BYTES" == "auto" ]]; then
+	GOLEM_MEM_NODE_SIZE_BYTES_AUTO=1
+	read -r GOLEM_MEM_NODE_SIZE_BYTES GOLEM_AUTO_MEM_REQUIRED_BYTES GOLEM_AUTO_MEM_DATA_END_BYTES GOLEM_AUTO_MEM_BIAS_STRIDE_BYTES < <(
+		derive_auto_mem_node_size \
+			"$GOLEM_GEMM_M" "$GOLEM_GEMM_N" "$GOLEM_GEMM_K" \
+			"$GOLEM_GEMM_BLOCK_M" "$GOLEM_GEMM_BLOCK_N" "$GOLEM_GEMM_BLOCK_K" \
+			"$GOLEM_ELEM_BYTES" "$GOLEM_NUM_MEMORY_NODES" "$GOLEM_TOTAL_GROUPS" \
+			"$GOLEM_TOTAL_GEMM_CORES" "$GOLEM_GROUP_MANAGER_ENABLE" \
+			"$GOLEM_A_REUSE_N_TILES" "$GOLEM_B_REUSE_M_TILES"
+	)
+	echo "[INFO] Auto-selected GOLEM_MEM_NODE_SIZE_BYTES=$GOLEM_MEM_NODE_SIZE_BYTES (required=$GOLEM_AUTO_MEM_REQUIRED_BYTES, data_end=$GOLEM_AUTO_MEM_DATA_END_BYTES, bias_stride=$GOLEM_AUTO_MEM_BIAS_STRIDE_BYTES)"
+fi
+
+if ! [[ "$GOLEM_MEM_NODE_SIZE_BYTES" =~ ^[0-9]+$ ]] || [[ "$GOLEM_MEM_NODE_SIZE_BYTES" -le 0 ]]; then
+	echo "[ERROR] GOLEM_MEM_NODE_SIZE_BYTES 必须为正整数或 auto，收到: $GOLEM_MEM_NODE_SIZE_BYTES" >&2
+	exit 1
+fi
+
+GOLEM_IDENTITY_BASE="$GOLEM_MEM_NODE_SIZE_BYTES"
 
 if ! [[ "$GOLEM_DMA_WINDOW_K_TILES" =~ ^[0-9]+$ ]] || [[ "$GOLEM_DMA_WINDOW_K_TILES" -le 0 ]]; then
 	echo "[ERROR] GOLEM_DMA_WINDOW_K_TILES 必须为正整数，收到: $GOLEM_DMA_WINDOW_K_TILES" >&2
@@ -1366,6 +1512,7 @@ HBM_METADATA_KEYS=(
 	GOLEM_TOTAL_GEMM_CORES
 	GOLEM_NUM_MEMORY_NODES
 	GOLEM_MEM_NODE_SIZE_BYTES
+	GOLEM_HBM_DUMP_OUTPUT
 	GOLEM_GLOBAL_STRIDE_BYTES
 	GOLEM_A_REUSE_N_TILES
 	GOLEM_B_REUSE_M_TILES
@@ -1438,6 +1585,8 @@ export VANADIS_NUM_CORES="$GOLEM_TOTAL_CORES"
 export GOLEM_NUM_MEMORY_NODES
 export GOLEM_MEMORY_LAYOUT
 export GOLEM_MEM_NODE_SIZE_BYTES
+export GOLEM_IDENTITY_BASE
+export GOLEM_HBM_DUMP_OUTPUT
 export GOLEM_GLOBAL_STRIDE_KB
 export GOLEM_GLOBAL_STRIDE_BYTES
 export GOLEM_DMA_STAGGER_CYCLES
@@ -1538,6 +1687,8 @@ echo "  GOLEM_TOTAL_GEMM_CORES=$GOLEM_TOTAL_GEMM_CORES"
 echo "  GOLEM_NUM_MEMORY_NODES=$GOLEM_NUM_MEMORY_NODES"
 echo "  GOLEM_MEMORY_LAYOUT=$GOLEM_MEMORY_LAYOUT"
 echo "  GOLEM_MEM_NODE_SIZE_BYTES=$GOLEM_MEM_NODE_SIZE_BYTES"
+echo "  GOLEM_IDENTITY_BASE=${GOLEM_IDENTITY_BASE:-<unset>}"
+echo "  GOLEM_HBM_DUMP_OUTPUT=$GOLEM_HBM_DUMP_OUTPUT"
 echo "  GOLEM_GLOBAL_STRIDE_KB=$GOLEM_GLOBAL_STRIDE_KB"
 echo "  GOLEM_GLOBAL_STRIDE_BYTES=$GOLEM_GLOBAL_STRIDE_BYTES"
 echo "  GOLEM_DMA_STAGGER_CYCLES=$GOLEM_DMA_STAGGER_CYCLES"
@@ -2269,6 +2420,8 @@ record = {
     "num_cores": os.environ.get("GOLEM_TOTAL_CORES", ""),
     "gemm_cores": os.environ.get("GOLEM_TOTAL_GEMM_CORES", ""),
     "num_mem_nodes": os.environ.get("GOLEM_NUM_MEMORY_NODES", ""),
+    "mem_node_size_bytes": os.environ.get("GOLEM_MEM_NODE_SIZE_BYTES", ""),
+    "hbm_dump_output": os.environ.get("GOLEM_HBM_DUMP_OUTPUT", ""),
     "dma_node_credits": os.environ.get("GOLEM_DMA_NODE_CREDITS", ""),
     "dma_node_chunk_credits": os.environ.get("GOLEM_DMA_NODE_CHUNK_CREDITS", ""),
     "dma_panel_chunk_bytes": os.environ.get("GOLEM_DMA_PANEL_CHUNK_BYTES", ""),

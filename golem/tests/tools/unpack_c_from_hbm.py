@@ -87,10 +87,13 @@ def main(argv=None):
     n_groups = (n_tiles + a_reuse_n_tiles - 1) // a_reuse_n_tiles
     total_macro_tasks = m_groups * n_groups
 
-    off_gemm_mat = 0
     mat_reuse_slots = b_reuse_m_tiles if b_reuse_m_tiles > 1 else 1
     vec_reuse_slots = a_reuse_n_tiles if a_reuse_n_tiles > 1 else 1
     out_reuse_slots = mat_reuse_slots * vec_reuse_slots
+
+    def macro_task_for_group(m_group: int, n_group: int) -> int:
+        n_band = (n_group - m_group) % n_groups
+        return n_band * m_groups + m_group
 
     def layout_owner_core_for_task(task_id: int) -> int:
         if active_gemm_cores <= 0:
@@ -104,6 +107,12 @@ def main(argv=None):
             return os_memory_node
         return data_nodes[group_idx % len(data_nodes)]
 
+    def layout_a_data_node_for_m_tile(m_tile: int) -> int:
+        return layout_data_node_for_task(m_tile // b_reuse_m_tiles)
+
+    def layout_b_data_node_for_n_tile(n_tile: int) -> int:
+        return layout_data_node_for_task(n_tile // a_reuse_n_tiles)
+
     max_macro_tasks_per_data_node = max(
         (
             sum(
@@ -115,10 +124,33 @@ def main(argv=None):
         ),
         default=1,
     )
-    off_gemm_vec_base = off_gemm_mat + max_macro_tasks_per_data_node * mat_reuse_slots * k_tiles * mm_mat_stride
+    max_a_m_tiles_per_data_node = max(
+        (
+            sum(
+                1
+                for m_tile in range(m_tiles)
+                if layout_a_data_node_for_m_tile(m_tile) == node_idx
+            )
+            for node_idx in data_nodes
+        ),
+        default=1,
+    )
+    max_b_n_tiles_per_data_node = max(
+        (
+            sum(
+                1
+                for n_tile in range(n_tiles)
+                if layout_b_data_node_for_n_tile(n_tile) == node_idx
+            )
+            for node_idx in data_nodes
+        ),
+        default=1,
+    )
+    off_gemm_mat = 0
+    off_gemm_vec_base = off_gemm_mat + max_a_m_tiles_per_data_node * k_tiles * mm_mat_stride
     off_gemm_out_base = (
         off_gemm_vec_base
-        + max_macro_tasks_per_data_node * vec_reuse_slots * k_tiles * block_n * mm_vec_stride
+        + max_b_n_tiles_per_data_node * k_tiles * block_n * mm_vec_stride
     )
     out_tile_bytes = block_m * block_n * elem_bytes
     out_tile_stride = align_up(out_tile_bytes, mm_align)
@@ -161,7 +193,7 @@ def main(argv=None):
         n_group = n_tile // a_reuse_n_tiles
         m_offset = m_tile % b_reuse_m_tiles
         n_offset = n_tile % a_reuse_n_tiles
-        macro_task_id = m_group * n_groups + n_group
+        macro_task_id = macro_task_for_group(m_group, n_group)
         reuse_offset = m_offset * vec_reuse_slots + n_offset
         node_idx = data_node_for_task(macro_task_id)
         slot = task_slot_in_node(macro_task_id)

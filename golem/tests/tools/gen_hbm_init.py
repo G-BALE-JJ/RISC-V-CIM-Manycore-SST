@@ -32,13 +32,20 @@ from golem_dtype import (
 TESTS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ARTIFACT_ROOT = os.getenv("GOLEM_ARTIFACT_ROOT", os.path.join(TESTS_DIR, "artifacts"))
 HBM_DIR = os.getenv("GOLEM_HBM_DIR", os.path.join(ARTIFACT_ROOT, "hbm"))
+HBM_DUMP_OUTPUT = os.getenv("GOLEM_HBM_DUMP_OUTPUT", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
 PRINT_CORE_MAP = int(os.getenv("GOLEM_PRINT_CORE_MAP", "0"))
 CORE_MAP_FILE = os.getenv(
     "GOLEM_CORE_MAP_FILE", os.path.join(ARTIFACT_ROOT, "stats", "core_memory_map.csv")
 )
 
-MEM_NODE_SIZE = int(os.getenv("GOLEM_MEM_NODE_SIZE_BYTES", str(64 * 1024**2)))
-IDENTITY_BASE = MEM_NODE_SIZE
+_MEM_NODE_SIZE_ENV = os.getenv("GOLEM_MEM_NODE_SIZE_BYTES", str(64 * 1024**2))
+MEM_NODE_SIZE_AUTO = _MEM_NODE_SIZE_ENV.strip().lower() == "auto"
+MEM_NODE_SIZE = 0 if MEM_NODE_SIZE_AUTO else int(_MEM_NODE_SIZE_ENV, 0)
 TOTAL_GROUPS = int(os.getenv("GOLEM_TOTAL_GROUPS", "4"))
 # 优先使用运行脚本导出的 GOLEM_TOTAL_GEMM_CORES（对应 --gemm-cores）
 # 兼容旧变量 GOLEM_TOTAL_CORES
@@ -128,6 +135,12 @@ def _align_up(value: int, align: int) -> int:
     return ((value + align - 1) // align) * align
 
 
+def _next_power_of_two(value: int) -> int:
+    if value <= 1:
+        return 1
+    return 1 << (value - 1).bit_length()
+
+
 MM_MAT_STRIDE = _align_up(BLOCK_MAT_BYTES, MM_ALIGN)
 OFF_GEMM_MAT = 0x0
 MM_VEC_STRIDE = _align_up(BLOCK_VEC_BYTES, MM_ALIGN)
@@ -168,15 +181,62 @@ def _max_macro_tasks_per_data_node() -> int:
 
 
 MAX_GEMM_MACRO_TASKS_PER_DATA_NODE = _max_macro_tasks_per_data_node()
-OFF_GEMM_VEC_BASE = OFF_GEMM_MAT + MAX_GEMM_MACRO_TASKS_PER_DATA_NODE * MAT_REUSE_SLOTS * GEMM_K_TILES * MM_MAT_STRIDE
+
+
+def _layout_m_group_for_m_tile(m_tile: int) -> int:
+    return m_tile // B_REUSE_M_TILES
+
+
+def _layout_n_group_for_n_tile(n_tile: int) -> int:
+    return n_tile // A_REUSE_N_TILES
+
+
+def _layout_a_data_node_for_m_tile(m_tile: int) -> int:
+    return _layout_data_node_for_task(_layout_m_group_for_m_tile(m_tile))
+
+
+def _layout_b_data_node_for_n_tile(n_tile: int) -> int:
+    return _layout_data_node_for_task(_layout_n_group_for_n_tile(n_tile))
+
+
+def _max_a_m_tiles_per_data_node() -> int:
+    max_count = 0
+    for node_idx in DATA_NODE_IDS:
+        count = sum(1 for m_tile in range(GEMM_M_TILES) if _layout_a_data_node_for_m_tile(m_tile) == node_idx)
+        max_count = max(max_count, count)
+    return max_count or 1
+
+
+def _max_b_n_tiles_per_data_node() -> int:
+    max_count = 0
+    for node_idx in DATA_NODE_IDS:
+        count = sum(1 for n_tile in range(GEMM_N_TILES) if _layout_b_data_node_for_n_tile(n_tile) == node_idx)
+        max_count = max(max_count, count)
+    return max_count or 1
+
+
+MAX_GEMM_A_M_TILES_PER_DATA_NODE = _max_a_m_tiles_per_data_node()
+MAX_GEMM_B_N_TILES_PER_DATA_NODE = _max_b_n_tiles_per_data_node()
+OFF_GEMM_VEC_BASE = OFF_GEMM_MAT + MAX_GEMM_A_M_TILES_PER_DATA_NODE * GEMM_K_TILES * MM_MAT_STRIDE
 GEMM_OUT_STRIDE_MM = _align_up(BLOCK_M * BLOCK_N * elem_nbytes(MATMUL_DTYPE), MM_ALIGN)
 OFF_GEMM_OUT_BASE = (
     OFF_GEMM_VEC_BASE
-    + MAX_GEMM_MACRO_TASKS_PER_DATA_NODE * VEC_REUSE_SLOTS * GEMM_K_TILES * BLOCK_N * MM_VEC_STRIDE
+    + MAX_GEMM_B_N_TILES_PER_DATA_NODE * GEMM_K_TILES * BLOCK_N * MM_VEC_STRIDE
 )
 GEMM_BIAS_STRIDE_MM = _align_up(GEMM_N * elem_nbytes(MATMUL_DTYPE), MM_ALIGN)
-OFF_GEMM_BIAS_BASE = MEM_NODE_SIZE - GEMM_BIAS_STRIDE_MM
 GEMM_DATA_REGION_END = OFF_GEMM_OUT_BASE + MAX_GEMM_MACRO_TASKS_PER_DATA_NODE * OUT_REUSE_SLOTS * GEMM_OUT_STRIDE_MM
+FIXED_AUX_REGION_END = 0x01300000
+
+if MEM_NODE_SIZE_AUTO:
+    required_size = max(
+        GEMM_DATA_REGION_END + GEMM_BIAS_STRIDE_MM,
+        FIXED_AUX_REGION_END,
+        64 * 1024**2,
+    )
+    MEM_NODE_SIZE = _next_power_of_two(required_size)
+
+IDENTITY_BASE = MEM_NODE_SIZE
+OFF_GEMM_BIAS_BASE = MEM_NODE_SIZE - GEMM_BIAS_STRIDE_MM
 POOL1_OFF = 0x01006000
 POOL1_CH = 6
 POOL1_H = 12
@@ -210,11 +270,33 @@ def _pack_tensor_values(values):
     return pack_values(MATMUL_DTYPE, values)
 
 
-def _write_block(buf: bytearray, offset: int, data: bytes, tag: str):
+class SparseNodeBuffer:
+    def __init__(self, path: str, size: int):
+        self.path = path
+        self.size = size
+        self._file = open(path, "wb+")
+        self._file.truncate(size)
+
+    def __len__(self):
+        return self.size
+
+    def write_block(self, offset: int, data: bytes):
+        self._file.seek(offset)
+        self._file.write(data)
+
+    def close(self):
+        self._file.flush()
+        self._file.close()
+
+
+def _write_block(buf, offset: int, data: bytes, tag: str):
     end = offset + len(data)
     if offset < 0 or end > len(buf):
         raise ValueError(f"{tag} 写入越界: offset=0x{offset:x}, size={len(data)}")
-    buf[offset:end] = data
+    if hasattr(buf, "write_block"):
+        buf.write_block(offset, data)
+    else:
+        buf[offset:end] = data
 
 
 def _node_base(node_idx: int) -> int:
@@ -243,25 +325,31 @@ def _task_ids_for_core(core_id: int):
         task_id += ACTIVE_GEMM_CORES
 
 
+def _m_group_of_macro_task(task_id: int) -> int:
+    return task_id % GEMM_M_GROUPS
+
+
+def _n_group_of_macro_task(task_id: int) -> int:
+    m_group = _m_group_of_macro_task(task_id)
+    return ((task_id // GEMM_M_GROUPS) + m_group) % GEMM_N_GROUPS
+
+
+def _macro_task_for_group(m_group: int, n_group: int) -> int:
+    n_band = (n_group - m_group) % GEMM_N_GROUPS
+    return n_band * GEMM_M_GROUPS + m_group
+
+
 def _m_tile_of_task(task_id: int) -> int:
-    return (task_id // GEMM_N_GROUPS) * B_REUSE_M_TILES
+    return _m_group_of_macro_task(task_id) * B_REUSE_M_TILES
 
 
 def _n_tile_of_task(task_id: int) -> int:
-    return (task_id % GEMM_N_GROUPS) * A_REUSE_N_TILES
-
-
-def _m_group_of_macro_task(task_id: int) -> int:
-    return task_id // GEMM_N_GROUPS
+    return _n_group_of_macro_task(task_id) * A_REUSE_N_TILES
 
 
 def _m_count_for_group(m_group: int) -> int:
     m_begin = m_group * B_REUSE_M_TILES
     return min(B_REUSE_M_TILES, GEMM_M_TILES - m_begin)
-
-
-def _n_group_of_macro_task(task_id: int) -> int:
-    return task_id % GEMM_N_GROUPS
 
 
 def _n_count_for_group(n_group: int) -> int:
@@ -303,15 +391,41 @@ def _task_slot_in_node(task_id: int) -> int:
     return slot
 
 
+def _a_data_node_for_m_tile(m_tile: int) -> int:
+    return _data_node_for_task(m_tile // B_REUSE_M_TILES)
+
+
+def _b_data_node_for_n_tile(n_tile: int) -> int:
+    return _data_node_for_task(n_tile // A_REUSE_N_TILES)
+
+
+def _a_slot_for_m_tile(m_tile: int) -> int:
+    node_idx = _a_data_node_for_m_tile(m_tile)
+    slot = 0
+    for prev in range(m_tile):
+        if _a_data_node_for_m_tile(prev) == node_idx:
+            slot += 1
+    return slot
+
+
+def _b_slot_for_n_tile(n_tile: int) -> int:
+    node_idx = _b_data_node_for_n_tile(n_tile)
+    slot = 0
+    for prev in range(n_tile):
+        if _b_data_node_for_n_tile(prev) == node_idx:
+            slot += 1
+    return slot
+
+
 def _build_matrix_tile(rows: int, cols: int, m_tile: int, k_tile: int):
     # 所有元素 < 10，且不同 tile 可区分
     seed = (m_tile * 3 + k_tile * 5) % 9
     return [((seed + r + c) % 9) + 1 for r in range(rows) for c in range(cols)]
 
 
-def _build_vector_for_task(task_id: int, k_tile: int, n_col: int, length: int):
-    # 每个 (task, k_tile, n_col) 唯一向量
-    seed = (task_id * 2 + k_tile * 7 + n_col * 3) % 9
+def _build_vector_tile(n_tile: int, k_tile: int, n_col: int, length: int):
+    # 每个 (n_tile, k_tile, n_col) 唯一向量，匹配 packed-once B 布局。
+    seed = (n_tile * 2 + k_tile * 7 + n_col * 3) % 9
     return [((seed + i) % 9) + 1 for i in range(length)]
 
 
@@ -564,6 +678,12 @@ def main(argv=None):
     print("=" * 60)
     print(f"Memory nodes: {NUM_MEMORY_NODES} (OS node: {OS_MEMORY_NODE_INDEX})")
     print(f"Data nodes: {DATA_NODE_IDS}")
+    if MEM_NODE_SIZE_AUTO:
+        print(
+            f"Auto memory node size: {MEM_NODE_SIZE} bytes "
+            f"({MEM_NODE_SIZE // (1024 * 1024)} MiB)"
+        )
+    print(f"HBM output dump: {'enabled' if HBM_DUMP_OUTPUT else 'disabled'}")
     if plan_file:
         print(f"LeNet plan file: {plan_file} (stage={plan_stage_name})")
     print(f"Matmul env mapping file: {CONTRACT_MAPPING_FILE}")
@@ -616,7 +736,10 @@ def main(argv=None):
     with open(CONTRACT_RESOLVED_FILE, "w", encoding="utf-8") as f:
         json.dump(MATMUL_OP_DESC, f, indent=2, sort_keys=True)
 
-    node_buffers = {node_idx: bytearray(MEM_NODE_SIZE) for node_idx in DATA_NODE_IDS}
+    node_buffers = {}
+    for node_idx in DATA_NODE_IDS:
+        init_file = os.path.join(HBM_DIR, f"hbm_init_node{node_idx}.bin")
+        node_buffers[node_idx] = SparseNodeBuffer(init_file, MEM_NODE_SIZE)
 
     a_matrix = _load_matrix_from_file(args.a_file, GEMM_M, GEMM_K, "A")
     b_matrix = _load_matrix_from_file(args.b_file, GEMM_K, GEMM_N, "B")
@@ -831,51 +954,48 @@ def main(argv=None):
             f"fc1_partial_node{node_idx}",
         )
 
-    for task_id in range(TOTAL_GEMM_MACRO_TASKS):
-        node_idx, task_slot, m_tile, n_tile = task_info(task_id)
-        m_group = _m_group_of_macro_task(task_id)
-        n_group = _n_group_of_macro_task(task_id)
-        m_count = _m_count_for_group(m_group)
-        n_count = _n_count_for_group(n_group)
+    for m_tile in range(GEMM_M_TILES):
+        node_idx = _a_data_node_for_m_tile(m_tile)
+        a_slot = _a_slot_for_m_tile(m_tile)
         for k_tile in range(GEMM_K_TILES):
-            for m_offset in range(m_count):
-                current_m_tile = m_tile + m_offset
-                if a_matrix is not None:
-                    mat = _matrix_tile_from_input(
-                        a_matrix, current_m_tile, k_tile, BLOCK_M, BLOCK_K
+            if a_matrix is not None:
+                mat = _matrix_tile_from_input(
+                    a_matrix, m_tile, k_tile, BLOCK_M, BLOCK_K
+                )
+            else:
+                mat = _build_matrix_tile(BLOCK_M, BLOCK_K, m_tile, k_tile)
+            mat_data = _pack_tensor_values(mat)
+            mat_off = OFF_GEMM_MAT + (a_slot * GEMM_K_TILES + k_tile) * MM_MAT_STRIDE
+            _write_block(
+                node_buffers[node_idx],
+                mat_off,
+                mat_data,
+                f"a_m{m_tile}_k{k_tile}_node{node_idx}",
+            )
+
+    for n_tile in range(GEMM_N_TILES):
+        node_idx = _b_data_node_for_n_tile(n_tile)
+        b_slot = _b_slot_for_n_tile(n_tile)
+        for k_tile in range(GEMM_K_TILES):
+            vec_tile_data = bytearray(BLOCK_N * MM_VEC_STRIDE)
+            for n_col in range(BLOCK_N):
+                if b_matrix is not None:
+                    vec = _vector_from_input(
+                        b_matrix, k_tile, n_tile, n_col, BLOCK_K, BLOCK_N
                     )
                 else:
-                    mat = _build_matrix_tile(BLOCK_M, BLOCK_K, current_m_tile, k_tile)
-                mat_data = _pack_tensor_values(mat)
-                mat_group_slot = task_slot * MAT_REUSE_SLOTS + m_offset
-                mat_off = OFF_GEMM_MAT + (mat_group_slot * GEMM_K_TILES + k_tile) * MM_MAT_STRIDE
-                _write_block(
-                    node_buffers[node_idx],
-                    mat_off,
-                    mat_data,
-                    f"task{task_id}_m{m_offset}_k{k_tile}_mat_node{node_idx}",
-                )
-
-            for n_offset in range(n_count):
-                current_n_tile = n_tile + n_offset
-                output_task_id = m_tile * GEMM_N_TILES + current_n_tile
-                for n_col in range(BLOCK_N):
-                    if b_matrix is not None:
-                        vec = _vector_from_input(
-                            b_matrix, k_tile, current_n_tile, n_col, BLOCK_K, BLOCK_N
-                        )
-                    else:
-                        vec = _build_vector_for_task(output_task_id, k_tile, n_col, BLOCK_K)
-                    vec_data = _pack_tensor_values(vec)
-                    vec_group_slot = task_slot * VEC_REUSE_SLOTS + n_offset
-                    vec_slot = (vec_group_slot * GEMM_K_TILES + k_tile) * BLOCK_N + n_col
-                    vec_off = OFF_GEMM_VEC_BASE + vec_slot * MM_VEC_STRIDE
-                    _write_block(
-                        node_buffers[node_idx],
-                        vec_off,
-                        vec_data,
-                        f"task{task_id}_n{n_offset}_k{k_tile}_ncol{n_col}_vec_node{node_idx}",
-                    )
+                    vec = _build_vector_tile(n_tile, k_tile, n_col, BLOCK_K)
+                vec_data = _pack_tensor_values(vec)
+                start = n_col * MM_VEC_STRIDE
+                vec_tile_data[start : start + len(vec_data)] = vec_data
+            vec_slot = (b_slot * GEMM_K_TILES + k_tile) * BLOCK_N
+            vec_off = OFF_GEMM_VEC_BASE + vec_slot * MM_VEC_STRIDE
+            _write_block(
+                node_buffers[node_idx],
+                vec_off,
+                bytes(vec_tile_data),
+                f"b_n{n_tile}_k{k_tile}_node{node_idx}",
+            )
 
     if bias_vec is not None:
         bias_data = _pack_tensor_values(bias_vec)
@@ -891,15 +1011,19 @@ def main(argv=None):
         init_file = os.path.join(HBM_DIR, f"hbm_init_node{node_idx}.bin")
         out_file = os.path.join(HBM_DIR, f"hbm_out_node{node_idx}.bin")
 
-        with open(init_file, "wb") as f:
-            f.write(node_buffers[node_idx])
+        node_buffers[node_idx].close()
 
-        with open(out_file, "wb") as f:
-            f.seek(MEM_NODE_SIZE - 1)
-            f.write(b"\0")
+        if HBM_DUMP_OUTPUT:
+            with open(out_file, "wb") as f:
+                f.truncate(MEM_NODE_SIZE)
+            print(f"生成 {out_file}: {MEM_NODE_SIZE // (1024 * 1024)}MB")
+        else:
+            if os.path.exists(out_file):
+                os.remove(out_file)
 
         print(f"生成 {init_file}: {MEM_NODE_SIZE // (1024 * 1024)}MB")
-        print(f"生成 {out_file}: {MEM_NODE_SIZE // (1024 * 1024)}MB")
+    if not HBM_DUMP_OUTPUT:
+        print("HBM 输出落盘已关闭：未生成 hbm_out_node*.bin")
 
     print("\n[布局信息]")
     print(
@@ -907,13 +1031,14 @@ def main(argv=None):
         f"MM_MAT_STRIDE=0x{MM_MAT_STRIDE:X}, MM_VEC_STRIDE=0x{MM_VEC_STRIDE:X}"
     )
     print(
-        f"  MAX_MACRO_TASKS_PER_DATA_NODE={MAX_GEMM_MACRO_TASKS_PER_DATA_NODE}, OFF_GEMM_OUT_BASE=0x{OFF_GEMM_OUT_BASE:X}, "
+        f"  MAX_A_M_TILES_PER_DATA_NODE={MAX_GEMM_A_M_TILES_PER_DATA_NODE}, MAX_B_N_TILES_PER_DATA_NODE={MAX_GEMM_B_N_TILES_PER_DATA_NODE}, "
+        f"MAX_MACRO_TASKS_PER_DATA_NODE={MAX_GEMM_MACRO_TASKS_PER_DATA_NODE}, OFF_GEMM_OUT_BASE=0x{OFF_GEMM_OUT_BASE:X}, "
         f"DATA_REGION_END=0x{GEMM_DATA_REGION_END:X}, OFF_GEMM_BIAS_BASE=0x{OFF_GEMM_BIAS_BASE:X}, BIAS_STRIDE=0x{GEMM_BIAS_STRIDE_MM:X}"
     )
     print(
         f"  GEMM_M/N/K={GEMM_M}/{GEMM_N}/{GEMM_K}, block(M,N,K)={BLOCK_M}/{BLOCK_N}/{BLOCK_K}, tiles(M,N,K)={GEMM_M_TILES}/{GEMM_N_TILES}/{GEMM_K_TILES}, tasks={TOTAL_GEMM_TASKS}, macro_tasks={TOTAL_GEMM_MACRO_TASKS}, a_reuse_n={A_REUSE_N_TILES}, b_reuse_m={B_REUSE_M_TILES}, active_cores={ACTIVE_GEMM_CORES}"
     )
-    print(f"  shared_mat 基地址（首数据节点）: 0x{IDENTITY_BASE + OFF_GEMM_MAT:08X}")
+    print(f"  packed_once A 基地址（首数据节点）: 0x{IDENTITY_BASE + OFF_GEMM_MAT:08X}")
     if bias_vec is not None:
         print(
             f"  bias 基地址（每个数据节点）: 0x{IDENTITY_BASE + OFF_GEMM_BIAS_BASE:08X}, len={GEMM_N}"
@@ -921,7 +1046,7 @@ def main(argv=None):
 
     print("\n[预期读取值] (Identity Window 地址映射)")
     print(
-        "matrix/vector: 按 task 与 k_tile 布局；worker 通过 stride(task=worker_slot; task+=active_cores) 读取"
+        "matrix/vector: A 按 (m_tile,k_tile) packed once；B 按 (n_tile,k_tile,n_col) packed once"
     )
 
     for core_id in range(FIRST_WORKER_CORE, TOTAL_GEMM_CORES):
@@ -930,19 +1055,23 @@ def main(argv=None):
             print(f"  core{core_id:02d}: no task")
             continue
         for task_id in task_ids:
-            node_idx, task_slot, m_tile, n_tile = task_info(task_id)
+            c_node_idx, task_slot, m_tile, n_tile = task_info(task_id)
+            a_node_idx = _a_data_node_for_m_tile(m_tile)
+            b_node_idx = _b_data_node_for_n_tile(n_tile)
+            a_slot = _a_slot_for_m_tile(m_tile)
+            b_slot = _b_slot_for_n_tile(n_tile)
             mat_addr = (
-                _node_base(node_idx)
+                _node_base(a_node_idx)
                 + OFF_GEMM_MAT
-                + task_slot * GEMM_K_TILES * MM_MAT_STRIDE
+                + a_slot * GEMM_K_TILES * MM_MAT_STRIDE
             )
             vec_addr = (
-                _node_base(node_idx)
+                _node_base(b_node_idx)
                 + OFF_GEMM_VEC_BASE
-                + task_slot * GEMM_K_TILES * BLOCK_N * MM_VEC_STRIDE
+                + b_slot * GEMM_K_TILES * BLOCK_N * MM_VEC_STRIDE
             )
             print(
-                f"  core{core_id:02d}: task={task_id} (m_tile={m_tile},n_tile={n_tile}) mat_k0@0x{mat_addr:08X}, vec_k0@0x{vec_addr:08X} (node{node_idx}, slot={task_slot})"
+                f"  core{core_id:02d}: task={task_id} (m_tile={m_tile},n_tile={n_tile}) mat_k0@0x{mat_addr:08X} (node{a_node_idx}, slot={a_slot}), vec_k0@0x{vec_addr:08X} (node{b_node_idx}, slot={b_slot}), c_node={c_node_idx}, c_slot={task_slot}"
             )
 
     if PRINT_CORE_MAP:
@@ -964,22 +1093,26 @@ def main(argv=None):
             )
             for core_id in range(FIRST_WORKER_CORE, TOTAL_GEMM_CORES):
                 for seq_idx, task_id in enumerate(_task_ids_for_core(core_id)):
-                    node_idx, node_slot, m_tile, n_tile = task_info(task_id)
+                    c_node_idx, node_slot, m_tile, n_tile = task_info(task_id)
+                    a_node_idx = _a_data_node_for_m_tile(m_tile)
+                    b_node_idx = _b_data_node_for_n_tile(n_tile)
+                    a_slot = _a_slot_for_m_tile(m_tile)
+                    b_slot = _b_slot_for_n_tile(n_tile)
                     mat_addr = (
-                        _node_base(node_idx)
+                        _node_base(a_node_idx)
                         + OFF_GEMM_MAT
-                        + node_slot * GEMM_K_TILES * MM_MAT_STRIDE
+                        + a_slot * GEMM_K_TILES * MM_MAT_STRIDE
                     )
                     vec_addr = (
-                        _node_base(node_idx)
+                        _node_base(b_node_idx)
                         + OFF_GEMM_VEC_BASE
-                        + node_slot * GEMM_K_TILES * BLOCK_N * MM_VEC_STRIDE
+                        + b_slot * GEMM_K_TILES * BLOCK_N * MM_VEC_STRIDE
                     )
                     writer.writerow(
                         [
                             core_id,
                             seq_idx,
-                            node_idx,
+                            c_node_idx,
                             f"0x{mat_addr:08X}",
                             f"0x{vec_addr:08X}",
                             node_slot,

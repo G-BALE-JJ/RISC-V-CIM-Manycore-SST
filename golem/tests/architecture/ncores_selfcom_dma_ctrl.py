@@ -76,6 +76,7 @@ def _env_flag(name: str, default: bool = False) -> bool:
 
 ARTIFACT_ROOT = os.getenv("GOLEM_ARTIFACT_ROOT", os.path.join(TESTS_DIR, "artifacts"))
 HBM_DIR = os.getenv("GOLEM_HBM_DIR", os.path.join(ARTIFACT_ROOT, "hbm"))
+HBM_DUMP_OUTPUT = _env_flag("GOLEM_HBM_DUMP_OUTPUT", True)
 STATS_DIR = os.getenv("GOLEM_STATS_DIR", os.path.join(ARTIFACT_ROOT, "stats"))
 STATS_FILE = os.getenv(
     "GOLEM_STATS_FILE", os.path.join(STATS_DIR, "stats_selfcom_ctrl.txt")
@@ -373,12 +374,18 @@ for idx, router_id in enumerate(MEMORY_ROUTERS):
     if idx == OS_MEMORY_NODE_INDEX:
         mem_params.update({"backing": "malloc", "initBacking": 0})
     else:
+        hbm_init_file = os.path.join(HBM_DIR, f"hbm_init_node{idx}.bin")
+        hbm_out_file = (
+            os.path.join(HBM_DIR, f"hbm_out_node{idx}.bin")
+            if HBM_DUMP_OUTPUT
+            else hbm_init_file
+        )
         mem_params.update(
             {
                 "backing": "mmap",
                 "initBacking": 1,
-                "backing_in_file": os.path.join(HBM_DIR, f"hbm_init_node{idx}.bin"),
-                "backing_out_file": os.path.join(HBM_DIR, f"hbm_out_node{idx}.bin"),
+                "backing_in_file": hbm_init_file,
+                "backing_out_file": hbm_out_file,
             }
         )
     memctrl.addParams(mem_params)

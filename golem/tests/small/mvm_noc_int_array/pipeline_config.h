@@ -242,17 +242,93 @@ constexpr uint64_t stage_mat_src_mm(int stage_id) {
 }
 constexpr uint64_t INIT_VEC_SRC_MM = IDENTITY_BASE + TOTAL_GROUPS * MM_MAT_STRIDE;
 
-// GEMM模式：按 tile-task 分配。
-// task_id = m_tile * GEMM_N_TILES + n_tile
-// A reuse: macro_task_id = m_tile * GEMM_N_GROUPS + n_group; A once per macro, B/C per n_offset.
-// B reuse: macro_task_id = m_group * GEMM_N_TILES + n_tile; B once per macro, A/C per m_offset.
+// GEMM模式：A/B packed once, C remains one output tile per logical task.
+// A tile storage key: (m_tile, k_tile). B tile storage key: (n_tile, k_tile, n_col).
+// C tile storage key: (m_tile, n_tile), packed by macro-task slot plus reuse offset.
 constexpr uint64_t GEMM_VEC_STRIDE_MM = align_up_constexpr(GEMM_BLOCK_VEC_BYTES, MM_ALIGN);
 constexpr uint64_t OFF_GEMM_MAT_BASE = 0x0;
-constexpr uint64_t OFF_GEMM_VEC_BASE = OFF_GEMM_MAT_BASE + static_cast<uint64_t>(MAX_GEMM_MACRO_TASKS_PER_DATA_NODE * GEMM_MAT_REUSE_SLOTS * GEMM_K_TILES) * MM_MAT_STRIDE;
 constexpr uint64_t GEMM_OUT_STRIDE_MM = align_up_constexpr(GEMM_BLOCK_OUT_TILE_BYTES, MM_ALIGN);
-constexpr uint64_t OFF_GEMM_OUT_BASE = OFF_GEMM_VEC_BASE + static_cast<uint64_t>(MAX_GEMM_MACRO_TASKS_PER_DATA_NODE * GEMM_VEC_REUSE_SLOTS * GEMM_K_TILES * TILE_N_MAX) * GEMM_VEC_STRIDE_MM;
 constexpr uint64_t GEMM_BIAS_STRIDE_MM = align_up_constexpr(static_cast<uint64_t>(GEMM_N) * ELEM_BYTES, MM_ALIGN);
 constexpr uint64_t OFF_GEMM_BIAS_BASE = MEM_NODE_SIZE - GEMM_BIAS_STRIDE_MM;
+
+constexpr int gemm_const_m_group_for_m_tile(int m_tile) {
+    return m_tile / B_REUSE_M_TILES;
+}
+
+constexpr int gemm_const_n_group_for_n_tile(int n_tile) {
+    return n_tile / A_REUSE_N_TILES;
+}
+
+constexpr int gemm_const_macro_task_for_group(int m_group, int n_group) {
+    const int n_band = (n_group - m_group + GEMM_N_GROUPS) % GEMM_N_GROUPS;
+    return n_band * GEMM_M_GROUPS + m_group;
+}
+
+constexpr int gemm_const_macro_task_for_tile(int m_tile, int n_tile) {
+    return gemm_const_macro_task_for_group(
+        gemm_const_m_group_for_m_tile(m_tile),
+        gemm_const_n_group_for_n_tile(n_tile));
+}
+
+constexpr int gemm_const_a_data_node_for_m_tile(int m_tile) {
+    return gemm_const_data_node_for_task(
+        gemm_const_m_group_for_m_tile(m_tile));
+}
+
+constexpr int gemm_const_b_data_node_for_n_tile(int n_tile) {
+    return gemm_const_data_node_for_task(
+        gemm_const_n_group_for_n_tile(n_tile));
+}
+
+constexpr int gemm_const_a_m_tiles_for_data_node(int node_idx) {
+    int count = 0;
+    for (int m_tile = 0; m_tile < GEMM_M_TILES; ++m_tile) {
+        if (gemm_const_a_data_node_for_m_tile(m_tile) == node_idx) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+constexpr int gemm_const_b_n_tiles_for_data_node(int node_idx) {
+    int count = 0;
+    for (int n_tile = 0; n_tile < GEMM_N_TILES; ++n_tile) {
+        if (gemm_const_b_data_node_for_n_tile(n_tile) == node_idx) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+constexpr int gemm_const_max_a_m_tiles_per_data_node() {
+    int max_count = 0;
+    for (int node_idx = 1; node_idx <= DATA_MEMORY_NODE_COUNT; ++node_idx) {
+        const int count = gemm_const_a_m_tiles_for_data_node(node_idx);
+        if (count > max_count) {
+            max_count = count;
+        }
+    }
+    return max_count > 0 ? max_count : 1;
+}
+
+constexpr int gemm_const_max_b_n_tiles_per_data_node() {
+    int max_count = 0;
+    for (int node_idx = 1; node_idx <= DATA_MEMORY_NODE_COUNT; ++node_idx) {
+        const int count = gemm_const_b_n_tiles_for_data_node(node_idx);
+        if (count > max_count) {
+            max_count = count;
+        }
+    }
+    return max_count > 0 ? max_count : 1;
+}
+
+constexpr int MAX_GEMM_A_M_TILES_PER_DATA_NODE = gemm_const_max_a_m_tiles_per_data_node();
+constexpr int MAX_GEMM_B_N_TILES_PER_DATA_NODE = gemm_const_max_b_n_tiles_per_data_node();
+
+constexpr uint64_t OFF_GEMM_VEC_BASE =
+    OFF_GEMM_MAT_BASE + static_cast<uint64_t>(MAX_GEMM_A_M_TILES_PER_DATA_NODE * GEMM_K_TILES) * MM_MAT_STRIDE;
+constexpr uint64_t OFF_GEMM_OUT_BASE =
+    OFF_GEMM_VEC_BASE + static_cast<uint64_t>(MAX_GEMM_B_N_TILES_PER_DATA_NODE * GEMM_K_TILES * GEMM_BLOCK_N) * GEMM_VEC_STRIDE_MM;
 constexpr uint64_t GEMM_DATA_REGION_END = OFF_GEMM_OUT_BASE + static_cast<uint64_t>(MAX_GEMM_MACRO_TASKS_PER_DATA_NODE * GEMM_OUT_REUSE_SLOTS) * GEMM_OUT_STRIDE_MM;
 
 struct MatmulRuntimeConfig {
@@ -341,8 +417,7 @@ inline int gemm_total_macro_tasks(const MatmulRuntimeConfig& cfg) {
 
 inline uint64_t gemm_off_vec_base(const MatmulRuntimeConfig& cfg) {
     (void)cfg;
-    const int mat_slots = gemm_b_reuse_enabled() ? gemm_b_reuse_m_tiles() : 1;
-    return OFF_GEMM_MAT_BASE + static_cast<uint64_t>(MAX_GEMM_MACRO_TASKS_PER_DATA_NODE * mat_slots * GEMM_K_TILES) * MM_MAT_STRIDE;
+    return OFF_GEMM_MAT_BASE + static_cast<uint64_t>(MAX_GEMM_A_M_TILES_PER_DATA_NODE * GEMM_K_TILES) * MM_MAT_STRIDE;
 }
 
 inline uint64_t gemm_out_stride_mm(const MatmulRuntimeConfig& cfg) {
@@ -351,8 +426,7 @@ inline uint64_t gemm_out_stride_mm(const MatmulRuntimeConfig& cfg) {
 }
 
 inline uint64_t gemm_off_out_base(const MatmulRuntimeConfig& cfg) {
-    const int vec_slots = gemm_a_reuse_n_tiles() > 1 ? gemm_a_reuse_n_tiles() : 1;
-    return gemm_off_vec_base(cfg) + static_cast<uint64_t>(MAX_GEMM_MACRO_TASKS_PER_DATA_NODE * vec_slots * GEMM_K_TILES * cfg.block_n) * GEMM_VEC_STRIDE_MM;
+    return gemm_off_vec_base(cfg) + static_cast<uint64_t>(MAX_GEMM_B_N_TILES_PER_DATA_NODE * GEMM_K_TILES * cfg.block_n) * GEMM_VEC_STRIDE_MM;
 }
 
 inline int gemm_task_id_for_core(int core_id, const MatmulRuntimeConfig& cfg) {
@@ -364,16 +438,22 @@ inline int gemm_task_id_for_core(int core_id, const MatmulRuntimeConfig& cfg) {
     return worker_slot % total_tasks;
 }
 
+inline int gemm_m_group_of_macro_task(int macro_task_id, const MatmulRuntimeConfig& cfg);
+inline int gemm_n_group_of_macro_task(int macro_task_id, const MatmulRuntimeConfig& cfg);
+
 inline int gemm_m_tile_of_task(int task_id, const MatmulRuntimeConfig& cfg) {
-    return (task_id / gemm_n_groups(cfg)) * gemm_b_reuse_m_tiles();
+    return gemm_m_group_of_macro_task(task_id, cfg) * gemm_b_reuse_m_tiles();
 }
 
 inline int gemm_n_tile_of_task(int task_id, const MatmulRuntimeConfig& cfg) {
-    return (task_id % gemm_n_groups(cfg)) * gemm_a_reuse_n_tiles();
+    return gemm_n_group_of_macro_task(task_id, cfg) * gemm_a_reuse_n_tiles();
 }
 
 inline int gemm_n_group_of_macro_task(int macro_task_id, const MatmulRuntimeConfig& cfg) {
-    return macro_task_id % gemm_n_groups(cfg);
+    const int m_groups = gemm_m_groups(cfg);
+    const int n_groups = gemm_n_groups(cfg);
+    const int m_group = macro_task_id % m_groups;
+    return ((macro_task_id / m_groups) + m_group) % n_groups;
 }
 
 inline int gemm_n_count_for_group(int n_group, const MatmulRuntimeConfig& cfg) {
@@ -383,7 +463,7 @@ inline int gemm_n_count_for_group(int n_group, const MatmulRuntimeConfig& cfg) {
 }
 
 inline int gemm_m_group_of_macro_task(int macro_task_id, const MatmulRuntimeConfig& cfg) {
-    return macro_task_id / gemm_n_groups(cfg);
+    return macro_task_id % gemm_m_groups(cfg);
 }
 
 inline int gemm_m_count_for_group(int m_group, const MatmulRuntimeConfig& cfg) {
@@ -449,9 +529,61 @@ inline int gemm_local_task_slot(int task_id, const MatmulRuntimeConfig& cfg) {
     return slot;
 }
 
+inline int gemm_macro_task_for_tile(int m_tile, int n_tile, const MatmulRuntimeConfig& cfg) {
+    const int m_group = m_tile / gemm_b_reuse_m_tiles();
+    const int n_group = n_tile / gemm_a_reuse_n_tiles();
+    const int n_groups = gemm_n_groups(cfg);
+    const int n_band = (n_group - m_group + n_groups) % n_groups;
+    return n_band * gemm_m_groups(cfg) + m_group;
+}
+
+inline int gemm_a_data_node_for_m_tile(int m_tile, const MatmulRuntimeConfig& cfg) {
+    (void)cfg;
+    const int m_group = m_tile / gemm_b_reuse_m_tiles();
+    return gemm_data_node_for_task(m_group, cfg);
+}
+
+inline int gemm_b_data_node_for_n_tile(int n_tile, const MatmulRuntimeConfig& cfg) {
+    const int n_group = n_tile / gemm_a_reuse_n_tiles();
+    return gemm_data_node_for_task(n_group, cfg);
+}
+
+inline int gemm_a_slot_for_m_tile(int m_tile, const MatmulRuntimeConfig& cfg) {
+    const int node_idx = gemm_a_data_node_for_m_tile(m_tile, cfg);
+    int slot = 0;
+    for (int i = 0; i < m_tile; ++i) {
+        if (gemm_a_data_node_for_m_tile(i, cfg) == node_idx) {
+            ++slot;
+        }
+    }
+    return slot;
+}
+
+inline int gemm_b_slot_for_n_tile(int n_tile, const MatmulRuntimeConfig& cfg) {
+    const int node_idx = gemm_b_data_node_for_n_tile(n_tile, cfg);
+    int slot = 0;
+    for (int i = 0; i < n_tile; ++i) {
+        if (gemm_b_data_node_for_n_tile(i, cfg) == node_idx) {
+            ++slot;
+        }
+    }
+    return slot;
+}
+
 inline GemmTaskDescriptor gemm_task_desc_for_task(int core_id, int task_id, const MatmulRuntimeConfig& cfg) {
-    const int node_idx = gemm_data_node_for_task(task_id, cfg);
-    const int task_slot = gemm_local_task_slot(task_id, cfg);
+    const int n_tiles = gemm_n_tiles(cfg);
+    const int m_tile = task_id / n_tiles;
+    const int n_tile = task_id % n_tiles;
+    const int macro_task_id = gemm_macro_task_for_tile(m_tile, n_tile, cfg);
+    const int node_idx = gemm_data_node_for_task(macro_task_id, cfg);
+    const int task_slot = gemm_local_task_slot(macro_task_id, cfg);
+    const int a_node_idx = gemm_a_data_node_for_m_tile(m_tile, cfg);
+    const int b_node_idx = gemm_b_data_node_for_n_tile(n_tile, cfg);
+    const int a_slot = gemm_a_slot_for_m_tile(m_tile, cfg);
+    const int b_slot = gemm_b_slot_for_n_tile(n_tile, cfg);
+    const int mat_slots = gemm_b_reuse_enabled() ? gemm_b_reuse_m_tiles() : 1;
+    const int vec_slots = gemm_a_reuse_n_tiles() > 1 ? gemm_a_reuse_n_tiles() : 1;
+    const int reuse_offset = (m_tile % mat_slots) * vec_slots + (n_tile % vec_slots);
     const int k_tiles = gemm_k_tiles(cfg);
     const uint64_t task_slot_u64 = static_cast<uint64_t>(task_slot);
     const uint64_t off_vec_base = gemm_off_vec_base(cfg);
@@ -460,8 +592,8 @@ inline GemmTaskDescriptor gemm_task_desc_for_task(int core_id, int task_id, cons
     return {
         .core_id = core_id,
         .task_id = task_id,
-        .m_tile = gemm_m_tile_of_task(task_id, cfg),
-        .n_tile = gemm_n_tile_of_task(task_id, cfg),
+        .m_tile = m_tile,
+        .n_tile = n_tile,
         .data_node_idx = node_idx,
         .task_slot_in_node = task_slot,
         .m = cfg.m,
@@ -471,9 +603,9 @@ inline GemmTaskDescriptor gemm_task_desc_for_task(int core_id, int task_id, cons
         .block_n = cfg.block_n,
         .block_k = cfg.block_k,
         .k_tiles = k_tiles,
-        .a_base_mm = node_base_addr(node_idx) + OFF_GEMM_MAT_BASE + task_slot_u64 * static_cast<uint64_t>(GEMM_MAT_REUSE_SLOTS * k_tiles) * MM_MAT_STRIDE,
-        .b_pack_base_mm = node_base_addr(node_idx) + off_vec_base + task_slot_u64 * static_cast<uint64_t>(GEMM_VEC_REUSE_SLOTS * k_tiles * cfg.block_n) * GEMM_VEC_STRIDE_MM,
-        .c_base_mm = node_base_addr(node_idx) + off_out_base + task_slot_u64 * out_stride,
+        .a_base_mm = node_base_addr(a_node_idx) + OFF_GEMM_MAT_BASE + static_cast<uint64_t>(a_slot * k_tiles) * MM_MAT_STRIDE,
+        .b_pack_base_mm = node_base_addr(b_node_idx) + off_vec_base + static_cast<uint64_t>(b_slot * k_tiles * cfg.block_n) * GEMM_VEC_STRIDE_MM,
+        .c_base_mm = node_base_addr(node_idx) + off_out_base + (task_slot_u64 * static_cast<uint64_t>(mat_slots * vec_slots) + static_cast<uint64_t>(reuse_offset)) * out_stride,
         .bias_base_mm = node_base_addr(node_idx) + OFF_GEMM_BIAS_BASE,
     };
 }

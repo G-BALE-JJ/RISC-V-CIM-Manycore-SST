@@ -1848,14 +1848,14 @@ private:
         const uint32_t reuseM = std::max<uint32_t>(header_.b_reuse_m_tiles, 1u);
         uint32_t m_tile = 0;
         uint32_t n_tile = 0;
-        uint64_t mat_group_slot = 0;
-        uint64_t vec_group_slot = 0;
-        uint64_t out_group_slot = 0;
+        const uint32_t m_groups = header_.m_group_count != 0
+                                      ? header_.m_group_count
+                                      : ((m_tiles + reuseM - 1) / reuseM);
         const uint32_t n_groups = header_.n_group_count != 0
                                       ? header_.n_group_count
                                       : ((n_tiles + reuseN - 1) / reuseN);
-        const uint32_t m_group = macro_task_id / n_groups;
-        const uint32_t n_group = macro_task_id % n_groups;
+        const uint32_t m_group = macro_task_id % m_groups;
+        const uint32_t n_group = ((macro_task_id / m_groups) + m_group) % n_groups;
         const uint32_t m_begin = m_group * reuseM;
         const uint32_t n_begin = n_group * reuseN;
         currentReuseMCount_ = std::min<uint32_t>(reuseM, m_tiles - m_begin);
@@ -1875,32 +1875,58 @@ private:
         m_tile = m_begin + reuseMIndex_;
         n_tile = n_begin + reuseNIndex_;
         const uint64_t output_task_id = static_cast<uint64_t>(m_tile) * n_tiles + n_tile;
-        const uint32_t owner_slot = macro_task_id % header_.active_worker_cores;
-        const uint32_t group_id = header_.total_groups > 0 ? (owner_slot % header_.total_groups) : 0;
-        const uint32_t dataMapKey = header_.data_node_map_mode != 0 ? owner_slot : group_id;
-        const uint32_t node_idx = 1 + (header_.data_memory_node_count > 0 ? (dataMapKey % header_.data_memory_node_count) : 0);
-        uint32_t macro_slot = 0;
-        for (uint32_t i = 0; i < macro_task_id; ++i) {
-            const uint32_t prev_owner_slot = i % header_.active_worker_cores;
-            const uint32_t prev_group_id = header_.total_groups > 0 ? (prev_owner_slot % header_.total_groups) : 0;
-            const uint32_t prevDataMapKey = header_.data_node_map_mode != 0 ? prev_owner_slot : prev_group_id;
-            const uint32_t prev_node_idx = 1 + (header_.data_memory_node_count > 0 ? (prevDataMapKey % header_.data_memory_node_count) : 0);
-            if (prev_node_idx == node_idx) {
-                macro_slot++;
+        const uint32_t activeWorkers = std::max<uint32_t>(header_.active_worker_cores, 1u);
+        auto nodeForMacroTask = [&](uint32_t macroTaskId) -> uint32_t {
+            const uint32_t owner_slot = macroTaskId % activeWorkers;
+            const uint32_t group_id = header_.total_groups > 0 ? (owner_slot % header_.total_groups) : 0;
+            const uint32_t dataMapKey = header_.data_node_map_mode != 0 ? owner_slot : group_id;
+            return 1 + (header_.data_memory_node_count > 0 ? (dataMapKey % header_.data_memory_node_count) : 0);
+        };
+        auto macroSlotInNode = [&](uint32_t macroTaskId, uint32_t nodeIdx) -> uint32_t {
+            uint32_t slot = 0;
+            for (uint32_t i = 0; i < macroTaskId; ++i) {
+                if (nodeForMacroTask(i) == nodeIdx) {
+                    slot++;
+                }
+            }
+            return slot;
+        };
+        const uint32_t c_node_idx = nodeForMacroTask(macro_task_id);
+        const uint32_t macro_slot = macroSlotInNode(macro_task_id, c_node_idx);
+        const uint32_t a_owner_macro = m_group;
+        const uint32_t b_owner_macro = n_group;
+        const uint32_t a_node_idx = nodeForMacroTask(a_owner_macro);
+        const uint32_t b_node_idx = nodeForMacroTask(b_owner_macro);
+        uint32_t a_slot = 0;
+        for (uint32_t mt = 0; mt < m_tile; ++mt) {
+            const uint32_t mt_group = mt / reuseM;
+            if (nodeForMacroTask(mt_group) == a_node_idx) {
+                a_slot++;
+            }
+        }
+        uint32_t b_slot = 0;
+        for (uint32_t nt = 0; nt < n_tile; ++nt) {
+            const uint32_t nt_group = nt / reuseN;
+            if (nodeForMacroTask(nt_group) == b_node_idx) {
+                b_slot++;
             }
         }
 
-        const uint64_t node_base = static_cast<uint64_t>(node_idx) * header_.mem_node_size;
-        mat_group_slot = static_cast<uint64_t>(macro_slot) * (reuseM > 1 ? reuseM : 1) + static_cast<uint64_t>(reuseMIndex_);
-        vec_group_slot = static_cast<uint64_t>(macro_slot) * (reuseN > 1 ? reuseN : 1) + static_cast<uint64_t>(reuseNIndex_);
-        out_group_slot = static_cast<uint64_t>(macro_slot) * (reuseM > 1 ? reuseM : 1) * (reuseN > 1 ? reuseN : 1) +
-                         static_cast<uint64_t>(reuseMIndex_) * (reuseN > 1 ? reuseN : 1) + static_cast<uint64_t>(reuseNIndex_);
+        const uint64_t a_node_base = static_cast<uint64_t>(a_node_idx) * header_.mem_node_size;
+        const uint64_t b_node_base = static_cast<uint64_t>(b_node_idx) * header_.mem_node_size;
+        const uint64_t c_node_base = static_cast<uint64_t>(c_node_idx) * header_.mem_node_size;
+        const uint64_t mat_group_slot = static_cast<uint64_t>(a_slot);
+        const uint64_t vec_group_slot = static_cast<uint64_t>(b_slot);
+        const uint64_t out_group_slot =
+            static_cast<uint64_t>(macro_slot) * (reuseM > 1 ? reuseM : 1) * (reuseN > 1 ? reuseN : 1) +
+            static_cast<uint64_t>(reuseMIndex_) * (reuseN > 1 ? reuseN : 1) + static_cast<uint64_t>(reuseNIndex_);
         current_.task_id = output_task_id;
         current_.task_flags = 0;
-        current_.mat_base_addr = node_base + header_.off_gemm_mat_base + mat_group_slot * static_cast<uint64_t>(k_tiles) * header_.mat_stride_bytes;
-        current_.vec_base_addr = node_base + header_.off_gemm_vec_base + vec_group_slot * static_cast<uint64_t>(k_tiles * header_.block_n) * header_.vec_stride_bytes;
-        const uint64_t out_stride = static_cast<uint64_t>(header_.block_m) * static_cast<uint64_t>(header_.block_n) * static_cast<uint64_t>(header_.elem_bytes);
-        current_.c_base_addr = node_base + header_.off_gemm_out_base + out_group_slot * out_stride;
+        current_.mat_base_addr = a_node_base + header_.off_gemm_mat_base + mat_group_slot * static_cast<uint64_t>(k_tiles) * header_.mat_stride_bytes;
+        current_.vec_base_addr = b_node_base + header_.off_gemm_vec_base + vec_group_slot * static_cast<uint64_t>(k_tiles * header_.block_n) * header_.vec_stride_bytes;
+        const uint64_t out_bytes = static_cast<uint64_t>(header_.block_m) * static_cast<uint64_t>(header_.block_n) * static_cast<uint64_t>(header_.elem_bytes);
+        const uint64_t out_stride = ((out_bytes + 0xffULL) / 0x100ULL) * 0x100ULL;
+        current_.c_base_addr = c_node_base + header_.off_gemm_out_base + out_group_slot * out_stride;
         current_.accum_base_addr = header_.local_accum_gm_addr;
         current_.completion_flag_addr = 0;
         current_.completion_value = 0;
