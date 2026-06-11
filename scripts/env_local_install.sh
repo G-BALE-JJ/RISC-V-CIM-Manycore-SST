@@ -9,10 +9,10 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-ELEMENTS_WORKTREE="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+WORKTREE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 
 export SST_CORE_PREFIX="${SST_CORE_PREFIX:-/data4/lishun/pkg/sst_install}"
-export SST_ELEMENTS_INSTALL_PREFIX="${SST_ELEMENTS_INSTALL_PREFIX:-$ELEMENTS_WORKTREE/install}"
+export SST_ELEMENTS_INSTALL_PREFIX="${SST_ELEMENTS_INSTALL_PREFIX:-$WORKTREE_ROOT/install}"
 
 case ":${PATH:-}:" in
 	*":$SST_CORE_PREFIX/bin:"*) ;;

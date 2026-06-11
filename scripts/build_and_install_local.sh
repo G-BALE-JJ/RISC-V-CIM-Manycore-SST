@@ -5,20 +5,19 @@ usage() {
 	cat <<'EOF'
 Usage: scripts/build_and_install_local.sh [--clean] [--reconfigure] [--no-autogen] [--jobs N]
 
-Build and install this worktree's SST elements into a worktree-local prefix.
+Build and install this full-layout worktree's SST elements into a worktree-local
+prefix.
 
 Defaults:
-  BUILD_ROOT             ./build/sst-elements
-  INSTALL_PREFIX         ./install
-  SST_ELEMENTS_TEMPLATE  /data4/lishun/pkg/sst-elements
-  SST_CORE_PREFIX        /data4/lishun/pkg/sst_install
-  SST_DRAMSIM3_PREFIX    /data4/lishun/pkg/DRAMsim3
-  JOBS                   nproc
+  BUILD_ROOT          ./build/sst-elements
+  INSTALL_PREFIX      ./install
+  SST_CORE_PREFIX     /data4/lishun/pkg/sst_install
+  SST_DRAMSIM3_PREFIX /data4/lishun/pkg/DRAMsim3
+  JOBS                nproc
 
 Override defaults with environment variables, for example:
   SST_CORE_PREFIX=/path/to/sst_core_install \
   SST_DRAMSIM3_PREFIX=/path/to/DRAMsim3 \
-  SST_ELEMENTS_TEMPLATE=/path/to/full/sst-elements-source \
   scripts/build_and_install_local.sh
 
 Options:
@@ -69,9 +68,10 @@ while [[ $# -gt 0 ]]; do
 done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-ELEMENTS_WORKTREE="$(cd "$SCRIPT_DIR/.." && pwd -P)"
-BUILD_ROOT="${BUILD_ROOT:-$ELEMENTS_WORKTREE/build/sst-elements}"
-INSTALL_PREFIX="${INSTALL_PREFIX:-$ELEMENTS_WORKTREE/install}"
+WORKTREE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+ELEMENTS_SOURCE="$WORKTREE_ROOT/src/sst/elements"
+BUILD_ROOT="${BUILD_ROOT:-$WORKTREE_ROOT/build/sst-elements}"
+INSTALL_PREFIX="${INSTALL_PREFIX:-$WORKTREE_ROOT/install}"
 SST_CORE_PREFIX="${SST_CORE_PREFIX:-/data4/lishun/pkg/sst_install}"
 SST_DRAMSIM3_PREFIX="${SST_DRAMSIM3_PREFIX:-/data4/lishun/pkg/DRAMsim3}"
 
@@ -96,8 +96,8 @@ fi
 
 "$SCRIPT_DIR/prepare_local_build.sh" "$BUILD_ROOT"
 
-if [[ ! -L "$BUILD_ROOT/src/sst/elements" || "$(readlink -f "$BUILD_ROOT/src/sst/elements")" != "$ELEMENTS_WORKTREE" ]]; then
-	echo "[ERROR] $BUILD_ROOT/src/sst/elements does not point to this worktree" >&2
+if [[ ! -L "$BUILD_ROOT/src/sst/elements" || "$(readlink -f "$BUILD_ROOT/src/sst/elements")" != "$ELEMENTS_SOURCE" ]]; then
+	echo "[ERROR] $BUILD_ROOT/src/sst/elements does not point to this worktree's elements source" >&2
 	exit 1
 fi
 
@@ -132,7 +132,7 @@ cat <<EOF
 [OK] Build and install complete.
 
 Before running experiments from this worktree:
-  cd "$ELEMENTS_WORKTREE"
+  cd "$WORKTREE_ROOT"
   source scripts/env_local_install.sh
   cd build/sst-elements/src/sst/elements/golem/tests
 

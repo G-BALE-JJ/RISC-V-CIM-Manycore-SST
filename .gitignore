@@ -32,27 +32,27 @@ install/
 *~
 
 # GOLEM experiment artifacts and generated data
-golem/artifacts/
-golem/tests/artifacts/
-golem/tests/artifacts_lenet/
-golem/tests/data/*.bin
-golem/tests/data/*.npy
-golem/tests/data/*.csv
-golem/tests/data/real_lenet5*/
-golem/tests/doc/node_modules/
-golem/tests/doc/package-lock.json
-golem/tests/small/mvm_noc_int_array/riscv64/test_noc_dma
-golem/tests/small/mvm_noc_int_array/riscv64/*.build.env
-golem/tests/dramsim3*.txt
-golem/tests/dramsim3*.json
-golem/tests/stdout-*
-golem/tests/stderr-*
-golem/tests/stats/stats_selfcom.txt
-golem/tests/stats/kernel_speedup_trend.png
+src/sst/elements/golem/artifacts/
+src/sst/elements/golem/tests/artifacts/
+src/sst/elements/golem/tests/artifacts_lenet/
+src/sst/elements/golem/tests/data/*.bin
+src/sst/elements/golem/tests/data/*.npy
+src/sst/elements/golem/tests/data/*.csv
+src/sst/elements/golem/tests/data/real_lenet5*/
+src/sst/elements/golem/tests/doc/node_modules/
+src/sst/elements/golem/tests/doc/package-lock.json
+src/sst/elements/golem/tests/small/mvm_noc_int_array/riscv64/test_noc_dma
+src/sst/elements/golem/tests/small/mvm_noc_int_array/riscv64/*.build.env
+src/sst/elements/golem/tests/dramsim3*.txt
+src/sst/elements/golem/tests/dramsim3*.json
+src/sst/elements/golem/tests/stdout-*
+src/sst/elements/golem/tests/stderr-*
+src/sst/elements/golem/tests/stats/stats_selfcom.txt
+src/sst/elements/golem/tests/stats/kernel_speedup_trend.png
 
 # Large/generated backend test outputs
-memHierarchy/tests/dramsim3*.txt
-memHierarchy/tests/dramsim3*.json
+src/sst/elements/memHierarchy/tests/dramsim3*.txt
+src/sst/elements/memHierarchy/tests/dramsim3*.json
 
 # Tool caches
 .ruff_cache/
