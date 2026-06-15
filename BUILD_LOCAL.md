@@ -40,9 +40,11 @@ and keeps generated build files under:
 /data4/lishun/pkg/wt-huti-v0-full/build/sst-elements/
 ```
 
-The prepared build tree links `build/sst-elements/src/sst/elements` back to
-this worktree's `src/sst/elements`, so builds and `golem/tests` runs use this
-branch's sources.
+The prepared build tree copies this worktree's sources into
+`build/sst-elements/`, so generated configure, libtool, and object files stay
+inside the local build tree. Existing prepared build trees are refreshed before
+each build; legacy symlink-based trees are replaced automatically, and `--clean`
+is only needed after deleting source files or when you want a full reset.
 
 ## Defaults
 

@@ -69,11 +69,12 @@ done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 WORKTREE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
-ELEMENTS_SOURCE="$WORKTREE_ROOT/src/sst/elements"
 BUILD_ROOT="${BUILD_ROOT:-$WORKTREE_ROOT/build/sst-elements}"
 INSTALL_PREFIX="${INSTALL_PREFIX:-$WORKTREE_ROOT/install}"
 SST_CORE_PREFIX="${SST_CORE_PREFIX:-/data4/lishun/pkg/sst_install}"
 SST_DRAMSIM3_PREFIX="${SST_DRAMSIM3_PREFIX:-/data4/lishun/pkg/DRAMsim3}"
+INSTALL_HOME="$BUILD_ROOT/.sst-home"
+INSTALL_HOME_CONFIG="$INSTALL_HOME/.sst/sstsimulator.conf"
 
 if [[ -z "$jobs" ]]; then
 	jobs="$(nproc 2>/dev/null || echo 1)"
@@ -96,8 +97,8 @@ fi
 
 "$SCRIPT_DIR/prepare_local_build.sh" "$BUILD_ROOT"
 
-if [[ ! -L "$BUILD_ROOT/src/sst/elements" || "$(readlink -f "$BUILD_ROOT/src/sst/elements")" != "$ELEMENTS_SOURCE" ]]; then
-	echo "[ERROR] $BUILD_ROOT/src/sst/elements does not point to this worktree's elements source" >&2
+if [[ ! -d "$BUILD_ROOT/src/sst/elements/golem" || -L "$BUILD_ROOT/src/sst/elements" ]]; then
+	echo "[ERROR] $BUILD_ROOT/src/sst/elements is not a copied elements source tree" >&2
 	exit 1
 fi
 
@@ -126,7 +127,11 @@ echo "[3/4] Building with $jobs jobs"
 make -j"$jobs"
 
 echo "[4/4] Installing to $INSTALL_PREFIX"
-make install
+mkdir -p "$INSTALL_HOME/.sst"
+if [[ ! -f "$INSTALL_HOME_CONFIG" ]]; then
+	cp "$SST_CORE_PREFIX/etc/sst/sstsimulator.conf" "$INSTALL_HOME_CONFIG"
+fi
+HOME="$INSTALL_HOME" make install
 
 cat <<EOF
 [OK] Build and install complete.
@@ -134,7 +139,7 @@ cat <<EOF
 Before running experiments from this worktree:
   cd "$WORKTREE_ROOT"
   source scripts/env_local_install.sh
-  cd build/sst-elements/src/sst/elements/golem/tests
+  cd "$BUILD_ROOT/src/sst/elements/golem/tests"
 
 Installed element libraries:
   $INSTALL_PREFIX/lib/sst-elements-library
