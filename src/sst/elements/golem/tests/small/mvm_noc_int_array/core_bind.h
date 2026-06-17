@@ -22,15 +22,23 @@ inline void bind_process_to_core(int core_id) {
 
 inline int resolve_core_id(int requested_core) {
     int actual_core = sched_getcpu();
+
+    if (requested_core >= 0) {
+        if (actual_core >= 0 && requested_core != actual_core) {
+            printf("[WARN] 请求绑定核心 %d，但 sched_getcpu 返回核心 %d。将使用请求核心 ID。\n",
+                   requested_core, actual_core);
+        } else if (actual_core < 0) {
+            perror("sched_getcpu");
+            printf("[WARN] sched_getcpu 失败 (errno=%d)。将使用请求核心 ID %d。\n",
+                   errno, requested_core);
+        }
+        return requested_core;
+    }
+
     if (actual_core < 0) {
         perror("sched_getcpu");
         fprintf(stderr, "ERROR: 无法获取实际核心 ID，sched_getcpu 失败 (errno=%d)\n", errno);
         _exit(1);
-    }
-
-    if (requested_core >= 0 && requested_core != actual_core) {
-        printf("[WARN] 请求绑定核心 %d，但实际运行在核心 %d。将使用实际核心 ID。\n",
-               requested_core, actual_core);
     }
 
     return actual_core;

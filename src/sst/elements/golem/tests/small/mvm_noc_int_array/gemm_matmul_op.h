@@ -66,9 +66,12 @@ struct WorkerTaskListHeaderRuntime {
     uint32_t n_group_count;
     uint32_t b_reuse_m_tiles;
     uint32_t m_group_count;
+    uint32_t data_node_map_mode;
 };
 
 constexpr uint64_t WCP_DESC_GM_ADDR = LOCAL_TMP_OFFSET;
+static_assert((sizeof(WorkerTaskListHeaderRuntime) % sizeof(uint64_t)) == 0,
+              "WorkerTaskListHeaderRuntime must be written as whole u64 words");
 
 static inline void write_worker_task_list_header_at(int core_id, uint64_t base, const WorkerTaskListHeaderRuntime& desc) {
     const uint64_t* words = reinterpret_cast<const uint64_t*>(&desc);

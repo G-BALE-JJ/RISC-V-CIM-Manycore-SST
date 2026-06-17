@@ -155,7 +155,7 @@ public:
 
     virtual void getVCsPerVN(std::vector<int>& vcs_per_vn) {
         for ( int i = 0; i < num_vns; ++i ) {
-            vcs_per_vn[i] = 1;
+            vcs_per_vn[i] = 2;
         }
     }
     
