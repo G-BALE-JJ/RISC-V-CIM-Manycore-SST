@@ -27,7 +27,7 @@ WORKTREE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 ELEMENTS_SOURCE="$WORKTREE_ROOT/src/sst/elements"
 BUILD_ROOT="${1:-$WORKTREE_ROOT/build/sst-elements}"
 INSTALL_PREFIX="$WORKTREE_ROOT/install"
-SST_CORE_PREFIX="${SST_CORE_PREFIX:-/data4/lishun/pkg/sst_install}"
+SST_CORE_PREFIX="${SST_CORE_PREFIX:-/data4/jjgong/local/sstcore}"
 SST_DRAMSIM3_PREFIX="${SST_DRAMSIM3_PREFIX:-/data4/lishun/pkg/DRAMsim3}"
 
 if [[ ! -d "$ELEMENTS_SOURCE/golem" || ! -f "$WORKTREE_ROOT/autogen.sh" || ! -f "$WORKTREE_ROOT/configure.ac" ]]; then

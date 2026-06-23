@@ -9,6 +9,13 @@ enum class GolemOpStatus : uint8_t {
     UNSUPPORTED = 2,
 };
 
+enum class GolemOperatorKind : uint8_t {
+    CONV2D_IM2COL = 0,
+    MAXPOOL2D = 1,
+    DENSE = 2,
+    SOFTMAX = 3,
+};
+
 enum class TensorDataType : uint8_t {
     FP32 = 0,
     INT32 = 1,
@@ -65,6 +72,16 @@ struct DenseOpDesc {
     TensorLayout layout;
 };
 
+struct SoftmaxOpDesc {
+    uint32_t version;
+    int64_t outer;
+    int64_t dim;
+    int64_t axis;
+    bool allow_golem;
+    TensorDataType dtype;
+    TensorLayout layout;
+};
+
 const char* golem_op_last_error();
 const char* golem_op_status_string(GolemOpStatus status);
 
@@ -76,6 +93,7 @@ GolemOpStatus validate_tensor_desc(const TensorDesc& t,
 GolemOpStatus validate_op_desc(const Conv2dIm2colOpDesc& op);
 GolemOpStatus validate_op_desc(const MaxPool2dOpDesc& op);
 GolemOpStatus validate_op_desc(const DenseOpDesc& op);
+GolemOpStatus validate_op_desc(const SoftmaxOpDesc& op);
 
 GolemOpStatus validate_compatibility(const TensorDesc& input,
                                      const TensorDesc& output,
@@ -92,5 +110,9 @@ GolemOpStatus validate_compatibility(const TensorDesc& input,
                                      const TensorDesc& weights,
                                      const TensorDesc& bias,
                                      const DenseOpDesc& op);
+
+GolemOpStatus validate_compatibility(const TensorDesc& input,
+                                     const TensorDesc& output,
+                                     const SoftmaxOpDesc& op);
 
 #endif
