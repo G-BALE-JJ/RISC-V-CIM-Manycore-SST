@@ -11,6 +11,12 @@ golem_status_t golemInitCrossTileSoftmaxContext(
     if (ctx == nullptr) {
         return GOLEM_STATUS_INVALID_ARGUMENT;
     }
+    if (m <= 0 || n <= 0 || block_m <= 0 || block_n <= 0) {
+        return GOLEM_STATUS_INVALID_ARGUMENT;
+    }
+    if (block_m > 64 || block_n > 64) {
+        return GOLEM_STATUS_UNSUPPORTED;
+    }
     ctx->reduction_buffer_hbm_base = reduction_buffer_base;
     ctx->total_m_tiles = (m + block_m - 1) / block_m;
     ctx->total_n_tiles = (n + block_n - 1) / block_n;
@@ -38,6 +44,8 @@ static void compute_tile_local_max(
 }
 
 // Atomic max reduction: load current max from HBM, compute new max, and store
+// NOTE: This is not truly atomic - race condition exists between load and store.
+// TODO: Use hardware atomic operations when available (e.g., cim_atomic_max)
 static golem_status_t atomic_max_reduction(
     int core_id,
     uint64_t reduction_row_base_hbm,
@@ -87,19 +95,18 @@ golem_status_t golemRunCrossTileSoftmaxForCore(
     // Allocate temporary buffers in GM
     const uint64_t local_tmp_gm = gm_addr(core_id, LOCAL_LAYOUT.accum);
     const uint64_t tile_data_gm = gm_addr(core_id, LOCAL_LAYOUT.accum + 256);
-    const uint64_t row_max_gm = gm_addr(core_id, LOCAL_LAYOUT.accum + 512);
 
     // Load tile data from HBM to GM
     uint64_t tile_bytes = block_m * block_n * sizeof(float);
     dma_remote_load_to_gm(core_id, c_tile_hbm_addr, tile_data_gm, tile_bytes);
 
     // Copy tile data from GM to MM for computation
-    float tile_data[256];  // Max 64x64 tile = 4096 floats, use reasonable size
+    float tile_data[4096];  // Support up to 64×64 tiles
     set_len(tile_bytes);
     gm2mm(tile_data, tile_data_gm);
 
     // Compute local max for each row in the tile
-    float row_max[64];  // Max block_m rows
+    float row_max[64];      // Max block_m rows
     compute_tile_local_max(core_id, tile_data, block_m, block_n, row_max);
 
     // For each row, atomically update the global max in HBM reduction buffer
@@ -114,6 +121,9 @@ golem_status_t golemRunCrossTileSoftmaxForCore(
         // Atomic max update
         atomic_max_reduction(core_id, reduction_row_base, row_max[r], local_tmp_gm);
     }
+
+    // TODO: Add barrier synchronization here (Task 3)
+    // barrier_wait(core_id, ctx->reduction_buffer_hbm_base, ctx->n_tiles_per_row);
 
     return GOLEM_STATUS_OK;
 }
