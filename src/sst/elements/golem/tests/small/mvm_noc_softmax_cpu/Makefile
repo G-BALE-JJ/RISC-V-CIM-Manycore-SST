@@ -14,7 +14,7 @@ LDLIBS += -lm
 
 PROG := test_noc_dma_softmax
 OUT_DIR := $(ARCH)
-SRCS := test_noc_dma_softmax.cpp golem_softmax_runtime.cpp $(BASE_DIR)/golem_matmul_runtime.cpp
+SRCS := test_noc_dma_softmax.cpp golem_softmax_runtime.cpp golem_softmax_cross_tile.cpp $(BASE_DIR)/golem_matmul_runtime.cpp
 API_TEST_OBJ := $(OUT_DIR)/test_softmax_operator_api_compile.o
 
 all: $(OUT_DIR)/$(PROG) $(API_TEST_OBJ)

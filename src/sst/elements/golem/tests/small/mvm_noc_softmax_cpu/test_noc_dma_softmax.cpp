@@ -3,12 +3,11 @@
 #include <cstdlib>
 #include <cstring>
 
-#if defined(__riscv)
 #include "core_bind.h"
 #include "pipeline_config.h"
 #include "golem_matmul_runtime.h"
-#endif
 #include "golem_softmax_runtime.h"
+#include "golem_softmax_cross_tile.h"
 
 namespace {
 
@@ -17,7 +16,6 @@ bool close_enough(float got, float expected) {
     return diff <= 1.0e-5f;
 }
 
-#if defined(__riscv)
 int64_t read_i64_env_or_default(const char* name, int64_t default_value) {
     const char* raw = std::getenv(name);
     if (raw == nullptr || raw[0] == '\0') {
@@ -131,9 +129,35 @@ int run_tile_local_softmax_for_core(int core_id, const golem_matmul_op_desc_t& o
         return 0;
     }
 
+    // Initialize cross-tile softmax context
+    const int m_tiles = (cfg.m + cfg.block_m - 1) / cfg.block_m;
+    const int n_tiles = (cfg.n + cfg.block_n - 1) / cfg.block_n;
+    const uint64_t reduction_buffer_hbm = 0x8000000;  // Placeholder HBM address
+
+    CrossTileSoftmaxContext ctx;
+    golem_status_t status = golemInitCrossTileSoftmaxContext(
+        &ctx,
+        m_tiles,
+        n_tiles,
+        cfg.block_m,
+        cfg.block_n,
+        reduction_buffer_hbm);
+    if (status != GOLEM_STATUS_OK) {
+        std::fprintf(stderr,
+                     "[Core %d] [SOFTMAX] failed to initialize cross-tile context: %s\n",
+                     core_id,
+                     golemSoftmaxGetLastErrorString());
+        return 1;
+    }
+
     int softmax_tiles = 0;
     for (int task_id = worker_slot; task_id < total_tasks; task_id += ACTIVE_GEMM_CORES) {
         const GemmTaskDescriptor desc = gemm_task_desc_for_task(core_id, task_id, cfg);
+
+        // Extract tile indices from task_id
+        const int m_tile = task_id / n_tiles;
+        const int n_tile = task_id % n_tiles;
+
         golem_softmax_op_desc_t softmax_desc = {
             .outer = desc.block_m,
             .dim = desc.block_n,
@@ -141,25 +165,29 @@ int run_tile_local_softmax_for_core(int core_id, const golem_matmul_op_desc_t& o
             .dtype = GOLEM_DTYPE_FP32,
             .layout = GOLEM_LAYOUT_ROW_MAJOR,
         };
-        const golem_status_t status = golemRunSoftmaxCpuGmForCore(
+
+        status = golemRunCrossTileSoftmaxForCore(
             &softmax_desc,
+            &ctx,
             core_id,
+            m_tile,
+            n_tile,
             desc.c_base_mm,
-            desc.c_base_mm,
-            desc.block_n,
             desc.block_n);
         if (status != GOLEM_STATUS_OK) {
             std::fprintf(stderr,
-                         "[Core %d] [SOFTMAX] tile task=%d failed: %s\n",
+                         "[Core %d] [SOFTMAX] cross-tile task=%d (m_tile=%d, n_tile=%d) failed: %s\n",
                          core_id,
                          task_id,
+                         m_tile,
+                         n_tile,
                          golemSoftmaxGetLastErrorString());
             return 1;
         }
         softmax_tiles++;
     }
 
-    std::printf("[Core %d] [SOFTMAX] tile-local softmax complete: tiles=%d\n", core_id, softmax_tiles);
+    std::printf("[Core %d] [SOFTMAX] cross-tile softmax complete: tiles=%d\n", core_id, softmax_tiles);
     std::fflush(stdout);
     return 0;
 }
@@ -179,7 +207,6 @@ int run_riscv_gemm_softmax(int argc, char* argv[]) {
     }
     return run_tile_local_softmax_for_core(core_id, op_desc);
 }
-#endif
 
 int run_pointer_softmax_selftest() {
     float input[3] = {1.0f, 2.0f, 3.0f};
@@ -327,14 +354,9 @@ int run_gm_softmax_dim64_selftest() {
 }  // namespace
 
 int main(int argc, char* argv[]) {
-#if defined(__riscv)
     if (argc > 1) {
         return run_riscv_gemm_softmax(argc, argv);
     }
-#else
-    (void)argc;
-    (void)argv;
-#endif
     int status = run_pointer_softmax_selftest();
     if (status != 0) {
         return status;
