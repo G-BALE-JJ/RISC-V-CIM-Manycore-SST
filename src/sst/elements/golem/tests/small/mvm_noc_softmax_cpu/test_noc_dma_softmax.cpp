@@ -8,6 +8,7 @@
 #include "golem_matmul_runtime.h"
 #include "golem_softmax_runtime.h"
 #include "golem_softmax_cross_tile.h"
+#include "golem_softmax_single_core.h"
 
 namespace {
 
@@ -129,16 +130,35 @@ int run_tile_local_softmax_for_core(int core_id, const golem_matmul_op_desc_t& o
         return 0;
     }
 
-    // Initialize cross-tile softmax context
+    // Choose softmax mode: single-core (default) or cross-tile
+    const char* softmax_mode = std::getenv("GOLEM_SOFTMAX_MODE");
+    const bool use_cross_tile = (softmax_mode != nullptr && std::strcmp(softmax_mode, "cross-tile") == 0);
+
+    if (use_cross_tile) {
+        // Cross-tile mode: all cores participate with barriers
+        if (core_id == 0) {
+            std::printf("[SOFTMAX] mode=cross-tile (multi-core with barriers)\n");
+        }
+    } else {
+        // Single-core mode: only Core 0 executes
+        if (core_id == 0) {
+            std::printf("[SOFTMAX] mode=single-core (Core 0 post-processing)\n");
+        }
+    }
+
+    if (use_cross_tile) {
+        // Initialize cross-tile softmax context
     const int m_tiles = (cfg.m + cfg.block_m - 1) / cfg.block_m;
     const int n_tiles = (cfg.n + cfg.block_n - 1) / cfg.block_n;
-    const uint64_t reduction_buffer_hbm = 0x8000000;  // Placeholder HBM address
+    // Place reduction buffer in HBM at end of data region (identity_base + max_data_size)
+    // Assume C matrix uses at most 1MB, so place reduction buffer at 0x8000000 + 0x100000 = 0x8100000
+    const uint64_t reduction_buffer_hbm = 0x8100000;
 
     CrossTileSoftmaxContext ctx;
     golem_status_t status = golemInitCrossTileSoftmaxContext(
         &ctx,
-        m_tiles,
-        n_tiles,
+        cfg.m,        // Pass actual dimensions, not tile counts
+        cfg.n,
         cfg.block_m,
         cfg.block_n,
         reduction_buffer_hbm);
@@ -150,6 +170,27 @@ int run_tile_local_softmax_for_core(int core_id, const golem_matmul_op_desc_t& o
         return 1;
     }
 
+    // Core 0 initializes the reduction buffer
+    if (core_id == 0) {
+        const int64_t total_rows = cfg.m;
+        status = golemInitCrossTileReductionBuffer(&ctx, core_id, total_rows);
+        if (status != GOLEM_STATUS_OK) {
+            std::fprintf(stderr,
+                         "[Core 0] [SOFTMAX] failed to initialize reduction buffer: %s\n",
+                         golemSoftmaxGetLastErrorString());
+            return 1;
+        }
+        std::printf("[Core 0] [SOFTMAX] reduction buffer initialized (rows=%ld)\n", total_rows);
+        std::fflush(stdout);
+    }
+
+    // TODO: Add barrier to ensure core 0 finishes initialization before other cores start
+    // For now, rely on sequential execution in single-core tests
+
+    std::printf("[Core %d] [SOFTMAX] starting cross-tile loop: worker_slot=%d total_tasks=%d\n",
+                core_id, worker_slot, total_tasks);
+    std::fflush(stdout);
+
     int softmax_tiles = 0;
     for (int task_id = worker_slot; task_id < total_tasks; task_id += ACTIVE_GEMM_CORES) {
         const GemmTaskDescriptor desc = gemm_task_desc_for_task(core_id, task_id, cfg);
@@ -157,6 +198,10 @@ int run_tile_local_softmax_for_core(int core_id, const golem_matmul_op_desc_t& o
         // Extract tile indices from task_id
         const int m_tile = task_id / n_tiles;
         const int n_tile = task_id % n_tiles;
+
+        std::printf("[Core %d] [SOFTMAX] task=%d m_tile=%d n_tile=%d c_base_mm=0x%lx\n",
+                    core_id, task_id, m_tile, n_tile, desc.c_base_mm);
+        std::fflush(stdout);
 
         golem_softmax_op_desc_t softmax_desc = {
             .outer = desc.block_m,
@@ -174,6 +219,10 @@ int run_tile_local_softmax_for_core(int core_id, const golem_matmul_op_desc_t& o
             n_tile,
             desc.c_base_mm,
             desc.block_n);
+
+        std::printf("[Core %d] [SOFTMAX] task=%d returned status=%d\n", core_id, task_id, status);
+        std::fflush(stdout);
+
         if (status != GOLEM_STATUS_OK) {
             std::fprintf(stderr,
                          "[Core %d] [SOFTMAX] cross-tile task=%d (m_tile=%d, n_tile=%d) failed: %s\n",
@@ -189,6 +238,67 @@ int run_tile_local_softmax_for_core(int core_id, const golem_matmul_op_desc_t& o
 
     std::printf("[Core %d] [SOFTMAX] cross-tile softmax complete: tiles=%d\n", core_id, softmax_tiles);
     std::fflush(stdout);
+    } else {
+        // Single-core mode: only Core 0 aggregates and computes softmax
+        SingleCoreSoftmaxContext ctx;
+        golem_status_t status = golemInitSingleCoreSoftmaxContext(
+            &ctx,
+            cfg.m,
+            cfg.n,
+            cfg.block_m,
+            cfg.block_n);
+        if (status != GOLEM_STATUS_OK) {
+            if (core_id == 0) {
+                std::fprintf(stderr,
+                             "[Core 0] [SOFTMAX] failed to initialize single-core context: %s\n",
+                             golemSoftmaxGetLastErrorString());
+            }
+            return 1;
+        }
+
+        // Get first tile's HBM address (m_tile=0, n_tile=0)
+        const GemmTaskDescriptor first_desc = gemm_task_desc_for_task(core_id, 0, cfg);
+        const uint64_t c_base_hbm = first_desc.c_base_mm;
+
+        // Compute stride between N-tiles (assume column-major layout)
+        const int64_t n_tile_stride = cfg.block_m * cfg.block_n * sizeof(float);
+
+        golem_softmax_op_desc_t softmax_desc = {
+            .outer = cfg.m,
+            .dim = cfg.n,
+            .axis = -1,
+            .dtype = GOLEM_DTYPE_FP32,
+            .layout = GOLEM_LAYOUT_ROW_MAJOR,
+        };
+
+        if (core_id == 0) {
+            std::printf("[Core 0] [SOFTMAX] starting single-core softmax: m=%d n=%d c_base=0x%lx stride=%ld\n",
+                        cfg.m, cfg.n, c_base_hbm, n_tile_stride);
+            std::fflush(stdout);
+        }
+
+        status = golemRunSingleCoreSoftmaxForCore(
+            &softmax_desc,
+            &ctx,
+            core_id,
+            c_base_hbm,
+            n_tile_stride);
+
+        if (status != GOLEM_STATUS_OK) {
+            if (core_id == 0) {
+                std::fprintf(stderr,
+                             "[Core 0] [SOFTMAX] single-core softmax failed: %s\n",
+                             golemSoftmaxGetLastErrorString());
+            }
+            return 1;
+        }
+
+        if (core_id == 0) {
+            std::printf("[Core 0] [SOFTMAX] single-core softmax complete\n");
+            std::fflush(stdout);
+        }
+    }
+
     return 0;
 }
 
