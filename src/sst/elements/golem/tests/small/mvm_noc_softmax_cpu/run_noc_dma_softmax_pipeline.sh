@@ -272,10 +272,9 @@ fi
 popd >/dev/null
 
 export VANADIS_EXE="$SOFTMAX_BIN"
-# Force base pipeline to skip binary building - we provide our own softmax binary
-export GOLEM_SKIP_BUILD=1
-# Remove baseline binary metadata to prevent mismatch errors (we don't use baseline binary)
-rm -f "$BASELINE_BUILD_ENV" 2>/dev/null || true
+# Let base pipeline build its own binary (won't be used due to VANADIS_EXE override)
+# This avoids metadata mismatch issues
+export GOLEM_SKIP_BUILD=0
 export GOLEM_MATMUL_DTYPE="${GOLEM_MATMUL_DTYPE:-fp32}"
 export GOLEM_VERIFY_C
 export GOLEM_VERIFY_SOFTMAX
