@@ -2,7 +2,7 @@
 
 ## 概述
 
-这些脚本用于测试**多核并行 GEMM + 单核后处理 Softmax**的场景。
+这些测试脚本演示**多核并行 GEMM + 单核后处理 Softmax**的场景。
 
 ### 架构
 
@@ -19,11 +19,11 @@ Phase 2: 单核 Softmax (Core 0 串行)
 
 ### 测试脚本
 
-| 脚本 | 矩阵大小 | GEMM Tiles | 描述 |
-|------|---------|-----------|------|
-| `test_16core_128x128.sh` | 128×128 | 4 (2×2) | 快速验证 |
-| `test_16core_256x256.sh` | 256×256 | 16 (4×4) | 标准测试 |
-| `test_16core_512x512.sh` | 512×512 | 64 (8×8) | 压力测试 |
+| 脚本 | 矩阵大小 | GEMM Tiles | 配置文件 | 描述 |
+|------|---------|-----------|---------|------|
+| `test_16core_128x128.sh` | 128×128 | 4 (2×2) | `configs/16core_128x128.env` | 快速验证 |
+| `test_16core_256x256.sh` | 256×256 | 16 (4×4) | `configs/16core_256x256.env` | 标准测试 |
+| `test_16core_512x512.sh` | 512×512 | 64 (8×8) | `configs/16core_512x512.env` | 压力测试 |
 
 ### 运行示例
 
@@ -37,11 +37,67 @@ Phase 2: 单核 Softmax (Core 0 串行)
 # 压力测试（需较长时间）
 ./test_16core_512x512.sh
 
-# 自定义矩阵大小
-./run_16core_large_matrix.sh 384  # 384×384
+# 传递额外参数给底层 pipeline
+./test_16core_256x256.sh --dry-run  # 只生成配置，不运行 SST
 ```
 
-## 性能特点
+## 设计风格
+
+**统一使用 `run_noc_dma_softmax_pipeline.sh`**
+
+所有测试脚本都遵循项目标准：
+1. 使用 `configs/*.env` 配置文件
+2. 调用底层 `run_noc_dma_softmax_pipeline.sh`
+3. 支持参数透传
+
+**与原始 GEMM 测试一致：**
+```bash
+# 原始 GEMM 测试
+cd ../mvm_noc_int_array
+./run_noc_dma_pipeline.sh --gemm-m 256 ...
+
+# Softmax 测试（相同风格）
+cd ../mvm_noc_softmax_cpu
+./test_16core_256x256.sh  # 使用预设配置
+```
+
+## 配置文件详解
+
+### configs/16core_256x256.env
+
+```bash
+# Matrix dimensions
+export GOLEM_GEMM_M=256
+export GOLEM_GEMM_N=256
+export GOLEM_GEMM_K=256
+
+# Tile sizes
+export GOLEM_GEMM_BLOCK_M=64
+export GOLEM_GEMM_BLOCK_N=64
+export GOLEM_GEMM_BLOCK_K=64
+
+# Multi-core GEMM
+export GOLEM_TOTAL_CORES=16
+export GOLEM_TOTAL_GEMM_CORES=16
+export GOLEM_TOTAL_GROUPS=4
+
+# Softmax mode (single-core by default)
+export GOLEM_SOFTMAX_MODE=single-core
+```
+
+**自定义配置：**
+```bash
+# 创建新配置
+cp configs/16core_256x256.env configs/16core_384x384.env
+# 编辑 GOLEM_GEMM_M/N/K 为 384
+vim configs/16core_384x384.env
+
+# 使用新配置
+source configs/16core_384x384.env
+./run_noc_dma_softmax_pipeline.sh --verify-softmax
+```
+
+## 性能分析
 
 ### 256×256 矩阵示例
 
@@ -56,88 +112,89 @@ Phase 2: 单核 Softmax (Core 0 串行)
 - 处理：256 行 × 256 列
 - 其他 15 cores：空闲
 
-### 性能瓶颈分析
+### 瓶颈分析
 
-对于不同矩阵大小，GEMM vs Softmax 的时间占比：
-
-| 矩阵 | GEMM Tiles | GEMM 时间* | Softmax 时间* | Softmax 占比 |
-|------|-----------|-----------|--------------|-------------|
-| 128×128 | 4 | 低 | 低 | ~20% |
-| 256×256 | 16 | 中 | 中 | ~30% |
-| 512×512 | 64 | 高 | 高 | ~40% |
-
-*相对时间，实际值取决于硬件
-
-**结论：**
-- 小矩阵（128×128）：Softmax 开销可忽略
-- 中等矩阵（256×256）：Softmax 占比合理
-- 大矩阵（512×512）：如果 Softmax 成为瓶颈，考虑切换到跨 tile 并行模式
+| 矩阵 | GEMM Tiles | GEMM 占比 | Softmax 占比 |
+|------|-----------|----------|-------------|
+| 128×128 | 4 | ~80% | ~20% |
+| 256×256 | 16 | ~70% | ~30% |
+| 512×512 | 64 | ~60% | ~40% |
 
 ## 切换到跨 Tile 并行模式
 
-如果 Softmax 成为性能瓶颈，可以切换到多核并行 Softmax：
+如果 Softmax 成为性能瓶颈：
 
 ```bash
-# 使用跨 tile 并行模式
+# 方式 1: 环境变量
 GOLEM_SOFTMAX_MODE=cross-tile ./test_16core_512x512.sh
+
+# 方式 2: 修改配置文件
+vim configs/16core_512x512.env
+# 将 GOLEM_SOFTMAX_MODE=single-core 改为 cross-tile
+./test_16core_512x512.sh
 ```
 
 **注意：** 跨 tile 模式在 SST 仿真中极慢，建议只在真实硬件上使用。
 
 ## 验证模式
 
-默认使用 `--softmax-reference probability` 模式：
+**默认：probability 模式**
 - 验证每行是合法概率分布
-- 元素 ∈ [0,1]
-- 行和 ≈ 1
+- 元素 ∈ [0,1]，行和 ≈ 1
 
-如需更严格的验证（需确保 HBM 同步）：
+**严格：a_b 模式**（需确保 HBM 同步）
+```bash
+./test_16core_256x256.sh --softmax-reference a_b
+```
+
+## 命令行参数
+
+测试脚本支持透传参数给 `run_noc_dma_softmax_pipeline.sh`：
 
 ```bash
-./run_16core_large_matrix.sh 256 --softmax-reference a_b
+./test_16core_256x256.sh --dry-run              # 只生成配置
+./test_16core_256x256.sh --verify-softmax       # 已默认启用
+./test_16core_256x256.sh --softmax-reference a_b  # 严格验证
 ```
 
-## 文件说明
-
-- `run_16core_large_matrix.sh` - 主脚本，支持自定义矩阵大小
-- `test_16core_128x128.sh` - 快速验证（4 tiles）
-- `test_16core_256x256.sh` - 标准测试（16 tiles）
-- `test_16core_512x512.sh` - 压力测试（64 tiles）
-
-## 预期输出
-
-成功运行的关键日志：
-
+完整参数列表：
+```bash
+./run_noc_dma_softmax_pipeline.sh --help
 ```
-[SOFTMAX] mode=single-core (Core 0 post-processing)
-[Core 0] [SOFTMAX] starting single-core softmax: m=256 n=256 ...
-[Core 0] [SOFTMAX] single-core softmax complete
-[VERIFY-SOFTMAX] PASS reference=probability
-```
-
-## 故障排除
-
-**问题：SST 仿真被 Killed**
-- 原因：内存不足或矩阵太大
-- 解决：减小矩阵尺寸或增加系统内存
-
-**问题：Softmax 验证失败**
-- 检查：HBM init 文件是否同步
-- 尝试：使用 `--softmax-reference probability` 模式
-
-**问题：编译失败**
-- 运行：`make clean && make`
-- 检查：RISC-V 工具链是否可用
 
 ## 技术细节
 
 ### 单核 Softmax 限制
 
 - 最大 N：256 列（受 GM 缓冲大小限制）
-- 如需更大 N，需修改 `golem_softmax_single_core.cpp` 中的缓冲区大小
+- 如需更大 N，需修改 `golem_softmax_single_core.cpp` 缓冲区大小
 
 ### 内存布局
 
 - GEMM 输出：HBM 列优先（column-major）
 - Softmax 聚合：按行读取（跨 N-tiles）
 - Softmax 输出：HBM 列优先（覆盖原 GEMM 输出）
+
+## 故障排除
+
+**问题：找不到配置文件**
+```bash
+ls configs/  # 检查配置文件是否存在
+```
+
+**问题：SST 仿真被 Killed**
+- 减小矩阵尺寸
+- 增加系统内存
+
+**问题：编译失败**
+```bash
+make clean && make
+```
+
+## 项目一致性
+
+所有脚本遵循项目标准风格：
+- ✅ 使用 `configs/*.env` 配置文件
+- ✅ 调用统一的 `run_noc_dma_softmax_pipeline.sh`
+- ✅ 支持参数透传
+- ✅ 与原始 GEMM 测试风格一致

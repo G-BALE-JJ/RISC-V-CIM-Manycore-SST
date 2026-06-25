@@ -7,9 +7,7 @@
 #include <string>
 #include <vector>
 
-#if defined(__riscv)
 #include "operators.h"
-#endif
 
 namespace {
 
@@ -240,7 +238,6 @@ extern "C" golem_status_t golemRunSoftmaxCpuGmForCore(
         return status;
     }
 
-#if defined(__riscv)
     if (op_desc->dim > SOFTMAX_RISCV_MAX_DIM) {
         set_softmax_last_error("RISC-V softmax v1 supports dim <= %lld, got %lld",
                                static_cast<long long>(SOFTMAX_RISCV_MAX_DIM),
@@ -287,19 +284,6 @@ extern "C" golem_status_t golemRunSoftmaxCpuGmForCore(
         mm2gm(row_out, local_tmp_gm);
         remote_store(local_tmp_gm, row_output_gm);
     }
-#else
-    const size_t input_elems = static_cast<size_t>(op_desc->outer * input_stride);
-    const size_t output_elems = static_cast<size_t>(op_desc->outer * output_stride);
-    std::vector<float> input(input_elems, 0.0f);
-    std::vector<float> output(output_elems, 0.0f);
-    const uint64_t input_bytes = static_cast<uint64_t>(input_elems * sizeof(float));
-    const uint64_t output_bytes = static_cast<uint64_t>(output_elems * sizeof(float));
-    const float* input_ptr = reinterpret_cast<const float*>(input_gm_addr);
-    float* output_ptr = reinterpret_cast<float*>(output_gm_addr);
-    std::memcpy(input.data(), input_ptr, static_cast<size_t>(input_bytes));
-    run_softmax_fp32_buffer(op_desc, input.data(), output.data(), input_stride, output_stride);
-    std::memcpy(output_ptr, output.data(), static_cast<size_t>(output_bytes));
-#endif
 
     return GOLEM_STATUS_OK;
 }

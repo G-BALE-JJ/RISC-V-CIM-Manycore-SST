@@ -189,6 +189,45 @@ static golem_status_t normalize_and_writeback(
     return GOLEM_STATUS_OK;
 }
 
+// Initialize reduction buffer in HBM (call once from core 0 before softmax)
+golem_status_t golemInitCrossTileReductionBuffer(
+    const CrossTileSoftmaxContext* ctx,
+    int core_id,
+    int64_t total_rows) {
+    if (ctx == nullptr) {
+        return GOLEM_STATUS_INVALID_ARGUMENT;
+    }
+
+    // Initialize reduction buffer: for each row, set max=-inf, sum=0, barrier=0
+    const uint64_t local_tmp_gm = gm_addr(core_id, LOCAL_LAYOUT.accum);
+
+    // Initialize per-row reduction entries
+    for (int64_t row = 0; row < total_rows; ++row) {
+        const uint64_t reduction_row_base = ctx->reduction_buffer_hbm_base +
+                                            row * REDUCTION_ENTRY_BYTES;
+
+        // Write max = -infinity
+        float neg_inf = -INFINITY;
+        set_len(4);
+        mm2gm(&neg_inf, local_tmp_gm);
+        remote_store(local_tmp_gm, reduction_row_base + REDUCTION_MAX_OFFSET);
+
+        // Write sum = 0.0
+        float zero_sum = 0.0f;
+        set_len(4);
+        mm2gm(&zero_sum, local_tmp_gm);
+        remote_store(local_tmp_gm, reduction_row_base + REDUCTION_SUM_OFFSET);
+
+        // Write barrier counter = 0
+        int32_t zero_counter = 0;
+        set_len(4);
+        mm2gm(&zero_counter, local_tmp_gm);
+        remote_store(local_tmp_gm, reduction_row_base + REDUCTION_BARRIER_OFFSET);
+    }
+
+    return GOLEM_STATUS_OK;
+}
+
 // Run cross-tile softmax for one core's assigned tiles (All Three Passes)
 golem_status_t golemRunCrossTileSoftmaxForCore(
     const golem_softmax_op_desc_t* op_desc,

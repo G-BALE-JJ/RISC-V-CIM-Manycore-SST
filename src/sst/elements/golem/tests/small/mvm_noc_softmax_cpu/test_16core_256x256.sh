@@ -1,12 +1,30 @@
-#!/bin/bash
-# Standard test: 16-core 256x256 matrix (16 tiles, typical)
+#!/usr/bin/env bash
+# Standard test: 16-core 256x256 matrix GEMM + single-core softmax
+
+set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+CONFIG="$SCRIPT_DIR/configs/16core_256x256.env"
 
-echo "Standard Test: 16-core 256x256 matrix"
-echo "GEMM tiles: 16 (4x4 tiles)"
-echo "Each core processes: 1 tile on average"
+echo "=========================================="
+echo "16-Core 256x256 Test (Standard)"
+echo "=========================================="
+echo "Config: configs/16core_256x256.env"
+echo "GEMM: 16 cores parallel (16 tiles)"
+echo "Softmax: Core 0 single-core post-processing"
 echo ""
 
-./run_16core_large_matrix.sh 256
+# Load configuration
+if [[ ! -f "$CONFIG" ]]; then
+    echo "Error: Config file not found: $CONFIG"
+    exit 1
+fi
+
+# Source config to set environment variables
+source "$CONFIG"
+
+# Run pipeline with verification
+"$SCRIPT_DIR/run_noc_dma_softmax_pipeline.sh" \
+    --verify-softmax \
+    --softmax-reference probability \
+    "$@"

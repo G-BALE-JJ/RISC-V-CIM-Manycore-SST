@@ -27,6 +27,12 @@ golem_status_t golemInitCrossTileSoftmaxContext(
     int64_t block_m, int64_t block_n,
     uint64_t reduction_buffer_base);
 
+// Initialize reduction buffer in HBM (call once from core 0 before softmax)
+golem_status_t golemInitCrossTileReductionBuffer(
+    const CrossTileSoftmaxContext* ctx,
+    int core_id,
+    int64_t total_rows);
+
 // Run cross-tile softmax for one core's assigned tiles
 golem_status_t golemRunCrossTileSoftmaxForCore(
     const golem_softmax_op_desc_t* op_desc,
