@@ -159,6 +159,36 @@ static golem_status_t atomic_sum_reduction(
     return GOLEM_STATUS_OK;
 }
 
+// Normalize exp values by global sum and writeback to HBM in column-major layout
+static golem_status_t normalize_and_writeback(
+    int core_id,
+    const float* exp_tile,
+    int64_t block_m,
+    int64_t block_n,
+    float global_sum,
+    uint64_t output_tile_hbm_addr,
+    int64_t tile_stride,
+    uint64_t local_tmp_gm) {
+    float row_out[64];  // Assume block_n <= 64
+
+    for (int64_t r = 0; r < block_m; ++r) {
+        // Normalize row
+        for (int64_t c = 0; c < block_n; ++c) {
+            row_out[c] = exp_tile[r * block_n + c] / global_sum;
+        }
+
+        // Write row back to HBM (column-major layout)
+        const uint64_t row_bytes = static_cast<uint64_t>(block_n * sizeof(float));
+        set_len(row_bytes);
+        mm2gm(row_out, local_tmp_gm);
+
+        const uint64_t row_output_hbm = output_tile_hbm_addr + r * tile_stride * sizeof(float);
+        remote_store(local_tmp_gm, row_output_hbm);
+    }
+
+    return GOLEM_STATUS_OK;
+}
+
 // Run cross-tile softmax for one core's assigned tiles (Pass 1: Max Reduction)
 golem_status_t golemRunCrossTileSoftmaxForCore(
     const golem_softmax_op_desc_t* op_desc,
