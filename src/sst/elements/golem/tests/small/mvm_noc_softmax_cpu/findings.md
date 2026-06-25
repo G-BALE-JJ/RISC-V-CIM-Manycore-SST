@@ -164,3 +164,12 @@
   - 多核支持：每个 core 处理自己分配的 (m_tile, n_tile) tiles，通过 HBM reduction buffer 协调
   - 当 N = block_n（单 tile）时，退化为 tile-local，无跨核通信开销
   - **已知限制**：原子操作使用 load-modify-store 模式（非硬件原子），存在低概率竞态。待硬件原子指令支持后可升级为 `cim_atomic_max` / `cim_atomic_add`
+  - **集成测试发现的 bug 和修复**（Task 10）：
+    - Bug 1: Reduction buffer 地址 0x8000000 与 HBM C 输出冲突 → 修复：移至 0x8100000
+    - Bug 2: Reduction buffer 未初始化（max/sum/barrier 为随机值）→ 修复：添加 `golemInitCrossTileReductionBuffer()` 初始化为 max=-∞, sum=0, barrier=0
+    - Bug 3: Context 初始化传参错误（传 m_tiles/n_tiles 而非 m/n）→ 修复：test harness 传入正确维度
+  - **SST 仿真性能问题**：
+    - 跨 tile 场景（N=128, block_n=64）的 SST 仿真极慢，1-core 测试 15+ 分钟未完成（正常应 <2 分钟）
+    - 根因：barrier 的 adaptive wait + 原子操作导致大量仿真周期（每次 HBM 访问触发 DMA 仿真）
+    - 建议：在真实硬件或 FPGA 原型上验证，SST 仿真不适合测试细粒度同步原语
+    - 单 tile 场景（N=block_n）无跨 tile 通信，仿真性能正常
