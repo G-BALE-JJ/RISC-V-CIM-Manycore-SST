@@ -69,6 +69,88 @@ static golem_status_t atomic_max_reduction(
     return GOLEM_STATUS_OK;
 }
 
+// Barrier synchronization: wait for all tiles to complete max reduction
+static golem_status_t barrier_wait(
+    int core_id,
+    uint64_t reduction_row_base_hbm,
+    int expected_count,
+    uint64_t local_tmp_gm) {
+    // Atomic increment barrier counter
+    const uint64_t barrier_addr = reduction_row_base_hbm + REDUCTION_BARRIER_OFFSET;
+
+    // Read current counter
+    dma_remote_load_to_gm(core_id, barrier_addr, local_tmp_gm, 4);
+    int32_t counter;
+    set_len(4);
+    gm2mm(&counter, local_tmp_gm);
+
+    // Increment
+    counter++;
+    set_len(4);
+    mm2gm(&counter, local_tmp_gm);
+    remote_store(local_tmp_gm, barrier_addr);
+
+    // Spin until all tiles arrive
+    while (true) {
+        dma_remote_load_to_gm(core_id, barrier_addr, local_tmp_gm, 4);
+        set_len(4);
+        gm2mm(&counter, local_tmp_gm);
+        if (counter >= expected_count) {
+            break;
+        }
+    }
+
+    return GOLEM_STATUS_OK;
+}
+
+// Compute exp(x - max) and sum for each row in the tile
+static golem_status_t exp_sum_reduction(
+    int core_id,
+    const float* tile_data,
+    int64_t block_m,
+    int64_t block_n,
+    float global_max,
+    float* row_sum_out,
+    float* exp_tile_out) {
+    // For each row, compute exp(x - max) and accumulate sum
+    for (int64_t r = 0; r < block_m; ++r) {
+        float row_sum = 0.0f;
+        for (int64_t c = 0; c < block_n; ++c) {
+            const int64_t idx = r * block_n + c;
+            const float exp_val = std::exp(tile_data[idx] - global_max);
+            exp_tile_out[idx] = exp_val;
+            row_sum += exp_val;
+        }
+        row_sum_out[r] = row_sum;
+    }
+    return GOLEM_STATUS_OK;
+}
+
+// Atomic sum reduction: load current sum from HBM, add local sum, and store
+// NOTE: This is not truly atomic - race condition exists between load and store.
+// TODO: Use hardware atomic operations when available (e.g., cim_atomic_add)
+static golem_status_t atomic_sum_reduction(
+    int core_id,
+    uint64_t reduction_row_base_hbm,
+    float local_sum,
+    uint64_t local_tmp_gm) {
+    // Load current sum from HBM
+    const uint64_t sum_addr = reduction_row_base_hbm + REDUCTION_SUM_OFFSET;
+    dma_remote_load_to_gm(core_id, sum_addr, local_tmp_gm, 4);
+
+    float current_sum;
+    set_len(4);
+    gm2mm(&current_sum, local_tmp_gm);
+
+    // Atomic add
+    float new_sum = current_sum + local_sum;
+    set_len(4);
+    mm2gm(&new_sum, local_tmp_gm);
+    remote_store(local_tmp_gm, sum_addr);
+
+    return GOLEM_STATUS_OK;
+}
+
 // Run cross-tile softmax for one core's assigned tiles (Pass 1: Max Reduction)
 golem_status_t golemRunCrossTileSoftmaxForCore(
     const golem_softmax_op_desc_t* op_desc,
@@ -122,8 +204,13 @@ golem_status_t golemRunCrossTileSoftmaxForCore(
         atomic_max_reduction(core_id, reduction_row_base, row_max[r], local_tmp_gm);
     }
 
-    // TODO: Add barrier synchronization here (Task 3)
-    // barrier_wait(core_id, ctx->reduction_buffer_hbm_base, ctx->n_tiles_per_row);
+    // Barrier: wait for all tiles to finish max reduction
+    for (int64_t r = 0; r < block_m; ++r) {
+        const int64_t global_row = m_tile * block_m + r;
+        const uint64_t reduction_row_base = ctx->reduction_buffer_hbm_base +
+                                           global_row * REDUCTION_ENTRY_BYTES;
+        barrier_wait(core_id, reduction_row_base, ctx->n_tiles_per_row, local_tmp_gm);
+    }
 
     return GOLEM_STATUS_OK;
 }
