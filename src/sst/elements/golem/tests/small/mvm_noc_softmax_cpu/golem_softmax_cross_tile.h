@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include "../golem_operator_api.h"
+#include "golem_softmax_runtime.h"
 
 // Reduction buffer layout per row in HBM:
 // [max_val (fp32)] [sum_val (fp32)] [barrier_counter (int32)] [pad (int32)]
