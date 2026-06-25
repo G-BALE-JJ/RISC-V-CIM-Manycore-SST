@@ -21,7 +21,7 @@ from golem_dtype import (  # noqa: E402
 )
 
 
-def load_matrix(path: str, rows: int, cols: int, name: str, dtype: str):
+def load_matrix(path: str, rows: int, cols: int, name: str, dtype: str, layout: str = "row-major"):
     if path.endswith(".csv"):
         vals = []
         with open(path, "r", encoding="utf-8") as f:
@@ -58,7 +58,13 @@ def load_matrix(path: str, rows: int, cols: int, name: str, dtype: str):
         raise ValueError(
             f"{name} element count mismatch, expected {rows * cols}, got {len(vals)}"
         )
-    return [vals[r * cols : (r + 1) * cols] for r in range(rows)]
+
+    if layout == "column-major":
+        # Column-major: vals[col * rows + row] -> matrix[row][col]
+        return [[vals[c * rows + r] for c in range(cols)] for r in range(rows)]
+    else:
+        # Row-major: vals[row * cols + col] -> matrix[row][col]
+        return [vals[r * cols : (r + 1) * cols] for r in range(rows)]
 
 
 def matmul(a, b, m: int, n: int, k: int, bias_enable: int, bias_value: float):
@@ -81,7 +87,21 @@ def softmax_row(row):
     return [v / denom for v in exps]
 
 
+def full_rowwise_softmax(logits, m: int, n: int):
+    """Compute full row-wise softmax across entire N dimension."""
+    ref = [[0.0 for _ in range(n)] for _ in range(m)]
+    for r in range(m):
+        row = logits[r]
+        max_v = max(row)
+        exps = [math.exp(float(v) - max_v) for v in row]
+        denom = sum(exps)
+        for c in range(n):
+            ref[r][c] = exps[c] / denom
+    return ref
+
+
 def tile_local_softmax(logits, m: int, n: int, block_m: int, block_n: int):
+    """Deprecated: Use full_rowwise_softmax instead. Computes tile-local softmax (kept for compatibility)."""
     if m % block_m != 0 or n % block_n != 0:
         raise ValueError(
             f"M/N must be divisible by block_m/block_n, got m={m}, n={n}, block_m={block_m}, block_n={block_n}"
@@ -145,6 +165,12 @@ def main(argv=None):
     parser.add_argument("--block-n", type=int, default=None)
     parser.add_argument("--dtype", default=os.getenv("GOLEM_MATMUL_DTYPE", "fp32"))
     parser.add_argument(
+        "--layout",
+        choices=["row-major", "column-major"],
+        default="row-major",
+        help="Memory layout for C matrix: row-major (default) or column-major (GEMM GM fast path)",
+    )
+    parser.add_argument(
         "--reference",
         choices=["a_b", "probability"],
         default="a_b",
@@ -171,7 +197,7 @@ def main(argv=None):
     if block_m <= 0 or block_n <= 0:
         raise ValueError(f"block shape must be positive, got ({block_m},{block_n})")
 
-    c = load_matrix(args.c_file, args.m, args.n, "C", dtype)
+    c = load_matrix(args.c_file, args.m, args.n, "C", dtype, layout=args.layout)
 
     atol, rtol = default_tolerance(dtype)
     if args.atol is not None:
@@ -197,7 +223,7 @@ def main(argv=None):
     a = load_matrix(args.a_file, args.m, args.k, "A", dtype)
     b = load_matrix(args.b_file, args.k, args.n, "B", dtype)
     logits = matmul(a, b, args.m, args.n, args.k, args.bias_enable, args.bias_value)
-    ref = tile_local_softmax(logits, args.m, args.n, block_m, block_n)
+    ref = full_rowwise_softmax(logits, args.m, args.n)
 
     mismatches = 0
     max_abs = 0.0
