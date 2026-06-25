@@ -173,3 +173,23 @@
     - 根因：barrier 的 adaptive wait + 原子操作导致大量仿真周期（每次 HBM 访问触发 DMA 仿真）
     - 建议：在真实硬件或 FPGA 原型上验证，SST 仿真不适合测试细粒度同步原语
     - 单 tile 场景（N=block_n）无跨 tile 通信，仿真性能正常
+- **单核后处理 softmax 实现**（轻量级方案）：
+  - 实现文件：`golem_softmax_single_core.h/cpp`
+  - 机制：多核完成 GEMM 后，**只有 Core 0** 聚合完整行并计算 softmax
+  - 优点：
+    - 无同步开销（无 barrier、无原子操作）
+    - 实现简单（~120 行代码）
+    - SST 仿真快（无细粒度同步）
+    - 语义正确（完整 row-wise softmax）
+  - 缺点：
+    - Softmax 阶段串行（但 GEMM 阶段仍并行）
+    - 对大矩阵可能成为瓶颈
+    - 每行需要多次 DMA（N_tiles 次读 + N_tiles 次写）
+  - 适用场景：小矩阵（M×N < 64K 元素）或 Softmax 非性能瓶颈
+  - 限制：最大支持 N=256（受本地 GM 缓冲大小限制）
+- **Softmax 模式选择**（运行时切换）：
+  - 通过环境变量 `GOLEM_SOFTMAX_MODE` 选择：
+    - `single-core`（默认）：单核后处理，SST 仿真友好
+    - `cross-tile`：跨 tile 并行，真实硬件高性能
+  - 示例：`GOLEM_SOFTMAX_MODE=cross-tile ./run_noc_dma_softmax_pipeline.sh ...`
+  - 两种实现共存，用户根据场景选择
