@@ -178,11 +178,11 @@ while [[ "$i" -lt "${#args[@]}" ]]; do
 		--dma-overlap)
 			GOLEM_DMA_OVERLAP="${args[$((i + 1))]}"; PIPELINE_ARGS+=("${args[$i]}" "${args[$((i + 1))]}"); i=$((i + 2)) ;;
 		--ctrl-overlap-ab)
-			GOLEM_CTRL_OVERLAP_AB="${args[$((i + 1))]}"; i=$((i + 2)) ;;
+			GOLEM_CTRL_OVERLAP_AB="${args[$((i + 1))]}"; PIPELINE_ARGS+=("${args[$i]}" "${args[$((i + 1))]}"); i=$((i + 2)) ;;
 		--group-manager-enable)
-			GOLEM_GROUP_MANAGER_ENABLE="${args[$((i + 1))]}"; i=$((i + 2)) ;;
+			GOLEM_GROUP_MANAGER_ENABLE="${args[$((i + 1))]}"; PIPELINE_ARGS+=("${args[$i]}" "${args[$((i + 1))]}"); i=$((i + 2)) ;;
 		--ctrl-link-enable)
-			GOLEM_CTRL_LINK_ENABLE="${args[$((i + 1))]}"; i=$((i + 2)) ;;
+			GOLEM_CTRL_LINK_ENABLE="${args[$((i + 1))]}"; PIPELINE_ARGS+=("${args[$i]}" "${args[$((i + 1))]}"); i=$((i + 2)) ;;
 		--verify-softmax)
 			GOLEM_VERIFY_SOFTMAX=1; i=$((i + 1)) ;;
 		--softmax-c-file)
