@@ -189,7 +189,7 @@ static golem_status_t normalize_and_writeback(
     return GOLEM_STATUS_OK;
 }
 
-// Run cross-tile softmax for one core's assigned tiles (Pass 1: Max Reduction)
+// Run cross-tile softmax for one core's assigned tiles (All Three Passes)
 golem_status_t golemRunCrossTileSoftmaxForCore(
     const golem_softmax_op_desc_t* op_desc,
     const CrossTileSoftmaxContext* ctx,
@@ -212,9 +212,10 @@ golem_status_t golemRunCrossTileSoftmaxForCore(
     int64_t block_m = op_desc->outer;  // rows per tile
     int64_t block_n = op_desc->dim;    // cols per tile (typically)
 
-    // Allocate temporary buffers in GM
+    // Allocate temporary buffers in GM (non-overlapping)
     const uint64_t local_tmp_gm = gm_addr(core_id, LOCAL_LAYOUT.accum);
     const uint64_t tile_data_gm = gm_addr(core_id, LOCAL_LAYOUT.accum + 256);
+    const uint64_t exp_tile_gm = gm_addr(core_id, LOCAL_LAYOUT.accum + 256 + 4096 * 4);
 
     // Load tile data from HBM to GM
     uint64_t tile_bytes = block_m * block_n * sizeof(float);
@@ -225,6 +226,7 @@ golem_status_t golemRunCrossTileSoftmaxForCore(
     set_len(tile_bytes);
     gm2mm(tile_data, tile_data_gm);
 
+    // ===== PASS 1: Max Reduction =====
     // Compute local max for each row in the tile
     float row_max[64];      // Max block_m rows
     compute_tile_local_max(core_id, tile_data, block_m, block_n, row_max);
@@ -248,6 +250,75 @@ golem_status_t golemRunCrossTileSoftmaxForCore(
         const uint64_t reduction_row_base = ctx->reduction_buffer_hbm_base +
                                            global_row * REDUCTION_ENTRY_BYTES;
         barrier_wait(core_id, reduction_row_base, ctx->n_tiles_per_row, local_tmp_gm);
+    }
+
+    // ===== PASS 2: Exp and Sum Reduction =====
+    float exp_tile[4096];  // Temporary buffer for exp values
+    float row_sum[64];     // Sum for each row
+
+    for (int64_t r = 0; r < block_m; ++r) {
+        const int64_t global_row = m_tile * block_m + r;
+        const uint64_t reduction_row_base = ctx->reduction_buffer_hbm_base +
+                                           global_row * REDUCTION_ENTRY_BYTES;
+
+        // Load global max from HBM
+        const uint64_t max_addr = reduction_row_base + REDUCTION_MAX_OFFSET;
+        dma_remote_load_to_gm(core_id, max_addr, local_tmp_gm, 4);
+
+        float global_max;
+        set_len(4);
+        gm2mm(&global_max, local_tmp_gm);
+
+        // Compute exp(x - max) and sum for this row
+        float local_sum = 0.0f;
+        for (int64_t c = 0; c < block_n; ++c) {
+            const int64_t idx = r * block_n + c;
+            const float exp_val = std::exp(tile_data[idx] - global_max);
+            exp_tile[idx] = exp_val;
+            local_sum += exp_val;
+        }
+        row_sum[r] = local_sum;
+
+        // Atomic sum reduction
+        atomic_sum_reduction(core_id, reduction_row_base, local_sum, local_tmp_gm);
+    }
+
+    // Barrier: wait for all tiles to finish sum reduction (counter × 2)
+    for (int64_t r = 0; r < block_m; ++r) {
+        const int64_t global_row = m_tile * block_m + r;
+        const uint64_t reduction_row_base = ctx->reduction_buffer_hbm_base +
+                                           global_row * REDUCTION_ENTRY_BYTES;
+        barrier_wait(core_id, reduction_row_base, ctx->n_tiles_per_row * 2, local_tmp_gm);
+    }
+
+    // ===== PASS 3: Normalize and Writeback =====
+    for (int64_t r = 0; r < block_m; ++r) {
+        const int64_t global_row = m_tile * block_m + r;
+        const uint64_t reduction_row_base = ctx->reduction_buffer_hbm_base +
+                                           global_row * REDUCTION_ENTRY_BYTES;
+
+        // Load global sum from HBM
+        const uint64_t sum_addr = reduction_row_base + REDUCTION_SUM_OFFSET;
+        dma_remote_load_to_gm(core_id, sum_addr, local_tmp_gm, 4);
+
+        float global_sum;
+        set_len(4);
+        gm2mm(&global_sum, local_tmp_gm);
+
+        // Normalize and writeback row to HBM
+        float row_out[64];
+        for (int64_t c = 0; c < block_n; ++c) {
+            const int64_t idx = r * block_n + c;
+            row_out[c] = exp_tile[idx] / global_sum;
+        }
+
+        // Write row back to HBM (column-major layout)
+        const uint64_t row_bytes = static_cast<uint64_t>(block_n * sizeof(float));
+        set_len(row_bytes);
+        mm2gm(row_out, local_tmp_gm);
+
+        const uint64_t row_output_hbm = c_tile_hbm_addr + r * tile_stride * sizeof(float);
+        remote_store(local_tmp_gm, row_output_hbm);
     }
 
     return GOLEM_STATUS_OK;
