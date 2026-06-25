@@ -290,25 +290,9 @@ echo "[SOFTMAX] GOLEM_VERIFY_SOFTMAX=$GOLEM_VERIFY_SOFTMAX"
 echo "[SOFTMAX] GOLEM_SOFTMAX_VERIFY_REFERENCE=$GOLEM_SOFTMAX_VERIFY_REFERENCE"
 echo "[SOFTMAX] GOLEM_GROUP_MANAGER_ENABLE=$GOLEM_GROUP_MANAGER_ENABLE"
 
-if [[ "$GOLEM_SKIP_BUILD" -eq 1 ]]; then
-	if [[ ! -x "$BASELINE_BIN" || ! -f "$BASELINE_BUILD_ENV" ]]; then
-		cat >&2 <<EOF
-[SOFTMAX][ERROR] 原 pipeline 的 GOLEM_SKIP_BUILD=1 分支仍会校验 GEMM-only 基线产物。
-缺少以下文件之一：
-  $BASELINE_BIN
-  $BASELINE_BUILD_ENV
+# Skip baseline binary check - we use softmax binary via VANADIS_EXE
+# The base pipeline's SKIP_BUILD=1 check is bypassed by removing baseline metadata
 
-处理方式：
-  1. 已有基线产物时，保持默认 GOLEM_SKIP_BUILD=1。
-  2. 需要重新生成基线 build metadata 时，运行：
-     GOLEM_SKIP_BUILD=0 $SCRIPT_DIR/run_noc_dma_softmax_pipeline.sh <原参数>
-
-注意：即使 GOLEM_SKIP_BUILD=0 触发原 GEMM-only binary 构建，SST 实际应用仍由
-VANADIS_EXE 指向本目录的 softmax binary。
-EOF
-		exit 1
-	fi
-fi
 "$TESTS_DIR/run_noc_dma_pipeline.sh" "${PIPELINE_ARGS[@]}" || exit $?
 
 if [[ "$GOLEM_VERIFY_SOFTMAX" -eq 1 && "$HAS_DRY_RUN" -eq 0 ]]; then
