@@ -145,3 +145,22 @@
     已通过的 RISC-V softmax binary 和 GM/HBM 调用路径。
 - `SoftmaxOpDesc::allow_golem` 当前固定用于表达策略意图：v1 为 CPU fallback，不新增
   RoCC/CIM softmax 加速。runtime helper 不使用该字段，后续接入调度层时可读取它。
+- **GEMM C 输出 HBM 布局为列优先（column-major）**：
+  - 根因：`accum_col_addr(desc, rt, n_col)` 按列分段分配地址，每列占用 `block_m * 4` 字节连续空间。
+  - `store_c_tile_from_gm` 将整个 `local_accum` buffer 直接 `remote_store` 到 HBM，保持列优先布局。
+  - 逻辑位置 `C[row, col]` 的 HBM 字节偏移：`(col * block_m + row) * 4`。
+  - **关键发现**：`unpack_c_from_hbm.py` 已处理列优先到行优先的转换（208-212行），输出文件是行优先。
+  - 因此 checker 的 `--layout` 参数应保持 `row-major`（默认值）。
+  - 此修复只在 `mvm_noc_softmax_cpu` 目录内，未修改 GEMM 测试组件。
+- **Softmax checker 验证模式**：
+  - `--reference probability`：验证 C 输出每行为有限概率分布，元素∈[0,1]，行和≈1。**已验证通过**。
+  - `--reference a_b`：严格验证 `C = tile-local softmax(A@B)`。要求 `data/a.bin` 和 `data/b.bin` 与 HBM init 完全同步。
+  - **当前限制**：若 HBM init 文件（`hbm_init_node*.bin`）未完全刷新，`a_b` 模式会失配。例如 node2 未刷新时，GEMM 用旧 B 矩阵但 checker 用新 `data/b.bin`。
+  - **推荐用法**：默认使用 `probability` 模式做端到端验证；`a_b` 模式用于诊断 GEMM layout/golden 问题时，需确保运行前清理旧 HBM artifacts。
+- **跨 tile 完整 row-wise softmax 实现**：
+  - 三遍算法：(1) max reduction, (2) exp + sum reduction, (3) normalize
+  - 每行在 HBM 中分配 16-byte reduction entry：[max (fp32)] [sum (fp32)] [barrier_counter (int32)] [pad]
+  - Barrier 机制：每个 core 在完成当前遍后原子递增 counter，采用 **adaptive wait with exponential backoff**（8→16→32→...→2048 cycles，遵循 GEMM 的 `adaptive_wait_eq` 模式）避免互连带宽浪费
+  - 多核支持：每个 core 处理自己分配的 (m_tile, n_tile) tiles，通过 HBM reduction buffer 协调
+  - 当 N = block_n（单 tile）时，退化为 tile-local，无跨核通信开销
+  - **已知限制**：原子操作使用 load-modify-store 模式（非硬件原子），存在低概率竞态。待硬件原子指令支持后可升级为 `cim_atomic_max` / `cim_atomic_add`
