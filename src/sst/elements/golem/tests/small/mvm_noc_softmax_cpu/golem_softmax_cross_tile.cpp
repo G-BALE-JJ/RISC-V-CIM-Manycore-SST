@@ -69,7 +69,9 @@ static golem_status_t atomic_max_reduction(
     return GOLEM_STATUS_OK;
 }
 
-// Barrier synchronization: wait for all tiles to complete max reduction
+// Barrier synchronization with adaptive wait (follows GEMM's adaptive_wait_eq pattern)
+// Uses exponential backoff (8→16→32→...→2048 cycles) to reduce interconnect contention
+// NOTE: Counter increment is not hardware-atomic; race condition exists but is low-probability
 static golem_status_t barrier_wait(
     int core_id,
     uint64_t reduction_row_base_hbm,
@@ -90,13 +92,19 @@ static golem_status_t barrier_wait(
     mm2gm(&counter, local_tmp_gm);
     remote_store(local_tmp_gm, barrier_addr);
 
-    // Spin until all tiles arrive
+    // Adaptive wait with exponential backoff (same pattern as GEMM's adaptive_wait_eq)
+    uint32_t backoff = 8;
     while (true) {
         dma_remote_load_to_gm(core_id, barrier_addr, local_tmp_gm, 4);
         set_len(4);
         gm2mm(&counter, local_tmp_gm);
         if (counter >= expected_count) {
             break;
+        }
+        // Exponential backoff to reduce interconnect contention
+        delay_cycles(backoff);
+        if (backoff < 2048) {
+            backoff <<= 1;
         }
     }
 
