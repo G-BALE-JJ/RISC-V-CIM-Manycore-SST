@@ -272,15 +272,8 @@ fi
 popd >/dev/null
 
 export VANADIS_EXE="$SOFTMAX_BIN"
-if [[ "$USER_SET_GOLEM_SKIP_BUILD" -eq 0 ]]; then
-	if metadata_matches "$BASELINE_BUILD_ENV" "${BUILD_KEYS[@]}" && [[ -x "$BASELINE_BIN" ]]; then
-		export GOLEM_SKIP_BUILD=1
-	else
-		export GOLEM_SKIP_BUILD=0
-	fi
-else
-	export GOLEM_SKIP_BUILD
-fi
+# Force base pipeline to skip binary building - we provide our own softmax binary
+export GOLEM_SKIP_BUILD=1
 export GOLEM_MATMUL_DTYPE="${GOLEM_MATMUL_DTYPE:-fp32}"
 export GOLEM_VERIFY_C
 export GOLEM_VERIFY_SOFTMAX
