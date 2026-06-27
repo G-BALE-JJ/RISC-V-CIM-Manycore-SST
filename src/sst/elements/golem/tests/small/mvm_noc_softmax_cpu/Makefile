@@ -22,7 +22,7 @@ all: $(OUT_DIR)/$(PROG) $(API_TEST_OBJ)
 $(OUT_DIR):
 	mkdir -p $(OUT_DIR)
 
-$(OUT_DIR)/$(PROG): test_noc_dma_softmax.cpp golem_softmax_runtime.cpp golem_softmax_runtime.h ../golem_operator_api.h | $(OUT_DIR)
+$(OUT_DIR)/$(PROG): test_noc_dma_softmax.cpp golem_softmax_runtime.cpp golem_softmax_runtime.h golem_softmax_cross_tile.cpp golem_softmax_cross_tile.h golem_softmax_single_core.cpp golem_softmax_single_core.h ../golem_operator_api.h | $(OUT_DIR)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(LDFLAGS_STATIC) -o $@ $(SRCS) $(LDLIBS)
 
 $(API_TEST_OBJ): test_softmax_operator_api_compile.cpp golem_softmax_runtime.h ../golem_operator_api.h | $(OUT_DIR)

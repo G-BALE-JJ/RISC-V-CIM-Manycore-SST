@@ -28,6 +28,10 @@ USER_SET_GOLEM_VERIFY_C=0
 if [[ -n "${GOLEM_VERIFY_C+x}" ]]; then
 	USER_SET_GOLEM_VERIFY_C=1
 fi
+USER_SET_GOLEM_DMA_READ_RETRY_TICKS=0
+if [[ -n "${GOLEM_DMA_READ_RETRY_TICKS+x}" ]]; then
+	USER_SET_GOLEM_DMA_READ_RETRY_TICKS=1
+fi
 
 if [[ "$USER_SET_GOLEM_VERIFY_C" -eq 0 ]]; then
 	export GOLEM_VERIFY_C=0
@@ -35,6 +39,10 @@ fi
 GOLEM_VERIFY_SOFTMAX="${GOLEM_VERIFY_SOFTMAX:-0}"
 GOLEM_SOFTMAX_C_FILE="${GOLEM_SOFTMAX_C_FILE:-}"
 GOLEM_SOFTMAX_VERIFY_REFERENCE="${GOLEM_SOFTMAX_VERIFY_REFERENCE:-probability}"
+USER_SET_GOLEM_SOFTMAX_FAST_PROBABILITY=0
+if [[ -n "${GOLEM_SOFTMAX_FAST_PROBABILITY+x}" ]]; then
+	USER_SET_GOLEM_SOFTMAX_FAST_PROBABILITY=1
+fi
 SOFTMAX_TENSOR_DIR="${GOLEM_TENSOR_DIR:-$SCRIPT_DIR/data}"
 SOFTMAX_TENSOR_A_FILE="${GOLEM_TENSOR_A_FILE:-$SOFTMAX_TENSOR_DIR/a.bin}"
 SOFTMAX_TENSOR_B_FILE="${GOLEM_TENSOR_B_FILE:-$SOFTMAX_TENSOR_DIR/b.bin}"
@@ -51,6 +59,62 @@ align_up_int() {
 	local value="$1"
 	local align="$2"
 	echo $(( ((value + align - 1) / align) * align ))
+}
+
+derive_memory_routers() {
+	local mesh_dim_x="$1"
+	local num_cpus="$2"
+	local num_memory_nodes="$3"
+	local memory_layout="$4"
+	local cpu_rows data_memory_node_count data_memory_row_index os_memory_row_index
+	local data_row_start os_row_start
+
+	cpu_rows=$(( (num_cpus + mesh_dim_x - 1) / mesh_dim_x ))
+	data_memory_node_count=$(( num_memory_nodes - 1 ))
+	if (( data_memory_node_count < 1 )); then
+		echo "[ERROR] GOLEM_NUM_MEMORY_NODES must include at least one OS node and one data node" >&2
+		return 1
+	fi
+	if (( data_memory_node_count > mesh_dim_x )); then
+		echo "[ERROR] data memory nodes($data_memory_node_count) cannot exceed GOLEM_MESH_DIM_X($mesh_dim_x)" >&2
+		return 1
+	fi
+
+	case "$memory_layout" in
+		top_hbm)
+			data_memory_row_index=0
+			os_memory_row_index=$(( cpu_rows + 1 ))
+			;;
+		bottom_hbm)
+			data_memory_row_index=$cpu_rows
+			os_memory_row_index=$(( cpu_rows + 1 ))
+			;;
+		*)
+			echo "[ERROR] Unsupported GOLEM_MEMORY_LAYOUT=$memory_layout" >&2
+			return 1
+			;;
+	esac
+
+	data_row_start=$(( data_memory_row_index * mesh_dim_x ))
+	os_row_start=$(( os_memory_row_index * mesh_dim_x ))
+	python3 - "$mesh_dim_x" "$data_memory_node_count" "$data_row_start" "$os_row_start" <<'PY'
+import sys
+
+mesh_dim_x = int(sys.argv[1])
+data_memory_node_count = int(sys.argv[2])
+data_row_start = int(sys.argv[3])
+os_row_start = int(sys.argv[4])
+
+if data_memory_node_count == 1:
+    columns = [0]
+else:
+    columns = [
+        int(round(i * (mesh_dim_x - 1) / (data_memory_node_count - 1)))
+        for i in range(data_memory_node_count)
+    ]
+routers = [os_row_start] + [data_row_start + col for col in columns]
+print(",".join(str(router) for router in routers))
+PY
 }
 
 metadata_get_value() {
@@ -92,6 +156,10 @@ softmax_binary_is_fresh() {
 		"$SCRIPT_DIR/test_noc_dma_softmax.cpp" \
 		"$SCRIPT_DIR/golem_softmax_runtime.cpp" \
 		"$SCRIPT_DIR/golem_softmax_runtime.h" \
+		"$SCRIPT_DIR/golem_softmax_cross_tile.cpp" \
+		"$SCRIPT_DIR/golem_softmax_cross_tile.h" \
+		"$SCRIPT_DIR/golem_softmax_single_core.cpp" \
+		"$SCRIPT_DIR/golem_softmax_single_core.h" \
 		"$SCRIPT_DIR/softmax_config.h" \
 		"$SCRIPT_DIR/Makefile" \
 		"$BASE_DIR/golem_matmul_runtime.cpp" \
@@ -114,6 +182,8 @@ GOLEM_NUM_ARRAYS="${GOLEM_NUM_ARRAYS:-1}"
 GOLEM_TOTAL_CORES="${GOLEM_TOTAL_CORES:-${VANADIS_NUM_CORES:-16}}"
 GOLEM_TOTAL_GEMM_CORES="${GOLEM_TOTAL_GEMM_CORES:-16}"
 GOLEM_NUM_MEMORY_NODES="${GOLEM_NUM_MEMORY_NODES:-5}"
+GOLEM_MEMORY_LAYOUT="${GOLEM_MEMORY_LAYOUT:-top_hbm}"
+GOLEM_MESH_DIM_X="${GOLEM_MESH_DIM_X:-4}"
 GOLEM_MEM_NODE_SIZE_BYTES="${GOLEM_MEM_NODE_SIZE_BYTES:-67108864}"
 GOLEM_GLOBAL_STRIDE_KB="${GOLEM_GLOBAL_STRIDE_KB:-64}"
 GOLEM_DMA_STAGGER_CYCLES="${GOLEM_DMA_STAGGER_CYCLES:-0}"
@@ -157,6 +227,8 @@ while [[ "$i" -lt "${#args[@]}" ]]; do
 			GOLEM_TOTAL_CORES="${args[$((i + 1))]}"; PIPELINE_ARGS+=("${args[$i]}" "${args[$((i + 1))]}"); i=$((i + 2)) ;;
 		--num-mem-nodes)
 			GOLEM_NUM_MEMORY_NODES="${args[$((i + 1))]}"; PIPELINE_ARGS+=("${args[$i]}" "${args[$((i + 1))]}"); i=$((i + 2)) ;;
+		--mesh-dim-x)
+			GOLEM_MESH_DIM_X="${args[$((i + 1))]}"; PIPELINE_ARGS+=("${args[$i]}" "${args[$((i + 1))]}"); i=$((i + 2)) ;;
 		--mem-node-size)
 			GOLEM_MEM_NODE_SIZE_BYTES="${args[$((i + 1))]}"; PIPELINE_ARGS+=("${args[$i]}" "${args[$((i + 1))]}"); i=$((i + 2)) ;;
 		--global-stride-kb)
@@ -180,9 +252,9 @@ while [[ "$i" -lt "${#args[@]}" ]]; do
 		--ctrl-overlap-ab)
 			GOLEM_CTRL_OVERLAP_AB="${args[$((i + 1))]}"; PIPELINE_ARGS+=("${args[$i]}" "${args[$((i + 1))]}"); i=$((i + 2)) ;;
 		--group-manager-enable)
-			GOLEM_GROUP_MANAGER_ENABLE="${args[$((i + 1))]}"; PIPELINE_ARGS+=("${args[$i]}" "${args[$((i + 1))]}"); i=$((i + 2)) ;;
+			GOLEM_GROUP_MANAGER_ENABLE="${args[$((i + 1))]}"; i=$((i + 2)) ;;
 		--ctrl-link-enable)
-			GOLEM_CTRL_LINK_ENABLE="${args[$((i + 1))]}"; PIPELINE_ARGS+=("${args[$i]}" "${args[$((i + 1))]}"); i=$((i + 2)) ;;
+			GOLEM_CTRL_LINK_ENABLE="${args[$((i + 1))]}"; i=$((i + 2)) ;;
 		--verify-softmax)
 			GOLEM_VERIFY_SOFTMAX=1; i=$((i + 1)) ;;
 		--softmax-c-file)
@@ -224,6 +296,23 @@ if (( GOLEM_GLOBAL_STRIDE_BYTES < required_global_stride_bytes )); then
 	GOLEM_GLOBAL_STRIDE_BYTES=$required_global_stride_bytes
 	GOLEM_GLOBAL_STRIDE_KB=$(( (GOLEM_GLOBAL_STRIDE_BYTES + 1023) / 1024 ))
 	GOLEM_GLOBAL_STRIDE_BYTES=$(( GOLEM_GLOBAL_STRIDE_KB * 1024 ))
+fi
+
+if [[ "$USER_SET_GOLEM_SOFTMAX_FAST_PROBABILITY" -eq 0 && "$GOLEM_SOFTMAX_VERIFY_REFERENCE" == "probability" ]]; then
+	GOLEM_SOFTMAX_FAST_PROBABILITY=1
+fi
+
+if [[ "$GOLEM_CTRL_LINK_ENABLE" == "0" ]]; then
+	GOLEM_ARCH_SCRIPT="small/mvm_noc_softmax_cpu/ncores_selfcom_dma_softmax_archive.py"
+	GOLEM_REQUEST_SCHEDULER_ENABLE=0
+	GOLEM_WORKER_COMMAND_PROCESSOR_ENABLE=0
+	GOLEM_MEMORY_ROUTERS=$(derive_memory_routers "$GOLEM_MESH_DIM_X" "$GOLEM_TOTAL_CORES" "$GOLEM_NUM_MEMORY_NODES" "$GOLEM_MEMORY_LAYOUT")
+	if [[ "$USER_SET_GOLEM_DMA_READ_RETRY_TICKS" -eq 0 ]]; then
+		GOLEM_DMA_READ_RETRY_TICKS=256
+	fi
+else
+	GOLEM_ARCH_SCRIPT="${GOLEM_ARCH_SCRIPT:-architecture/ncores_selfcom_dma_ctrl.py}"
+	GOLEM_REQUEST_SCHEDULER_ENABLE="${GOLEM_REQUEST_SCHEDULER_ENABLE:-1}"
 fi
 
 BUILD_KEYS=(
@@ -278,16 +367,33 @@ export GOLEM_SKIP_BUILD=0
 export GOLEM_MATMUL_DTYPE="${GOLEM_MATMUL_DTYPE:-fp32}"
 export GOLEM_VERIFY_C
 export GOLEM_VERIFY_SOFTMAX
+export GOLEM_SOFTMAX_FAST_PROBABILITY
 export GOLEM_GROUP_MANAGER_ENABLE
 export GOLEM_CTRL_LINK_ENABLE
 export GOLEM_CTRL_OVERLAP_AB
+export GOLEM_ARCH_SCRIPT
+export GOLEM_REQUEST_SCHEDULER_ENABLE
+export GOLEM_WORKER_COMMAND_PROCESSOR_ENABLE
+export GOLEM_MEMORY_LAYOUT
+export GOLEM_MESH_DIM_X
+export GOLEM_MEMORY_ROUTERS
+export GOLEM_DMA_READ_RETRY_TICKS
 
 echo "[SOFTMAX] VANADIS_EXE=$VANADIS_EXE"
 echo "[SOFTMAX] GOLEM_SKIP_BUILD=$GOLEM_SKIP_BUILD"
 echo "[SOFTMAX] GOLEM_VERIFY_C=$GOLEM_VERIFY_C"
 echo "[SOFTMAX] GOLEM_VERIFY_SOFTMAX=$GOLEM_VERIFY_SOFTMAX"
 echo "[SOFTMAX] GOLEM_SOFTMAX_VERIFY_REFERENCE=$GOLEM_SOFTMAX_VERIFY_REFERENCE"
+echo "[SOFTMAX] GOLEM_SOFTMAX_FAST_PROBABILITY=${GOLEM_SOFTMAX_FAST_PROBABILITY:-0}"
 echo "[SOFTMAX] GOLEM_GROUP_MANAGER_ENABLE=$GOLEM_GROUP_MANAGER_ENABLE"
+echo "[SOFTMAX] GOLEM_CTRL_LINK_ENABLE=$GOLEM_CTRL_LINK_ENABLE"
+echo "[SOFTMAX] GOLEM_REQUEST_SCHEDULER_ENABLE=$GOLEM_REQUEST_SCHEDULER_ENABLE"
+echo "[SOFTMAX] GOLEM_WORKER_COMMAND_PROCESSOR_ENABLE=$GOLEM_WORKER_COMMAND_PROCESSOR_ENABLE"
+echo "[SOFTMAX] GOLEM_ARCH_SCRIPT=$GOLEM_ARCH_SCRIPT"
+echo "[SOFTMAX] GOLEM_MEMORY_LAYOUT=$GOLEM_MEMORY_LAYOUT"
+echo "[SOFTMAX] GOLEM_MESH_DIM_X=$GOLEM_MESH_DIM_X"
+echo "[SOFTMAX] GOLEM_MEMORY_ROUTERS=${GOLEM_MEMORY_ROUTERS:-}"
+echo "[SOFTMAX] GOLEM_DMA_READ_RETRY_TICKS=${GOLEM_DMA_READ_RETRY_TICKS:-}"
 
 # Skip baseline binary check - we use softmax binary via VANADIS_EXE
 # The base pipeline's SKIP_BUILD=1 check is bypassed by removing baseline metadata

@@ -28,8 +28,7 @@ golem_status_t golemInitSingleCoreSoftmaxContext(
 golem_status_t golemRunSingleCoreSoftmaxForCore(
     const golem_softmax_op_desc_t* op_desc,
     const SingleCoreSoftmaxContext* ctx,
-    int core_id,
-    uint64_t c_base_hbm_addr,  // Base address of first tile (m_tile=0, n_tile=0)
-    int64_t n_tile_stride_bytes);  // Byte offset between consecutive N-tiles
+    int executor_core_id,
+    int softmax_core_id);
 
 #endif  // GOLEM_SOFTMAX_SINGLE_CORE_H_

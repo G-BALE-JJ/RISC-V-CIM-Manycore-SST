@@ -60,6 +60,13 @@ golem_matmul_op_desc_t make_matmul_desc_from_env() {
     };
 }
 
+int read_requested_core_from_argv(int argc, char* argv[]) {
+    if (argc < 2) {
+        return 0;
+    }
+    return std::atoi(argv[1]);
+}
+
 int run_gemm(const golem_matmul_op_desc_t& op_desc) {
     golem_tensor_desc_t a_desc = {
         .data = nullptr,
@@ -108,9 +115,9 @@ int run_gemm(const golem_matmul_op_desc_t& op_desc) {
     return 0;
 }
 
-int run_tile_local_softmax_for_core(int core_id, const golem_matmul_op_desc_t& op_desc) {
+int run_tile_local_softmax_for_core(int executor_core_id, int softmax_core_id, const golem_matmul_op_desc_t& op_desc) {
     if (op_desc.dtype != GOLEM_DTYPE_FP32) {
-        if (core_id == 0) {
+        if (softmax_core_id == 0) {
             std::fprintf(stderr, "[SOFTMAX] skip: softmax v1 only supports fp32\n");
         }
         return 0;
@@ -125,7 +132,7 @@ int run_tile_local_softmax_for_core(int core_id, const golem_matmul_op_desc_t& o
         .block_k = static_cast<int>(op_desc.block_k),
     };
     const int total_tasks = gemm_total_tasks(cfg);
-    const int worker_slot = gemm_worker_slot_for_core(core_id);
+    const int worker_slot = gemm_worker_slot_for_core(softmax_core_id);
     if (worker_slot < 0 || worker_slot >= total_tasks) {
         return 0;
     }
@@ -136,12 +143,12 @@ int run_tile_local_softmax_for_core(int core_id, const golem_matmul_op_desc_t& o
 
     if (use_cross_tile) {
         // Cross-tile mode: all cores participate with barriers
-        if (core_id == 0) {
+        if (softmax_core_id == 0) {
             std::printf("[SOFTMAX] mode=cross-tile (multi-core with barriers)\n");
         }
     } else {
         // Single-core mode: only Core 0 executes
-        if (core_id == 0) {
+        if (softmax_core_id == 0) {
             std::printf("[SOFTMAX] mode=single-core (Core 0 post-processing)\n");
         }
     }
@@ -165,15 +172,15 @@ int run_tile_local_softmax_for_core(int core_id, const golem_matmul_op_desc_t& o
     if (status != GOLEM_STATUS_OK) {
         std::fprintf(stderr,
                      "[Core %d] [SOFTMAX] failed to initialize cross-tile context: %s\n",
-                     core_id,
+                     softmax_core_id,
                      golemSoftmaxGetLastErrorString());
         return 1;
     }
 
     // Core 0 initializes the reduction buffer
-    if (core_id == 0) {
+    if (softmax_core_id == 0) {
         const int64_t total_rows = cfg.m;
-        status = golemInitCrossTileReductionBuffer(&ctx, core_id, total_rows);
+        status = golemInitCrossTileReductionBuffer(&ctx, executor_core_id, total_rows);
         if (status != GOLEM_STATUS_OK) {
             std::fprintf(stderr,
                          "[Core 0] [SOFTMAX] failed to initialize reduction buffer: %s\n",
@@ -188,19 +195,19 @@ int run_tile_local_softmax_for_core(int core_id, const golem_matmul_op_desc_t& o
     // For now, rely on sequential execution in single-core tests
 
     std::printf("[Core %d] [SOFTMAX] starting cross-tile loop: worker_slot=%d total_tasks=%d\n",
-                core_id, worker_slot, total_tasks);
+                softmax_core_id, worker_slot, total_tasks);
     std::fflush(stdout);
 
     int softmax_tiles = 0;
     for (int task_id = worker_slot; task_id < total_tasks; task_id += ACTIVE_GEMM_CORES) {
-        const GemmTaskDescriptor desc = gemm_task_desc_for_task(core_id, task_id, cfg);
+        const GemmTaskDescriptor desc = gemm_task_desc_for_task(executor_core_id, task_id, cfg);
 
         // Extract tile indices from task_id
         const int m_tile = task_id / n_tiles;
         const int n_tile = task_id % n_tiles;
 
         std::printf("[Core %d] [SOFTMAX] task=%d m_tile=%d n_tile=%d c_base_mm=0x%lx\n",
-                    core_id, task_id, m_tile, n_tile, desc.c_base_mm);
+                    softmax_core_id, task_id, m_tile, n_tile, desc.c_base_mm);
         std::fflush(stdout);
 
         golem_softmax_op_desc_t softmax_desc = {
@@ -214,19 +221,19 @@ int run_tile_local_softmax_for_core(int core_id, const golem_matmul_op_desc_t& o
         status = golemRunCrossTileSoftmaxForCore(
             &softmax_desc,
             &ctx,
-            core_id,
+            executor_core_id,
             m_tile,
             n_tile,
             desc.c_base_mm,
             desc.block_n);
 
-        std::printf("[Core %d] [SOFTMAX] task=%d returned status=%d\n", core_id, task_id, status);
+        std::printf("[Core %d] [SOFTMAX] task=%d returned status=%d\n", softmax_core_id, task_id, status);
         std::fflush(stdout);
 
         if (status != GOLEM_STATUS_OK) {
             std::fprintf(stderr,
                          "[Core %d] [SOFTMAX] cross-tile task=%d (m_tile=%d, n_tile=%d) failed: %s\n",
-                         core_id,
+                         softmax_core_id,
                          task_id,
                          m_tile,
                          n_tile,
@@ -236,7 +243,7 @@ int run_tile_local_softmax_for_core(int core_id, const golem_matmul_op_desc_t& o
         softmax_tiles++;
     }
 
-    std::printf("[Core %d] [SOFTMAX] cross-tile softmax complete: tiles=%d\n", core_id, softmax_tiles);
+    std::printf("[Core %d] [SOFTMAX] cross-tile softmax complete: tiles=%d\n", softmax_core_id, softmax_tiles);
     std::fflush(stdout);
     } else {
         // Single-core mode: only Core 0 aggregates and computes softmax
@@ -248,20 +255,13 @@ int run_tile_local_softmax_for_core(int core_id, const golem_matmul_op_desc_t& o
             cfg.block_m,
             cfg.block_n);
         if (status != GOLEM_STATUS_OK) {
-            if (core_id == 0) {
+            if (softmax_core_id == 0) {
                 std::fprintf(stderr,
                              "[Core 0] [SOFTMAX] failed to initialize single-core context: %s\n",
                              golemSoftmaxGetLastErrorString());
             }
             return 1;
         }
-
-        // Get first tile's HBM address (m_tile=0, n_tile=0)
-        const GemmTaskDescriptor first_desc = gemm_task_desc_for_task(core_id, 0, cfg);
-        const uint64_t c_base_hbm = first_desc.c_base_mm;
-
-        // Compute stride between N-tiles (assume column-major layout)
-        const int64_t n_tile_stride = cfg.block_m * cfg.block_n * sizeof(float);
 
         golem_softmax_op_desc_t softmax_desc = {
             .outer = cfg.m,
@@ -271,21 +271,20 @@ int run_tile_local_softmax_for_core(int core_id, const golem_matmul_op_desc_t& o
             .layout = GOLEM_LAYOUT_ROW_MAJOR,
         };
 
-        if (core_id == 0) {
-            std::printf("[Core 0] [SOFTMAX] starting single-core softmax: m=%d n=%d c_base=0x%lx stride=%ld\n",
-                        cfg.m, cfg.n, c_base_hbm, n_tile_stride);
+        if (softmax_core_id == 0) {
+            std::printf("[Core 0] [SOFTMAX] starting single-core softmax: m=%d n=%d executor_core=%d\n",
+                        cfg.m, cfg.n, executor_core_id);
             std::fflush(stdout);
         }
 
         status = golemRunSingleCoreSoftmaxForCore(
             &softmax_desc,
             &ctx,
-            core_id,
-            c_base_hbm,
-            n_tile_stride);
+            executor_core_id,
+            softmax_core_id);
 
         if (status != GOLEM_STATUS_OK) {
-            if (core_id == 0) {
+            if (softmax_core_id == 0) {
                 std::fprintf(stderr,
                              "[Core 0] [SOFTMAX] single-core softmax failed: %s\n",
                              golemSoftmaxGetLastErrorString());
@@ -293,7 +292,7 @@ int run_tile_local_softmax_for_core(int core_id, const golem_matmul_op_desc_t& o
             return 1;
         }
 
-        if (core_id == 0) {
+        if (softmax_core_id == 0) {
             std::printf("[Core 0] [SOFTMAX] single-core softmax complete\n");
             std::fflush(stdout);
         }
@@ -303,10 +302,10 @@ int run_tile_local_softmax_for_core(int core_id, const golem_matmul_op_desc_t& o
 }
 
 int run_riscv_gemm_softmax(int argc, char* argv[]) {
-    bind_and_resolve_core_from_argv_or_exit(argc, argv, TOTAL_CORES);
-    const int core_id = sched_getcpu();
-    if (core_id < 0 || core_id >= TOTAL_CORES) {
-        std::fprintf(stderr, "[ERROR] invalid runtime core id=%d, TOTAL_CORES=%d\n", core_id, TOTAL_CORES);
+    const int executor_core_id = bind_and_resolve_core_from_argv_or_exit(argc, argv, TOTAL_CORES);
+    const int softmax_core_id = read_requested_core_from_argv(argc, argv);
+    if (softmax_core_id < 0 || softmax_core_id >= TOTAL_CORES) {
+        std::fprintf(stderr, "[ERROR] invalid requested core id=%d, TOTAL_CORES=%d\n", softmax_core_id, TOTAL_CORES);
         return 1;
     }
 
@@ -315,7 +314,7 @@ int run_riscv_gemm_softmax(int argc, char* argv[]) {
     if (status != 0) {
         return status;
     }
-    return run_tile_local_softmax_for_core(core_id, op_desc);
+    return run_tile_local_softmax_for_core(executor_core_id, softmax_core_id, op_desc);
 }
 
 int run_pointer_softmax_selftest() {
