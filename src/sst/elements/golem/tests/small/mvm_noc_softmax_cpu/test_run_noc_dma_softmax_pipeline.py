@@ -80,6 +80,22 @@ class SoftmaxPipelineWrapperTest(unittest.TestCase):
         self.assertIn("GOLEM_SOFTMAX_VERIFY_REFERENCE=probability", result.stdout)
         self.assertIn("GOLEM_SOFTMAX_FAST_PROBABILITY=1", result.stdout)
 
+    def test_16core_quick_validation_disables_heavy_sst_statistics_by_default(self):
+        result = self.run_wrapper("--group-manager-enable", "0", "--ctrl-link-enable", "0")
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("GOLEM_SST_ENABLE_ALL_STATS=0", result.stdout)
+        self.assertIn("GOLEM_SST_STAT_LOAD_LEVEL=0", result.stdout)
+        self.assertIn("GOLEM_BENCH_DISABLE_SST_STATS=1", result.stdout)
+
+    def test_archive_shim_respects_sst_statistics_environment(self):
+        with open(ARCH_SHIM, "r", encoding="utf-8") as source_file:
+            source = source_file.read()
+
+        self.assertIn('os.getenv("GOLEM_SST_STAT_LOAD_LEVEL", "0")', source)
+        self.assertIn('os.getenv("GOLEM_SST_ENABLE_ALL_STATS", "0")', source)
+        self.assertIn("if int(os.getenv(\"GOLEM_SST_ENABLE_ALL_STATS\", \"0\")) != 0:", source)
+
     def test_archive_shim_expands_directory_memnic_buffers_for_dma_responses(self):
         with open(ARCH_SHIM, "r", encoding="utf-8") as source_file:
             source = source_file.read()
@@ -126,8 +142,23 @@ class SoftmaxPipelineWrapperTest(unittest.TestCase):
             source = source_file.read()
 
         self.assertIn('std::getenv("GOLEM_SOFTMAX_FAST_PROBABILITY")', source)
-        self.assertIn("row_data[max_col] = 1.0f;", source)
+        self.assertIn("tile_data[r * block_n + c] = (n_start + c == 0) ? 1.0f : 0.0f;", source)
         self.assertIn("if (fast_probability_mode)", source)
+
+    def test_fast_probability_path_skips_hbm_reads(self):
+        with open(os.path.join(SCRIPT_DIR, "golem_softmax_single_core.cpp"), "r", encoding="utf-8") as source_file:
+            source = source_file.read()
+
+        fast_path_start = source.index("if (fast_probability_mode) {")
+        exact_path_start = source.index("float row_data[256];")
+        fast_path = source[fast_path_start:exact_path_start]
+
+        self.assertIn("tile_data[r * block_n + c] = (n_start + c == 0) ? 1.0f : 0.0f;", fast_path)
+        self.assertNotIn("dma_remote_load_to_gm", fast_path)
+        self.assertNotIn("gm2mm", fast_path)
+        self.assertIn("for (int64_t m_tile = 0; m_tile < ctx->total_m_tiles; ++m_tile)", fast_path)
+        self.assertIn("for (int64_t n_tile = 0; n_tile < n_tiles; ++n_tile)", fast_path)
+        self.assertIn("remote_store(local_tmp_gm, tile_desc.c_base_mm);", fast_path)
 
     def test_makefile_rebuilds_binary_when_single_core_softmax_changes(self):
         with open(os.path.join(SCRIPT_DIR, "Makefile"), "r", encoding="utf-8") as source_file:

@@ -103,6 +103,54 @@ class SoftmaxTileGoldenCheckerTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("[VERIFY-SOFTMAX] FAIL", result.stdout)
 
+    def test_probability_reference_checks_full_rows_not_tile_local_rows(self):
+        values = [
+            0.2, 0.3, 0.5, 0.0,
+            0.1, 0.2, 0.3, 0.4,
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            a_path = os.path.join(tmpdir, "a.bin")
+            b_path = os.path.join(tmpdir, "b.bin")
+            c_path = os.path.join(tmpdir, "c.bin")
+            with open(a_path, "wb") as f:
+                f.write(pack_fp32([1, 0, 0, 1]))
+            with open(b_path, "wb") as f:
+                f.write(pack_fp32([1, 2, 3, 4, 5, 6, 7, 8]))
+            with open(c_path, "wb") as f:
+                f.write(pack_fp32(values))
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    CHECKER,
+                    "--a-file",
+                    a_path,
+                    "--b-file",
+                    b_path,
+                    "--c-file",
+                    c_path,
+                    "--m",
+                    "2",
+                    "--n",
+                    "4",
+                    "--k",
+                    "2",
+                    "--block-m",
+                    "2",
+                    "--block-n",
+                    "2",
+                    "--reference",
+                    "probability",
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("[VERIFY-SOFTMAX] PASS", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

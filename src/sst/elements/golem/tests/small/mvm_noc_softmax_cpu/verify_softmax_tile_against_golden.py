@@ -118,36 +118,33 @@ def tile_local_softmax(logits, m: int, n: int, block_m: int, block_n: int):
 
 
 def verify_probability_rows(c, m: int, n: int, block_m: int, block_n: int, atol: float, rtol: float, max_mismatches: int):
+    del block_m, block_n
     mismatches = 0
     max_abs = 0.0
     printed = 0
-    for m0 in range(0, m, block_m):
-        for n0 in range(0, n, block_n):
-            for r in range(block_m):
-                row_sum = 0.0
-                row_has_bad_value = False
-                row_idx = m0 + r
-                for cc in range(block_n):
-                    col_idx = n0 + cc
-                    value = float(c[row_idx][col_idx])
-                    if not math.isfinite(value) or value < -atol or value > 1.0 + atol:
-                        row_has_bad_value = True
-                        if printed < max_mismatches:
-                            print(
-                                f"[VERIFY-SOFTMAX] invalid probability at ({row_idx},{col_idx}): C={value:.9g}"
-                            )
-                            printed += 1
-                    row_sum += value
-                diff = row_sum - 1.0
-                abs_diff = abs(diff)
-                max_abs = max(max_abs, abs_diff)
-                if row_has_bad_value or abs_diff > (atol + rtol):
-                    mismatches += 1
-                    if printed < max_mismatches:
-                        print(
-                            f"[VERIFY-SOFTMAX] invalid probability row tile_origin=({m0},{n0}) row={row_idx}: sum={row_sum:.9g}, diff={diff:.9g}"
-                        )
-                        printed += 1
+    for row_idx in range(m):
+        row_sum = 0.0
+        row_has_bad_value = False
+        for col_idx in range(n):
+            value = float(c[row_idx][col_idx])
+            if not math.isfinite(value) or value < -atol or value > 1.0 + atol:
+                row_has_bad_value = True
+                if printed < max_mismatches:
+                    print(
+                        f"[VERIFY-SOFTMAX] invalid probability at ({row_idx},{col_idx}): C={value:.9g}"
+                    )
+                    printed += 1
+            row_sum += value
+        diff = row_sum - 1.0
+        abs_diff = abs(diff)
+        max_abs = max(max_abs, abs_diff)
+        if row_has_bad_value or abs_diff > (atol + rtol):
+            mismatches += 1
+            if printed < max_mismatches:
+                print(
+                    f"[VERIFY-SOFTMAX] invalid probability row={row_idx}: sum={row_sum:.9g}, diff={diff:.9g}"
+                )
+                printed += 1
     return mismatches, max_abs
 
 

@@ -30,6 +30,20 @@ source = source.replace(
     '            "golem_dma_response_vn": "0",',
     1,
 )
+source = source.replace(
+    "sst.setStatisticLoadLevel(16)\n"
+    'sst.enableAllStatisticsForAllComponents({"type": "sst.AccumulatorStatistic"})',
+    'sst.setStatisticLoadLevel(int(os.getenv("GOLEM_SST_STAT_LOAD_LEVEL", "0")))\n'
+    'if int(os.getenv("GOLEM_SST_ENABLE_ALL_STATS", "0")) != 0:\n'
+    '    sst.enableAllStatisticsForAllComponents({"type": "sst.AccumulatorStatistic"})',
+    1,
+)
+source = source.replace(
+    "    mem_backend.enableAllStatistics()\n",
+    '    if int(os.getenv("GOLEM_SST_ENABLE_ALL_STATS", "0")) != 0:\n'
+    "        mem_backend.enableAllStatistics()\n",
+    1,
+)
 
 globals_dict = {
     "__file__": ARCHIVE_SCRIPT,

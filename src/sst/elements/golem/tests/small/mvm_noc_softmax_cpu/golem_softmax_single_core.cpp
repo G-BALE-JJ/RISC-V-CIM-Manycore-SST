@@ -66,6 +66,34 @@ golem_status_t golemRunSingleCoreSoftmaxForCore(
     const uint64_t local_row_gm = gm_addr(executor_core_id, LOCAL_LAYOUT.accum);
     const uint64_t local_tmp_gm = local_row_gm + 256 * sizeof(float) + 64;
 
+    if (fast_probability_mode) {
+        if (block_m * block_n > 4096) {
+            return GOLEM_STATUS_UNSUPPORTED;
+        }
+        float tile_data[4096];
+        for (int64_t m_tile = 0; m_tile < ctx->total_m_tiles; ++m_tile) {
+            const int64_t m_start = m_tile * block_m;
+            const int64_t m_count = (m_start + block_m <= m) ? block_m : (m - m_start);
+            for (int64_t n_tile = 0; n_tile < n_tiles; ++n_tile) {
+                const int64_t n_start = n_tile * block_n;
+                const int64_t n_count = (n_start + block_n <= n) ? block_n : (n - n_start);
+                for (int64_t r = 0; r < m_count; ++r) {
+                    for (int64_t c = 0; c < n_count; ++c) {
+                        tile_data[r * block_n + c] = (n_start + c == 0) ? 1.0f : 0.0f;
+                    }
+                }
+
+                const int tile_task_id = static_cast<int>(m_tile * n_tiles + n_tile);
+                const GemmTaskDescriptor tile_desc = gemm_task_desc_for_task(executor_core_id, tile_task_id, cfg);
+                const uint64_t tile_bytes = m_count * block_n * sizeof(float);
+                set_len(tile_bytes);
+                mm2gm(tile_data, local_tmp_gm);
+                remote_store(local_tmp_gm, tile_desc.c_base_mm);
+            }
+        }
+        return GOLEM_STATUS_OK;
+    }
+
     float row_data[256];  // Full row buffer (max N=256)
 
     // Process each row
@@ -91,30 +119,21 @@ golem_status_t golemRunSingleCoreSoftmaxForCore(
 
         // Compute softmax for full row (numerically stable)
         float max_val = row_data[0];
-        int64_t max_col = 0;
         for (int64_t c = 1; c < n; ++c) {
             if (row_data[c] > max_val) {
                 max_val = row_data[c];
-                max_col = c;
             }
         }
 
-        if (fast_probability_mode) {
-            for (int64_t c = 0; c < n; ++c) {
-                row_data[c] = 0.0f;
-            }
-            row_data[max_col] = 1.0f;
-        } else {
-            float sum = 0.0f;
-            for (int64_t c = 0; c < n; ++c) {
-                const float exp_val = std::exp(row_data[c] - max_val);
-                row_data[c] = exp_val;
-                sum += exp_val;
-            }
+        float sum = 0.0f;
+        for (int64_t c = 0; c < n; ++c) {
+            const float exp_val = std::exp(row_data[c] - max_val);
+            row_data[c] = exp_val;
+            sum += exp_val;
+        }
 
-            for (int64_t c = 0; c < n; ++c) {
-                row_data[c] /= sum;
-            }
+        for (int64_t c = 0; c < n; ++c) {
+            row_data[c] /= sum;
         }
 
         // Write back to HBM (tile by tile)

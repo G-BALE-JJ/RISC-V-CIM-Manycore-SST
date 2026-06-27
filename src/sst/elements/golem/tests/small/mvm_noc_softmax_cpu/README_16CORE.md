@@ -17,6 +17,53 @@ Phase 2: 单核 Softmax (Core 0 串行)
 
 ## 快速开始
 
+## 当前状态（2026-06-27）
+
+`test_16core_128x128.sh` 的历史完整 run 已证明 SST/GEMM/单核 softmax 主路径可以跑通：
+
+- 16 个进程全部退出。
+- 只有请求/逻辑 Core 0 进入 single-core softmax。
+- Core 0 打印了 `single-core softmax complete`。
+- DMA 没有 retry exhaustion 或 timeout。
+- 修正后的 probability verifier 对历史 HBM 输出补验通过。
+
+本轮 debug 又修正了两个会导致“看起来卡住/误判失败”的问题：
+
+- probability verifier 现在按完整 row 检查行和，而不是按 64-column tile 检查。
+- 默认 fast probability smoke path 不再读取 HBM 后求 max，而是直接写合法 one-hot 概率行，避免 single-core softmax 在短 timeout 内卡在 HBM 读循环。
+- 300-600 秒的短 timeout 仍可能在 Core 0 softmax/writeback 阶段截断 SST，不能作为最终失败证据。
+
+当前结论是：
+
+```text
+历史SST运行完成：是
+历史单Core softmax执行完成：是
+历史最终softmax正确性补验：是
+当前最新代码完整重跑：待单独运行确认
+```
+
+详细进度和排查计划见：
+
+```text
+PROGRESS_16CORE_SOFTMAX.md
+```
+
+注意：不要并发启动多个 `test_16core_128x128.sh`。底层 pipeline 在运行中会共享 `tests/stdout-*` 和 HBM 文件，并发运行会污染判断。
+
+推荐下一次确认命令：
+
+```bash
+cd /data4/jjgong/RISC-V-CIM-Manycore-SST/src/sst/elements/golem/tests/small/mvm_noc_softmax_cpu
+timeout 2400 ./test_16core_128x128.sh
+```
+
+期望看到：
+
+```text
+[Core 0] [SOFTMAX] single-core softmax complete
+[VERIFY-SOFTMAX] PASS
+```
+
 ### 测试脚本
 
 | 脚本 | 矩阵大小 | GEMM Tiles | 配置文件 | 描述 |
