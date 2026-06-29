@@ -31,6 +31,8 @@
 | 第一版建议 SFU-managed reducer state | 先保证正确性和可调试性，再考虑显式 NoC 流量建模 |
 | 第一版建议内部轻量 credit/inflight 控制 | 借鉴 GEMM DMA 机制，但避免过早耦合 request scheduler |
 | 第一版建议原地覆盖 C | 降低 workload 和地址管理复杂度 |
+| SFU 骨架已作为独立子组件注册 | `golem.cc` include + `Makefile.am` 源文件列表足够让 `sfu/sfu.cc` 编进 `libgolem.la` |
+| RoCC SFU 指令接入默认关闭 | `roccAnalog.h` 只在 `sfuEnable=1` 时加载 `"sfu"` slot；新增 func7 为 `0x17/0x18`，已有 GEMM batch/WCP func7 `0x11` 到 `0x16` 保持不变 |
 
 ## Issues Encountered
 
@@ -39,6 +41,7 @@
 | 旧 cross-tile prototype 的 HBM counter/sum 更新非原子 | 正式设计改为 row-owner/reducer，不让多个 core 直接写同一个 reduction 值 |
 | tile-local softmax 对大 N 不正确 | 第一版直接设计 full row-wise softmax |
 | 传统三阶段 softmax 不是 online softmax | 设计更新为 tile stats + online merge + normalize |
+| `scripts/build_and_install_local.sh --reconfigure --jobs 16` 在 rsync/chgrp 阶段失败 | 不是 SFU 编译错误；脚本在 `prepare_local_build.sh` 使用 `rsync -a` 保留 group 属性，当前文件系统对部分文件 chgrp 返回 `Invalid argument`。已在复制出的 build tree 中手动 `autogen/configure/make -C src/sst/elements/golem -j16` 验证 SFU 骨架编译通过 |
 
 ## Resources
 

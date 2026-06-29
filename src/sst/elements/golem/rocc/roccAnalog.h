@@ -24,6 +24,7 @@
 #include <sst/elements/golem/array/computeArray.h>
 #include <sst/elements/golem/groupctrl/groupctrl.h>
 #include <sst/elements/golem/requestscheduler/requestscheduler.h>
+#include <sst/elements/golem/sfu/sfu.h>
 #include <sst/elements/golem/workercmdproc/workercmdproc.h>
 #include <sst/elements/vanadis/rocc/vroccinterface.h>
 #include <sst/elements/golem/globalmemory/globalmemory.h>
@@ -54,6 +55,8 @@ constexpr uint8_t GOLEM_ROCC_FUNC7_TILE_GM2IMAT_BCAST = 0x13;
 constexpr uint8_t GOLEM_ROCC_FUNC7_TILE_GM2IVEC_BATCH = 0x14;
 constexpr uint8_t GOLEM_ROCC_FUNC7_WCP_START = 0x15;
 constexpr uint8_t GOLEM_ROCC_FUNC7_WCP_WAIT = 0x16;
+constexpr uint8_t GOLEM_ROCC_FUNC7_SFU_SOFTMAX_TILE = 0x17;
+constexpr uint8_t GOLEM_ROCC_FUNC7_SFU_WAIT = 0x18;
 
 template <typename T>
 class RoCCAnalog : public SST::Vanadis::VanadisRoCCInterface {
@@ -186,6 +189,21 @@ public:
                         "RoCCAnalog: 核心%" PRIu64 " 的 GlobalMemory 基地址配置为 0x%" PRIx64 "\n", 
                         coreID, baseAddr);
 
+        sfu = nullptr;
+        sfuEnable = params.find<int>("sfuEnable", 0) != 0;
+        if (sfuEnable) {
+            sfu = loadUserSubComponent<SST::Golem::SFUAPI>(
+                "sfu", ComponentInfo::SHARE_NONE);
+            if (nullptr == sfu) {
+                output->fatal(CALL_INFO, -1,
+                    "Error: sfuEnable=1 but required user subcomponent 'sfu' is missing for RoCCAnalog.\n");
+            }
+            sfu->bindGlobalMemory(globalMem);
+            sfu->setCoreInfo(
+                static_cast<uint32_t>(coreID),
+                params.find<uint32_t>("active_worker_cores", 1));
+        }
+
         groupCtrl = nullptr;
         if (params.find<int>("groupCtrlEnable", 0) != 0) {
             groupCtrl = loadUserSubComponent<SST::Golem::GroupCtrlAPI>(
@@ -299,6 +317,9 @@ public:
     if (requestScheduler) {
         requestScheduler->init(phase);
     }
+    if (sfu) {
+        sfu->init(phase);
+    }
     }
 
     void setup() override {
@@ -316,6 +337,9 @@ public:
         }
         if (requestScheduler) {
             requestScheduler->setup();
+        }
+        if (sfu) {
+            sfu->setup();
         }
     }
 
@@ -335,6 +359,9 @@ public:
         if (requestScheduler) {
             requestScheduler->complete(phase);
         }
+        if (sfu) {
+            sfu->complete(phase);
+        }
     }
 
     void finish() override {
@@ -353,6 +380,9 @@ public:
         }
         if (requestScheduler) {
             requestScheduler->finish();
+        }
+        if (sfu) {
+            sfu->finish();
         }
     }
   
@@ -487,6 +517,20 @@ public:
             if (next_cmd != nullptr && next_cmd->inst != nullptr && next_cmd->inst->func7 == GOLEM_ROCC_FUNC7_WCP_WAIT) {
                 roccCmd_q.pop_front();
                 if (!tryWaitWorkerWindow(next_cmd)) {
+                    roccCmd_q.push_front(next_cmd);
+                }
+                return;
+            }
+            if (next_cmd != nullptr && next_cmd->inst != nullptr && next_cmd->inst->func7 == GOLEM_ROCC_FUNC7_SFU_SOFTMAX_TILE) {
+                roccCmd_q.pop_front();
+                if (!tryIssueSfuSoftmaxTileCommand(next_cmd)) {
+                    roccCmd_q.push_front(next_cmd);
+                }
+                return;
+            }
+            if (next_cmd != nullptr && next_cmd->inst != nullptr && next_cmd->inst->func7 == GOLEM_ROCC_FUNC7_SFU_WAIT) {
+                roccCmd_q.pop_front();
+                if (!tryWaitSfuCommand(next_cmd)) {
                     roccCmd_q.push_front(next_cmd);
                 }
                 return;
@@ -925,6 +969,45 @@ public:
         }
         enqueueResponse(new SST::Vanadis::RoCCResponse(
             cmd->inst->rd, 0, cmd->cmd_id, cmd->hw_thread));
+        delete cmd;
+        return true;
+    }
+
+    bool tryIssueSfuSoftmaxTileCommand(SST::Vanadis::RoCCCommand* cmd) {
+        if (cmd == nullptr || cmd->inst == nullptr) {
+            return true;
+        }
+        if (sfu == nullptr) {
+            enqueueResponse(new SST::Vanadis::RoCCResponse(
+                cmd->inst->rd, 1, cmd->cmd_id, cmd->hw_thread));
+            delete cmd;
+            return true;
+        }
+        if (!sfu->issueSoftmaxTile(cmd->rs1, cmd->rs2)) {
+            return false;
+        }
+        enqueueResponse(new SST::Vanadis::RoCCResponse(
+            cmd->inst->rd, 0, cmd->cmd_id, cmd->hw_thread));
+        delete cmd;
+        return true;
+    }
+
+    bool tryWaitSfuCommand(SST::Vanadis::RoCCCommand* cmd) {
+        if (cmd == nullptr || cmd->inst == nullptr) {
+            return true;
+        }
+        if (sfu == nullptr) {
+            enqueueResponse(new SST::Vanadis::RoCCResponse(
+                cmd->inst->rd, 1, cmd->cmd_id, cmd->hw_thread));
+            delete cmd;
+            return true;
+        }
+        uint64_t status = 1;
+        if (!sfu->wait(cmd->rs1, &status)) {
+            return false;
+        }
+        enqueueResponse(new SST::Vanadis::RoCCResponse(
+            cmd->inst->rd, status, cmd->cmd_id, cmd->hw_thread));
         delete cmd;
         return true;
     }
@@ -1972,6 +2055,7 @@ private:
     SST::Golem::GroupCtrlAPI *groupCtrl;
     SST::Golem::RequestSchedulerAPI *requestScheduler;
     SST::Golem::WorkerCommandProcessorAPI *workerCommandProcessor;
+    SST::Golem::SFUAPI *sfu;
     uint64_t coreID;
 
   
@@ -2034,6 +2118,7 @@ private:
     std::vector<uint8_t> outputPayload;
     size_t remoteTransferLength;
     bool enable_async_array_load = true;
+    bool sfuEnable = false;
 
     // 用于 write_gm 的状态变量
     uint64_t gm_write_dst_addr;   // GlobalMemory 的目标地址 (rs2)

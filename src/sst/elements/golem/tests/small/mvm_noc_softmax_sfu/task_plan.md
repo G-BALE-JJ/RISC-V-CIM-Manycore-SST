@@ -6,7 +6,7 @@
 
 ## Current Phase
 
-Phase 3: Implementation Plan
+Phase 4: Component Implementation
 
 ## Phases
 
@@ -38,18 +38,18 @@ Phase 3: Implementation Plan
 
 ### Phase 4: Component Implementation
 
-- [ ] 新增 `src/sst/elements/golem/sfu/sfu.h`。
-- [ ] 新增 `src/sst/elements/golem/sfu/sfu.cc`。
-- [ ] 修改 `golem.cc` 和 `Makefile.am` 注册 SFU。
-- [ ] 修改 `rocc/roccAnalog.h` 加载 `sfu` slot 并处理 SFU 指令。
+- [x] 新增 `src/sst/elements/golem/sfu/sfu.h`。
+- [x] 新增 `src/sst/elements/golem/sfu/sfu.cc`。
+- [x] 修改 `golem.cc` 和 `Makefile.am` 注册 SFU。
+- [x] 修改 `rocc/roccAnalog.h` 加载 `sfu` slot 并处理 SFU 指令。
 - [ ] 修改 `tests/architecture/cpu_builder.py` 挂载 `golem.SFU`。
-- **Status:** pending
+- **Status:** in_progress
 
 ### Phase 5: Workload and Verification
 
 - [ ] 在 `mvm_noc_softmax_sfu` 下创建 RISC-V workload。
 - [ ] 复用现有 GEMM pipeline 参数和构建方式。
-- [ ] 新增 full row-wise `softmax(A @ B)` checker。
+- [x] 新增 full row-wise `softmax(A @ B)` checker。
 - [ ] 验证 64x64、128x128、256x256、512x512 配置。
 - **Status:** pending
 
@@ -79,6 +79,7 @@ Phase 3: Implementation Plan
 | Error | Attempt | Resolution |
 |-------|---------|------------|
 | 无 | 1 | 当前阶段只进行设计和文档更新 |
+| `build_and_install_local.sh` rsync/chgrp 失败 | 1 | 该失败发生在复制 build tree 阶段，不是 SFU 编译错误；已在复制出的 build tree 手动 autogen/configure，并用 `make -C src/sst/elements/golem -j16` 验证通过 |
 
 ## Notes
 
