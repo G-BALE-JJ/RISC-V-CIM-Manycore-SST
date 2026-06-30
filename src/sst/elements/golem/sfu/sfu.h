@@ -2,6 +2,8 @@
 #define _H_GOLEM_SFU
 
 #include <cstdint>
+#include <unordered_map>
+#include <vector>
 
 #include <sst/core/output.h>
 #include <sst/core/params.h>
@@ -12,6 +14,41 @@
 
 namespace SST {
 namespace Golem {
+
+struct SFUSoftmaxTileDesc {
+    uint64_t job_id;
+    uint64_t local_input_gm_addr;
+    uint64_t local_output_gm_addr;
+    uint32_t global_m;
+    uint32_t global_n;
+    uint32_t block_m;
+    uint32_t block_n;
+    uint32_t m_tile;
+    uint32_t n_tile;
+    uint32_t valid_m;
+    uint32_t valid_n;
+    uint32_t n_tiles_per_row;
+    uint32_t elem_bytes;
+    uint32_t flags;
+};
+
+static_assert(sizeof(SFUSoftmaxTileDesc) == 72,
+              "SFUSoftmaxTileDesc ABI must stay fixed for RISC-V workload descriptors");
+
+enum class SFUStatus : uint64_t {
+    Success = 0,
+    Pending = 1,
+    InvalidDescriptor = 2,
+    UnsupportedElemBytes = 3,
+    GlobalMemoryUnavailable = 4,
+    InvalidShape = 5,
+};
+
+struct SFUTileRowStats {
+    uint32_t global_row;
+    double tile_m;
+    double tile_l;
+};
 
 class SFUAPI : public SST::SubComponent {
 public:
@@ -66,6 +103,24 @@ public:
     void setCoreInfo(uint32_t coreId, uint32_t activeWorkerCores) override;
 
 private:
+    struct SoftmaxOpState {
+        SFUSoftmaxTileDesc desc;
+        uint64_t descAddr;
+        uint64_t tag;
+        SFUStatus status;
+        std::vector<SFUTileRowStats> rowStats;
+        std::vector<float> inputTile;
+        bool normalizeReady;
+    };
+
+    bool readSoftmaxDescriptor(uint64_t descAddr, SFUSoftmaxTileDesc* desc);
+    SFUStatus validateSoftmaxDescriptor(const SFUSoftmaxTileDesc& desc) const;
+    bool readInputTile(const SFUSoftmaxTileDesc& desc, std::vector<float>* values);
+    void computeTileStats(SoftmaxOpState* state);
+    bool mergeTileStats(SoftmaxOpState* state);
+    bool tileGlobalStatsReady(const SoftmaxOpState& state) const;
+    bool normalizeTile(SoftmaxOpState* state);
+
     uint32_t coreId_;
     uint32_t activeWorkerCores_;
     uint32_t maxInflight_;
@@ -77,6 +132,7 @@ private:
 
     GlobalMemoryAPI* globalMem_;
     SST::Output output_;
+    std::unordered_map<uint64_t, SoftmaxOpState> pendingSoftmaxOps_;
 
     Statistic<uint64_t>* statOpsIssued_;
     Statistic<uint64_t>* statSoftmaxRows_;

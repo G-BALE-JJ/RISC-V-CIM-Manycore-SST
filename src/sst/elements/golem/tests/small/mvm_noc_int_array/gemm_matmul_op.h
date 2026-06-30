@@ -586,48 +586,44 @@ static inline void gemm_tiled_baseline(
 
     for (int n_col = 0; n_col < desc.block_n; ++n_col) {
         configure_output_mode(0, 1, true);
-    }
+        for (int k = 0; k < desc.k_tiles; ++k) {
+            const WaitProfileStats batch_grant_wait = group_request_dma_batch_token(
+                core_id,
+                gemm_desc_mat_src_mm(desc, k),
+                MAT_BYTES + VEC_BYTES
+            );
+            stats->group_wait_cycles += batch_grant_wait.wait_cycles;
+            stats->poll_iters += batch_grant_wait.poll_iters;
+            mark_exec_window_begin(stats, read_cycle_counter());
+            profiled_dma_remote_load_to_gm(
+                core_id,
+                gemm_desc_mat_src_mm(desc, k),
+                rt.local_mat,
+                MAT_BYTES,
+                &stats->dma_issue_cycles,
+                &stats->dma_wait_cycles,
+                &stats->poll_iters
+            );
+            profiled_dma_remote_load_to_gm(
+                core_id,
+                gemm_desc_vec_src_mm(desc, k, n_col),
+                rt.local_vec_in,
+                VEC_BYTES,
+                &stats->dma_issue_cycles,
+                &stats->dma_wait_cycles,
+                &stats->poll_iters
+            );
+            const uint64_t batch_end = read_cycle_counter();
 
-    for (int k = 0; k < desc.k_tiles; ++k) {
-        const uint64_t vec_block_bytes = static_cast<uint64_t>(desc.block_n) * VEC_BYTES;
-        const WaitProfileStats batch_grant_wait = group_request_dma_batch_token(
-            core_id,
-            gemm_desc_mat_src_mm(desc, k),
-            MAT_BYTES + vec_block_bytes
-        );
-        stats->group_wait_cycles += batch_grant_wait.wait_cycles;
-        stats->poll_iters += batch_grant_wait.poll_iters;
-        mark_exec_window_begin(stats, read_cycle_counter());
-        profiled_dma_remote_load_to_gm(
-            core_id,
-            gemm_desc_mat_src_mm(desc, k),
-            rt.local_mat,
-            MAT_BYTES,
-            &stats->dma_issue_cycles,
-            &stats->dma_wait_cycles,
-            &stats->poll_iters
-        );
-        profiled_dma_remote_load_to_gm(
-            core_id,
-            gemm_desc_vec_src_mm(desc, k, 0),
-            rt.local_vec_in,
-            vec_block_bytes,
-            &stats->dma_issue_cycles,
-            &stats->dma_wait_cycles,
-            &stats->poll_iters
-        );
-        const uint64_t batch_end = read_cycle_counter();
+            if (!first_dma_ready_reported && stage_progress_enabled()) {
+                printf("[Core %d] [%s] STAGE_PROGRESS: A/B DMA done k_tile=%d cycle=%" PRIu64 "\n",
+                       core_id, dtype_label<T>(), k, batch_end);
+                fflush(stdout);
+                first_dma_ready_reported = true;
+            }
 
-        if (!first_dma_ready_reported && stage_progress_enabled()) {
-            printf("[Core %d] [%s] STAGE_PROGRESS: A/B DMA done k_tile=%d cycle=%" PRIu64 "\n",
-                   core_id, dtype_label<T>(), k, batch_end);
-            fflush(stdout);
-            first_dma_ready_reported = true;
-        }
-
-        const uint64_t n_loop_begin = read_cycle_counter();
-        const uint64_t compute_before = stats->compute_cycles;
-        for (int n_col = 0; n_col < desc.block_n; ++n_col) {
+            const uint64_t n_loop_begin = read_cycle_counter();
+            const uint64_t compute_before = stats->compute_cycles;
             const uint64_t compute_begin = read_cycle_counter();
             if (!first_before_mvm_reported && stage_progress_enabled()) {
                 printf("[Core %d] [%s] STAGE_PROGRESS: before first mvm n_col=%d k_tile=%d cycle=%" PRIu64 "\n",
@@ -635,7 +631,7 @@ static inline void gemm_tiled_baseline(
                 fflush(stdout);
                 first_before_mvm_reported = true;
             }
-            run_mvm_compute_only<T>(rt.local_mat, vec_col_addr(rt, n_col), 0);
+            run_mvm_compute_only<T>(rt.local_mat, rt.local_vec_in, 0);
             const uint64_t compute_end = read_cycle_counter();
             stats->compute_cycles += (compute_end - compute_begin);
             if (!first_after_mvm_reported && stage_progress_enabled()) {
@@ -644,12 +640,9 @@ static inline void gemm_tiled_baseline(
                 fflush(stdout);
                 first_after_mvm_reported = true;
             }
+            account_nloop_overhead(stats, n_loop_begin, read_cycle_counter(), compute_before);
+            group_request_dma_batch_done(core_id);
         }
-        account_nloop_overhead(stats, n_loop_begin, read_cycle_counter(), compute_before);
-        group_request_dma_batch_done(core_id);
-    }
-
-    for (int n_col = 0; n_col < desc.block_n; ++n_col) {
         const uint64_t store_begin = read_cycle_counter();
         set_len(VEC_BYTES);
         outputvectorstore(accum_col_addr(desc, rt, n_col), 0);

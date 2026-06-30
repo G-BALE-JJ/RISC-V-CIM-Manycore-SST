@@ -6,6 +6,11 @@
 路径上。SFU 表示 Special Function Unit，不只服务于 softmax；softmax 是第一个
 接入的特殊函数类操作。
 
+从长期架构看，SFU 是 Golem 中面向特殊数学函数和非矩阵主算子的通用执行单元。
+它应能逐步承载 `exp`、`log`、`reciprocal`、`rsqrt`、`sigmoid`、`tanh`、
+`softmax`、`layernorm`、`gelu` 等操作。当前 small test 只要求打通
+softmax，是因为现有迁移目标是替代 CPU fallback softmax。
+
 第一版 SFU softmax 必须支持 GEMM 输出矩阵 `C[M, N]` 的完整 row-wise softmax，
 而不是 tile-local softmax。
 
@@ -88,6 +93,33 @@ src/sst/elements/golem/sfu/sfu.cc
 
 - 在 `golem.cc` 中 include `sfu/sfu.h`。
 - 在 `Makefile.am` 的 `libgolem_la_SOURCES` 中加入 `sfu/sfu.h` 和 `sfu/sfu.cc`。
+
+## SFU 通用职责与操作分层
+
+SFU 不应被建模成只会执行 softmax 的专用模块。推荐把 SFU 操作分为两层：
+
+```text
+SFU primitive ops:
+  exp
+  log
+  reciprocal / divide approximate
+  rsqrt
+  max / sum reduction helper
+
+SFU fused ops:
+  softmax
+  sigmoid
+  tanh
+  layernorm
+  gelu
+```
+
+第一版只对 workload 暴露 fused softmax 指令，原因是它能直接替换当前 CPU
+fallback 路径，并且避免在 RISC-V workload 中暴露过多尚未使用的 primitive
+RoCC 指令。softmax 内部仍应按 SFU primitive 的思想组织：`max reduction`、
+`exp`、`sum reduction`、`reciprocal/divide` 和 normalize。这样后续新增
+standalone `exp`、`log`、`reciprocal` 或 layernorm 时，不需要重命名组件或推翻
+RoCC slot 结构。
 
 ## Online Softmax 协议
 
@@ -235,14 +267,14 @@ sfu.normalize        # 用 global_m/global_l 归一化
 sfu.wait
 ```
 
-第一版可以只对软件暴露 fused softmax 指令，把 primitive 阶段封装在 SFU 内部。
+第一版只对软件暴露 fused softmax 指令，把 primitive 阶段封装在 SFU 内部。
 保留 primitive 名称，是为了后续扩展到其他 SFU 操作，例如：
 
 - layernorm 中的局部规约和归一化；
+- standalone `exp`、`log`、`reciprocal`、`rsqrt`；
 - sigmoid；
 - tanh；
-- reciprocal / divide approximate；
-- standalone exp。
+- reciprocal / divide approximate。
 
 ## 数据搬运
 

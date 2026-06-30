@@ -44,6 +44,12 @@ source = source.replace(
     "        mem_backend.enableAllStatistics()\n",
     1,
 )
+source = source.replace(
+    '    "GOLEM_SILENT",\n]',
+    '    "GOLEM_SILENT",\n'
+    '    "GOLEM_SFU_SKIP_SOFTMAX",\n]',
+    1,
+)
 
 globals_dict = {
     "__file__": ARCHIVE_SCRIPT,
