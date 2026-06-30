@@ -71,10 +71,21 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 WORKTREE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 BUILD_ROOT="${BUILD_ROOT:-$WORKTREE_ROOT/build/sst-elements}"
 INSTALL_PREFIX="${INSTALL_PREFIX:-$WORKTREE_ROOT/install}"
-SST_CORE_PREFIX="${SST_CORE_PREFIX:-/data4/lishun/pkg/sst_install}"
+SST_CORE_PREFIX="${SST_CORE_PREFIX:-/data4/jjgong/local/sstcore}"
 SST_DRAMSIM3_PREFIX="${SST_DRAMSIM3_PREFIX:-/data4/lishun/pkg/DRAMsim3}"
 INSTALL_HOME="$BUILD_ROOT/.sst-home"
 INSTALL_HOME_CONFIG="$INSTALL_HOME/.sst/sstsimulator.conf"
+
+restore_handwritten_test_makefiles() {
+	local rel
+	for rel in \
+		"src/sst/elements/golem/tests/small/mvm_noc_int_array/Makefile" \
+		"src/sst/elements/golem/tests/small/mvm_noc_softmax_cpu/Makefile"; do
+		if [[ -f "$WORKTREE_ROOT/$rel" ]]; then
+			install -D -m 644 "$WORKTREE_ROOT/$rel" "$BUILD_ROOT/$rel"
+		fi
+	done
+}
 
 if [[ -z "$jobs" ]]; then
 	jobs="$(nproc 2>/dev/null || echo 1)"
@@ -108,6 +119,7 @@ if [[ "$reconfigure" -eq 1 ]]; then
 	echo "[INFO] Removing configure outputs"
 	rm -f Makefile config.log config.status libtool
 	find . -name Makefile -type f -delete
+	restore_handwritten_test_makefiles
 fi
 
 if [[ "$run_autogen" -eq 1 ]]; then

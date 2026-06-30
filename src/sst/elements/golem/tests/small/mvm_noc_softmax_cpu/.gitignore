@@ -1,0 +1,6 @@
+!Makefile
+__pycache__/
+*.pyc
+data/
+native/
+riscv64/

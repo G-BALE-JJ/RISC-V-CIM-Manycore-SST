@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REAL_SST_BIN="${REAL_SST_BIN:-/data4/jjgong/local/sstcore/bin/sst}"
+SST_SOFTMAX_LD_LIBRARY_PATH="${SST_SOFTMAX_LD_LIBRARY_PATH:-/data4/jjgong/miniconda3/lib:/data4/jjgong/local/sstcore/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"
+
+export LD_LIBRARY_PATH="$SST_SOFTMAX_LD_LIBRARY_PATH"
+exec "$REAL_SST_BIN" "$@"

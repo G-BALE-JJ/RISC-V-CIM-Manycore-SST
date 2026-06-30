@@ -11,15 +11,17 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 WORKTREE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 
-export SST_CORE_PREFIX="${SST_CORE_PREFIX:-/data4/lishun/pkg/sst_install}"
+export SST_CORE_PREFIX="${SST_CORE_PREFIX:-/data4/jjgong/local/sstcore}"
 export SST_ELEMENTS_INSTALL_PREFIX="${SST_ELEMENTS_INSTALL_PREFIX:-$WORKTREE_ROOT/install}"
+export SST_PYTHON_LIB_DIR="${SST_PYTHON_LIB_DIR:-/data4/jjgong/miniconda3/lib}"
 
 case ":${PATH:-}:" in
 	*":$SST_CORE_PREFIX/bin:"*) ;;
 	*) export PATH="$SST_CORE_PREFIX/bin${PATH:+:$PATH}" ;;
 esac
 
-for lib_dir in "$SST_ELEMENTS_INSTALL_PREFIX/lib" "$SST_CORE_PREFIX/lib"; do
+for lib_dir in "$SST_PYTHON_LIB_DIR" "$SST_ELEMENTS_INSTALL_PREFIX/lib" "$SST_CORE_PREFIX/lib"; do
+	[[ -d "$lib_dir" ]] || continue
 	case ":${LD_LIBRARY_PATH:-}:" in
 		*":$lib_dir:"*) ;;
 		*) export LD_LIBRARY_PATH="$lib_dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ;;

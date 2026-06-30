@@ -24,6 +24,8 @@ libgolem_la_SOURCES = \
 	groupctrl/groupctrl.cc \
 	requestscheduler/requestscheduler.h \
 	requestscheduler/requestscheduler.cc \
+	sfu/sfu.h \
+	sfu/sfu.cc \
 	workercmdproc/workercmdproc.h \
 	rocc/roccAnalog.h \
 	rocc/roccAnalogFloat.h \
