@@ -82,6 +82,83 @@ class SfuWorkloadScaffoldTest(unittest.TestCase):
         self.assertIn("dma_remote_load_to_gm(executor_core_id,", runtime_source)
         self.assertIn("write_sfu_desc_to_gm(executor_core_id,", runtime_source)
 
+    def test_runtime_has_interleaved_local_accum_experiment_mode(self):
+        entry_source = read_local("test_noc_dma_softmax_sfu.cpp")
+        runtime_header = read_local("golem_softmax_sfu_runtime.h")
+        runtime_source = read_local("golem_softmax_sfu_runtime.cpp")
+
+        self.assertIn('read_i64_env_or_default("GOLEM_SFU_INTERLEAVE_GEMM", 0)', entry_source)
+        self.assertIn("golemRunSoftmaxSfuTileFromLocalAccum", runtime_header)
+        self.assertIn("local_input_gm_addr = local_accum_gm", runtime_source)
+        self.assertIn("skip_hbm_reload", runtime_source)
+        self.assertIn("mode=sfu-interleaved-local-accum", entry_source)
+        self.assertLess(
+            entry_source.index("gemm_tiled<float>(executor_core_id, desc, rt, &stats)"),
+            entry_source.index("golemRunSoftmaxSfuTileFromLocalAccum"),
+        )
+
+    def test_interleaved_mode_keeps_default_bulk_softmax_path_available(self):
+        entry_source = read_local("test_noc_dma_softmax_sfu.cpp")
+
+        self.assertIn("run_gemm_for_core(executor_core_id, requested_core_id, op_desc)", entry_source)
+        self.assertIn("golemRunSoftmaxSfuForCore(", entry_source)
+        self.assertLess(
+            entry_source.index('read_i64_env_or_default("GOLEM_SFU_INTERLEAVE_GEMM", 0)'),
+            entry_source.index("run_gemm_for_core(executor_core_id, requested_core_id, op_desc)"),
+        )
+
+    def test_workload_has_standalone_softmax_only_mode_before_gemm(self):
+        entry_source = read_local("test_noc_dma_softmax_sfu.cpp")
+        runtime_header = read_local("golem_softmax_sfu_runtime.h")
+        runtime_source = read_local("golem_softmax_sfu_runtime.cpp")
+
+        self.assertIn('read_i64_env_or_default("GOLEM_SFU_STANDALONE_SOFTMAX", 0)', entry_source)
+        self.assertIn("mode=sfu-standalone-softmax", entry_source)
+        self.assertIn("golemRunStandaloneSoftmaxSfuForCore", runtime_header)
+        self.assertIn("golemRunStandaloneSoftmaxSfuForCore", runtime_source)
+        self.assertIn("task.c_base_mm", runtime_source)
+        self.assertLess(
+            entry_source.index('read_i64_env_or_default("GOLEM_SFU_STANDALONE_SOFTMAX", 0)'),
+            entry_source.index("run_gemm_for_core(executor_core_id, requested_core_id, op_desc)"),
+        )
+        self.assertLess(
+            entry_source.index("golemRunStandaloneSoftmaxSfuForCore"),
+            entry_source.index("run_gemm_for_core(executor_core_id, requested_core_id, op_desc)"),
+        )
+
+    def test_standalone_softmax_uses_row_band_issue_wait_window(self):
+        runtime_source = read_local("golem_softmax_sfu_runtime.cpp")
+        body_match = re.search(
+            r"extern \"C\" golem_status_t golemRunSoftmaxSfuForCore\s*\([^)]*\)\s*\{(?P<body>.*?)\n\}\n\nextern \"C\" golem_status_t golemRunStandaloneSoftmaxSfuForCore",
+            runtime_source,
+            re.S,
+        )
+        self.assertIsNotNone(body_match)
+        body = body_match.group("body")
+
+        self.assertIn("SFU_SOFTMAX_ISSUE_WINDOW_TILES", runtime_source)
+        self.assertIn("row_band_m_tiles", runtime_source)
+        self.assertIn("issue_sfu_softmax_tile", runtime_source)
+        self.assertIn("wait_and_store_pending_tiles", runtime_source)
+        self.assertIn("std::vector<PendingTile> pending", body)
+        self.assertLess(
+            body.index("for (int m_tile_begin = 0;"),
+            body.index("wait_and_store_pending_tiles"),
+        )
+
+    def test_hbm_generator_preloads_standalone_logits_into_c_tile_layout(self):
+        source = read_repo_relative("../../tools/gen_hbm_init.py")
+
+        self.assertIn("GOLEM_SFU_STANDALONE_SOFTMAX", source)
+        self.assertIn("GOLEM_SOFTMAX_LOGITS_FILE", source)
+        self.assertIn("--softmax-logits-file", source)
+        self.assertIn("_build_softmax_logits_matrix", source)
+        self.assertIn("_write_standalone_softmax_logits", source)
+        self.assertIn("OFF_GEMM_OUT_BASE", source)
+        self.assertIn("GEMM_OUT_STRIDE_MM", source)
+        self.assertIn("macro_task_id = _macro_task_for_group(m_group, n_group)", source)
+        self.assertIn("cc * BLOCK_M + r", source)
+
     def test_explicit_gemm_baseline_keeps_columns_independent_on_single_array_path(self):
         text = read_repo_relative("../mvm_noc_int_array/gemm_matmul_op.h")
         body_match = re.search(

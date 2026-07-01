@@ -18,6 +18,7 @@ thread_local std::string g_sfu_softmax_last_error;
 constexpr uint64_t SFU_DESC_GM_OFFSET = LOCAL_LAYOUT.tmp;
 constexpr uint64_t SFU_INPUT_GM_OFFSET = LOCAL_LAYOUT.accum;
 constexpr uint64_t SFU_OUTPUT_GM_OFFSET = LOCAL_LAYOUT.out;
+constexpr int SFU_SOFTMAX_ISSUE_WINDOW_TILES = 8;
 
 enum : uint64_t {
     SFU_STATUS_SUCCESS = 0,
@@ -97,7 +98,135 @@ int task_id_for_tile(int n_tiles, int m_tile, int n_tile) {
     return m_tile * n_tiles + n_tile;
 }
 
+SFUSoftmaxTileDesc make_sfu_tile_desc(const MatmulRuntimeConfig& cfg,
+                                      const GemmTaskDescriptor& task,
+                                      uint64_t local_input_gm,
+                                      uint64_t local_output_gm,
+                                      uint64_t job_id) {
+    return {
+        .job_id = job_id,
+        .local_input_gm_addr = local_input_gm,
+        .local_output_gm_addr = local_output_gm,
+        .global_m = static_cast<uint32_t>(cfg.m),
+        .global_n = static_cast<uint32_t>(cfg.n),
+        .block_m = static_cast<uint32_t>(task.block_m),
+        .block_n = static_cast<uint32_t>(task.block_n),
+        .m_tile = static_cast<uint32_t>(task.m_tile),
+        .n_tile = static_cast<uint32_t>(task.n_tile),
+        .valid_m = static_cast<uint32_t>(task.block_m),
+        .valid_n = static_cast<uint32_t>(task.block_n),
+        .n_tiles_per_row = static_cast<uint32_t>(gemm_n_tiles(cfg)),
+        .elem_bytes = sizeof(float),
+        .flags = 0,
+    };
+}
+
+struct PendingTile {
+    uint64_t tag;
+    uint64_t output_hbm;
+    uint64_t local_output_gm;
+    uint64_t bytes;
+};
+
+int row_band_m_tiles(int n_tiles) {
+    if (n_tiles <= 0) {
+        return 1;
+    }
+    const int rows = SFU_SOFTMAX_ISSUE_WINDOW_TILES / n_tiles;
+    return std::max(1, rows);
+}
+
+golem_status_t issue_sfu_softmax_tile(const MatmulRuntimeConfig& cfg,
+                                      int executor_core_id,
+                                      const GemmTaskDescriptor& task,
+                                      uint64_t desc_gm,
+                                      uint64_t local_input_gm,
+                                      uint64_t local_output_gm,
+                                      uint64_t job_id,
+                                      uint64_t tag,
+                                      std::vector<PendingTile>* pending) {
+    if (pending == nullptr) {
+        set_sfu_softmax_last_error("softmax SFU pending queue is null");
+        return GOLEM_STATUS_INVALID_ARGUMENT;
+    }
+
+    const uint64_t tile_bytes =
+        static_cast<uint64_t>(task.block_m) * static_cast<uint64_t>(task.block_n) * sizeof(float);
+
+    dma_remote_load_to_gm(executor_core_id, task.c_base_mm, local_input_gm, tile_bytes);
+
+    const SFUSoftmaxTileDesc desc =
+        make_sfu_tile_desc(cfg, task, local_input_gm, local_output_gm, job_id);
+    write_sfu_desc_to_gm(executor_core_id, desc_gm, desc);
+
+    sfu_softmax_tile(desc_gm, tag);
+    pending->push_back(PendingTile{
+        .tag = tag,
+        .output_hbm = task.c_base_mm,
+        .local_output_gm = local_output_gm,
+        .bytes = tile_bytes,
+    });
+    return GOLEM_STATUS_OK;
+}
+
+golem_status_t wait_and_store_pending_tiles(const std::vector<PendingTile>& pending) {
+    for (const PendingTile& tile : pending) {
+        const golem_status_t status = golemWaitSoftmaxSfuTileAndStore(
+            tile.tag, tile.local_output_gm, tile.output_hbm, tile.bytes);
+        if (status != GOLEM_STATUS_OK) {
+            return status;
+        }
+    }
+    return GOLEM_STATUS_OK;
+}
+
 } // namespace
+
+extern "C" golem_status_t golemRunSoftmaxSfuTileFromLocalAccum(
+    const golem_softmax_op_desc_t* op_desc,
+    int executor_core_id,
+    const MatmulRuntimeConfig* cfg,
+    const GemmTaskDescriptor* task,
+    uint64_t local_accum_gm,
+    uint64_t local_output_gm,
+    uint64_t desc_gm,
+    uint64_t job_id,
+    uint64_t tag) {
+    if (task == nullptr) {
+        set_sfu_softmax_last_error("softmax SFU local-accum task is null");
+        return GOLEM_STATUS_INVALID_ARGUMENT;
+    }
+    const golem_status_t status =
+        validate_sfu_softmax_request(op_desc, executor_core_id, executor_core_id, cfg);
+    if (status != GOLEM_STATUS_OK) {
+        return status;
+    }
+
+    constexpr bool skip_hbm_reload = true;
+    (void)skip_hbm_reload;
+    SFUSoftmaxTileDesc desc =
+        make_sfu_tile_desc(*cfg, *task, local_accum_gm, local_output_gm, job_id);
+    desc.local_input_gm_addr = local_accum_gm;
+    write_sfu_desc_to_gm(executor_core_id, desc_gm, desc);
+    sfu_softmax_tile(desc_gm, tag);
+    return GOLEM_STATUS_OK;
+}
+
+extern "C" golem_status_t golemWaitSoftmaxSfuTileAndStore(
+    uint64_t tag,
+    uint64_t local_output_gm,
+    uint64_t output_hbm,
+    uint64_t bytes) {
+    const uint64_t sfu_status = sfu_wait(tag);
+    if (sfu_status != SFU_STATUS_SUCCESS) {
+        set_sfu_softmax_last_error("softmax SFU wait failed with status=%llu",
+                                   static_cast<unsigned long long>(sfu_status));
+        return GOLEM_STATUS_INTERNAL_ERROR;
+    }
+    set_len(bytes);
+    remote_store(local_output_gm, output_hbm);
+    return GOLEM_STATUS_OK;
+}
 
 extern "C" golem_status_t golemRunSoftmaxSfuForCore(
     const golem_softmax_op_desc_t* op_desc,
@@ -117,74 +246,55 @@ extern "C" golem_status_t golemRunSoftmaxSfuForCore(
         return GOLEM_STATUS_OK;
     }
 
-    struct PendingTile {
-        uint64_t tag;
-        uint64_t output_hbm;
-        uint64_t local_output_gm;
-        uint64_t bytes;
-    };
-    std::vector<PendingTile> pending;
-
     const uint64_t desc_gm = gm_addr(executor_core_id, SFU_DESC_GM_OFFSET);
     const uint64_t local_input_gm = gm_addr(executor_core_id, SFU_INPUT_GM_OFFSET);
     const uint64_t local_output_gm = gm_addr(executor_core_id, SFU_OUTPUT_GM_OFFSET);
 
-    for (int m_tile = 0; m_tile < m_tiles; ++m_tile) {
-        for (int n_tile = 0; n_tile < n_tiles; ++n_tile) {
-            const int task_id = task_id_for_tile(n_tiles, m_tile, n_tile);
-            if ((task_id % ACTIVE_GEMM_CORES) != worker_slot) {
-                continue;
+    const int m_tile_band = row_band_m_tiles(n_tiles);
+    for (int m_tile_begin = 0; m_tile_begin < m_tiles; m_tile_begin += m_tile_band) {
+        std::vector<PendingTile> pending;
+        const int m_tile_end = std::min(m_tiles, m_tile_begin + m_tile_band);
+        for (int m_tile = m_tile_begin; m_tile < m_tile_end; ++m_tile) {
+            for (int n_tile = 0; n_tile < n_tiles; ++n_tile) {
+                const int task_id = task_id_for_tile(n_tiles, m_tile, n_tile);
+                if ((task_id % ACTIVE_GEMM_CORES) != worker_slot) {
+                    continue;
+                }
+                const GemmTaskDescriptor task =
+                    gemm_task_desc_for_task(executor_core_id, task_id, *cfg);
+                const uint64_t tag = static_cast<uint64_t>(task_id) + 1;
+                const golem_status_t status = issue_sfu_softmax_tile(
+                    *cfg,
+                    executor_core_id,
+                    task,
+                    desc_gm,
+                    local_input_gm,
+                    local_output_gm,
+                    job_id,
+                    tag,
+                    &pending);
+                if (status != GOLEM_STATUS_OK) {
+                    return status;
+                }
             }
-            const GemmTaskDescriptor task = gemm_task_desc_for_task(executor_core_id, task_id, *cfg);
-
-            const uint32_t valid_m = static_cast<uint32_t>(task.block_m);
-            const uint32_t valid_n = static_cast<uint32_t>(task.block_n);
-            const uint64_t tile_bytes =
-                static_cast<uint64_t>(task.block_m) * static_cast<uint64_t>(task.block_n) * sizeof(float);
-
-            dma_remote_load_to_gm(executor_core_id, task.c_base_mm, local_input_gm, tile_bytes);
-
-            const SFUSoftmaxTileDesc desc = {
-                .job_id = job_id,
-                .local_input_gm_addr = local_input_gm,
-                .local_output_gm_addr = local_output_gm,
-                .global_m = static_cast<uint32_t>(cfg->m),
-                .global_n = static_cast<uint32_t>(cfg->n),
-                .block_m = static_cast<uint32_t>(task.block_m),
-                .block_n = static_cast<uint32_t>(task.block_n),
-                .m_tile = static_cast<uint32_t>(task.m_tile),
-                .n_tile = static_cast<uint32_t>(task.n_tile),
-                .valid_m = valid_m,
-                .valid_n = valid_n,
-                .n_tiles_per_row = static_cast<uint32_t>(n_tiles),
-                .elem_bytes = sizeof(float),
-                .flags = 0,
-            };
-            write_sfu_desc_to_gm(executor_core_id, desc_gm, desc);
-
-            const uint64_t tag = static_cast<uint64_t>(task_id) + 1;
-            sfu_softmax_tile(desc_gm, tag);
-            pending.push_back(PendingTile{
-                .tag = tag,
-                .output_hbm = task.c_base_mm,
-                .local_output_gm = local_output_gm,
-                .bytes = tile_bytes,
-            });
         }
-    }
 
-    for (const PendingTile& tile : pending) {
-        const uint64_t sfu_status = sfu_wait(tile.tag);
-        if (sfu_status != SFU_STATUS_SUCCESS) {
-            set_sfu_softmax_last_error("softmax SFU wait failed with status=%llu",
-                                       static_cast<unsigned long long>(sfu_status));
-            return GOLEM_STATUS_INTERNAL_ERROR;
+        const golem_status_t status = wait_and_store_pending_tiles(pending);
+        if (status != GOLEM_STATUS_OK) {
+            return status;
         }
-        set_len(tile.bytes);
-        remote_store(tile.local_output_gm, tile.output_hbm);
     }
 
     return GOLEM_STATUS_OK;
+}
+
+extern "C" golem_status_t golemRunStandaloneSoftmaxSfuForCore(
+    const golem_softmax_op_desc_t* op_desc,
+    int executor_core_id,
+    int worker_core_id,
+    const MatmulRuntimeConfig* cfg,
+    uint64_t job_id) {
+    return golemRunSoftmaxSfuForCore(op_desc, executor_core_id, worker_core_id, cfg, job_id);
 }
 
 extern "C" const char* golemSoftmaxSfuGetLastErrorString(void) {

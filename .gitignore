@@ -45,6 +45,7 @@ src/sst/elements/golem/tests/doc/node_modules/
 src/sst/elements/golem/tests/doc/package-lock.json
 src/sst/elements/golem/tests/small/mvm_noc_int_array/riscv64/test_noc_dma
 src/sst/elements/golem/tests/small/mvm_noc_int_array/riscv64/*.build.env
+src/sst/elements/golem/tests/small/mvm_noc_softmax_sfu/data/
 src/sst/elements/golem/tests/small/mvm_noc_softmax_sfu/riscv64/
 src/sst/elements/golem/tests/dramsim3*.txt
 src/sst/elements/golem/tests/dramsim3*.json

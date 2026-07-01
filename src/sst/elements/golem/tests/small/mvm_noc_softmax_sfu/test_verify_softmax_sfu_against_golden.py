@@ -74,6 +74,15 @@ class SoftmaxSfuGoldenCheckerTest(unittest.TestCase):
             f.write(pack_fp32(flatten(c_rows)))
         return a_path, b_path, c_path
 
+    def write_logits_case(self, tmpdir, logits_rows, c_rows):
+        logits_path = os.path.join(tmpdir, "logits.bin")
+        c_path = os.path.join(tmpdir, "c.bin")
+        with open(logits_path, "wb") as f:
+            f.write(pack_fp32(flatten(logits_rows)))
+        with open(c_path, "wb") as f:
+            f.write(pack_fp32(flatten(c_rows)))
+        return logits_path, c_path
+
     def run_checker(self, tmpdir, a_rows, b_rows, c_rows, extra_args=None):
         a_path, b_path, c_path = self.write_matrix_case(tmpdir, a_rows, b_rows, c_rows)
         return subprocess.run(
@@ -155,6 +164,56 @@ class SoftmaxSfuGoldenCheckerTest(unittest.TestCase):
             result = self.run_checker(tmpdir, a, b, c)
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_logits_reference_passes_for_standalone_softmax_input(self):
+        logits = [[1, 2, 3, 4], [4, 3, 2, 1]]
+        c = softmax_rows(logits)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            logits_path, c_path = self.write_logits_case(tmpdir, logits, c)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    CHECKER,
+                    "--a-file",
+                    os.path.join(tmpdir, "unused_a.bin"),
+                    "--b-file",
+                    os.path.join(tmpdir, "unused_b.bin"),
+                    "--c-file",
+                    c_path,
+                    "--logits-file",
+                    logits_path,
+                    "--reference",
+                    "logits",
+                    "--m",
+                    "2",
+                    "--n",
+                    "4",
+                    "--k",
+                    "1",
+                    "--block-m",
+                    "2",
+                    "--block-n",
+                    "2",
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("[VERIFY-SFU-SOFTMAX] PASS", result.stdout)
+        self.assertIn("reference=logits", result.stdout)
+
+    def test_logits_reference_requires_logits_file(self):
+        a = [[1, 0]]
+        b = [[1, 2, 3, 4], [0, 0, 0, 0]]
+        c = softmax_rows(matmul(a, b))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = self.run_checker(tmpdir, a, b, c, ["--reference", "logits"])
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--logits-file is required", result.stderr)
 
 
 if __name__ == "__main__":

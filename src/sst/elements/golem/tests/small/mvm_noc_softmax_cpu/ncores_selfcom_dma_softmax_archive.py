@@ -50,6 +50,18 @@ source = source.replace(
     '    "GOLEM_SFU_SKIP_SOFTMAX",\n]',
     1,
 )
+source = source.replace(
+    '    "GOLEM_SFU_SKIP_SOFTMAX",\n]',
+    '    "GOLEM_SFU_SKIP_SOFTMAX",\n'
+    '    "GOLEM_SFU_INTERLEAVE_GEMM",\n]',
+    1,
+)
+source = source.replace(
+    '    "GOLEM_SFU_INTERLEAVE_GEMM",\n]',
+    '    "GOLEM_SFU_INTERLEAVE_GEMM",\n'
+    '    "GOLEM_SFU_STANDALONE_SOFTMAX",\n]',
+    1,
+)
 
 globals_dict = {
     "__file__": ARCHIVE_SCRIPT,

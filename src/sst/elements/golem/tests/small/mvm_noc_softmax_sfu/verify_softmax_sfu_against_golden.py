@@ -152,9 +152,14 @@ def main(argv=None):
     )
     parser.add_argument(
         "--reference",
-        choices=["a_b", "probability"],
+        choices=["a_b", "probability", "logits"],
         default="a_b",
-        help="a_b compares against full row-wise softmax(A@B); probability checks each full row only",
+        help="a_b compares against softmax(A@B); logits compares against softmax(logits-file); probability checks each full row only",
+    )
+    parser.add_argument(
+        "--logits-file",
+        default="",
+        help="Standalone softmax logits file used when --reference=logits",
     )
     parser.add_argument("--bias-enable", type=int, default=0)
     parser.add_argument("--bias-value", type=float, default=0.0)
@@ -197,6 +202,28 @@ def main(argv=None):
         print(
             f"{PREFIX} PASS reference=probability dtype={dtype} checked={total} "
             f"bad_rows=0 max_row_sum_abs_diff={max_abs:.9g} "
+            f"atol={atol} rtol={rtol} block=({block_m},{block_n})"
+        )
+        return 0
+
+    if args.reference == "logits":
+        if not args.logits_file:
+            parser.error("--logits-file is required when --reference=logits")
+        logits = load_matrix(args.logits_file, args.m, args.n, "logits", dtype)
+        ref = full_rowwise_softmax(logits, args.m, args.n)
+        mismatches, max_abs = compare_matrices(
+            dtype, c, ref, args.m, args.n, atol, rtol, args.max_mismatches
+        )
+        if mismatches:
+            print(
+                f"{PREFIX} FAIL reference=logits dtype={dtype} checked={total} "
+                f"mismatches={mismatches} max_abs_diff={max_abs:.9g} "
+                f"atol={atol} rtol={rtol} block=({block_m},{block_n})"
+            )
+            return 1
+        print(
+            f"{PREFIX} PASS reference=logits dtype={dtype} checked={total} "
+            f"mismatches=0 max_abs_diff={max_abs:.9g} "
             f"atol={atol} rtol={rtol} block=({block_m},{block_n})"
         )
         return 0

@@ -94,6 +94,83 @@ int run_gemm_for_core(int executor_core_id, int worker_core_id, const golem_matm
     return 0;
 }
 
+int run_gemm_interleaved_sfu_for_core(int executor_core_id,
+                                      int worker_core_id,
+                                      const golem_matmul_op_desc_t& op_desc,
+                                      const golem_softmax_op_desc_t& softmax_desc,
+                                      const MatmulRuntimeConfig& cfg,
+                                      uint64_t job_id) {
+    if (op_desc.layout != GOLEM_LAYOUT_ROW_MAJOR ||
+        op_desc.transpose_a != 0 ||
+        op_desc.transpose_b != 0 ||
+        !validate_matmul_call(cfg)) {
+        std::fprintf(stderr, "[ERROR] invalid interleaved SFU GEMM op descriptor\n");
+        return 1;
+    }
+    if ((cfg.block_m % TILE_M) != 0 || (cfg.block_k % TILE_K) != 0 || cfg.block_n > TILE_N_MAX) {
+        std::fprintf(stderr, "[ERROR] unsupported interleaved SFU GEMM tile shape\n");
+        return 1;
+    }
+
+    const GemmTileRuntimeContext rt = make_gemm_runtime_context(executor_core_id);
+    const int total_tasks = gemm_total_tasks(cfg);
+    const int worker_slot = gemm_worker_slot_for_core(worker_core_id);
+    if (worker_slot < 0 || worker_slot >= total_tasks) {
+        return 0;
+    }
+
+    struct PendingTile {
+        uint64_t tag;
+        uint64_t output_hbm;
+        uint64_t local_output_gm;
+        uint64_t bytes;
+    };
+    std::vector<PendingTile> pending;
+
+    const uint64_t desc_gm = gm_addr(executor_core_id, LOCAL_LAYOUT.tmp);
+    GemmKernelStats stats = {};
+    for (int task_id = worker_slot; task_id < total_tasks; task_id += ACTIVE_GEMM_CORES) {
+        const GemmTaskDescriptor desc = gemm_descriptor_for_task(executor_core_id, task_id, cfg);
+        gemm_tiled<float>(executor_core_id, desc, rt, &stats);
+
+        const uint64_t tile_bytes =
+            static_cast<uint64_t>(desc.block_m) * static_cast<uint64_t>(desc.block_n) * sizeof(float);
+        const uint64_t tag = static_cast<uint64_t>(task_id) + 1;
+        const golem_status_t sfu_status = golemRunSoftmaxSfuTileFromLocalAccum(
+            &softmax_desc,
+            executor_core_id,
+            &cfg,
+            &desc,
+            rt.local_accum,
+            rt.local_out,
+            desc_gm,
+            job_id,
+            tag);
+        if (sfu_status != GOLEM_STATUS_OK) {
+            std::fprintf(stderr, "[SOFTMAX-SFU] local-accum issue failed on core %d task %d\n",
+                         worker_core_id, task_id);
+            return 1;
+        }
+        pending.push_back(PendingTile{
+            .tag = tag,
+            .output_hbm = desc.c_base_mm,
+            .local_output_gm = rt.local_out,
+            .bytes = tile_bytes,
+        });
+    }
+
+    for (const PendingTile& tile : pending) {
+        const golem_status_t wait_status = golemWaitSoftmaxSfuTileAndStore(
+            tile.tag, tile.local_output_gm, tile.output_hbm, tile.bytes);
+        if (wait_status != GOLEM_STATUS_OK) {
+            std::fprintf(stderr, "[SOFTMAX-SFU] local-accum wait failed on core %d\n",
+                         worker_core_id);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 int read_requested_core_from_argv(int argc, char* argv[]) {
     if (argc < 2) {
         return 0;
@@ -114,19 +191,6 @@ int run_riscv_gemm_softmax_sfu(int argc, char* argv[]) {
         return 1;
     }
 
-    int status = run_gemm_for_core(executor_core_id, requested_core_id, op_desc);
-    if (status != 0) {
-        return status;
-    }
-    const int64_t skip_softmax = read_i64_env_or_default("GOLEM_SFU_SKIP_SOFTMAX", 0);
-    if (skip_softmax != 0) {
-        if (requested_core_id == 0) {
-            std::printf("[SOFTMAX] mode=sfu-skip-softmax executor_core=%d\n", executor_core_id);
-            std::fflush(stdout);
-        }
-        return 0;
-    }
-
     const MatmulRuntimeConfig cfg = {
         .m = static_cast<int>(op_desc.m),
         .n = static_cast<int>(op_desc.n),
@@ -143,17 +207,57 @@ int run_riscv_gemm_softmax_sfu(int argc, char* argv[]) {
         .layout = GOLEM_LAYOUT_ROW_MAJOR,
     };
 
-    if (requested_core_id == 0) {
-        std::printf("[SOFTMAX] mode=sfu m=%d n=%d block_m=%d block_n=%d executor_core=%d\n",
-                    cfg.m, cfg.n, cfg.block_m, cfg.block_n, executor_core_id);
-        std::fflush(stdout);
-    }
-
     const uint64_t job_id =
         (static_cast<uint64_t>(cfg.m) << 48) ^
         (static_cast<uint64_t>(cfg.n) << 32) ^
         (static_cast<uint64_t>(cfg.block_m) << 16) ^
         static_cast<uint64_t>(cfg.block_n);
+
+    const int64_t standalone_softmax = read_i64_env_or_default("GOLEM_SFU_STANDALONE_SOFTMAX", 0);
+    if (standalone_softmax != 0) {
+        if (requested_core_id == 0) {
+            std::printf("[SOFTMAX] mode=sfu-standalone-softmax m=%d n=%d block_m=%d block_n=%d executor_core=%d\n",
+                        cfg.m, cfg.n, cfg.block_m, cfg.block_n, executor_core_id);
+            std::fflush(stdout);
+        }
+        const golem_status_t sfu_status = golemRunStandaloneSoftmaxSfuForCore(
+            &softmax_desc, executor_core_id, requested_core_id, &cfg, job_id);
+        if (sfu_status != GOLEM_STATUS_OK) {
+            std::fprintf(stderr, "[SOFTMAX-SFU] standalone failed on core %d\n", requested_core_id);
+            return 1;
+        }
+        return 0;
+    }
+
+    const int64_t interleave_gemm = read_i64_env_or_default("GOLEM_SFU_INTERLEAVE_GEMM", 0);
+    if (interleave_gemm != 0) {
+        if (requested_core_id == 0) {
+            std::printf("[SOFTMAX] mode=sfu-interleaved-local-accum m=%d n=%d block_m=%d block_n=%d executor_core=%d\n",
+                        cfg.m, cfg.n, cfg.block_m, cfg.block_n, executor_core_id);
+            std::fflush(stdout);
+        }
+        return run_gemm_interleaved_sfu_for_core(
+            executor_core_id, requested_core_id, op_desc, softmax_desc, cfg, job_id);
+    }
+
+    int status = run_gemm_for_core(executor_core_id, requested_core_id, op_desc);
+    if (status != 0) {
+        return status;
+    }
+    const int64_t skip_softmax = read_i64_env_or_default("GOLEM_SFU_SKIP_SOFTMAX", 0);
+    if (skip_softmax != 0) {
+        if (requested_core_id == 0) {
+            std::printf("[SOFTMAX] mode=sfu-skip-softmax executor_core=%d\n", executor_core_id);
+            std::fflush(stdout);
+        }
+        return 0;
+    }
+
+    if (requested_core_id == 0) {
+        std::printf("[SOFTMAX] mode=sfu m=%d n=%d block_m=%d block_n=%d executor_core=%d\n",
+                    cfg.m, cfg.n, cfg.block_m, cfg.block_n, executor_core_id);
+        std::fflush(stdout);
+    }
 
     const golem_status_t sfu_status = golemRunSoftmaxSfuForCore(
         &softmax_desc, executor_core_id, requested_core_id, &cfg, job_id);

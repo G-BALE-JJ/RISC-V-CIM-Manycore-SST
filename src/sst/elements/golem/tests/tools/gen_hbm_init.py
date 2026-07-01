@@ -32,6 +32,8 @@ from golem_dtype import (
 TESTS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ARTIFACT_ROOT = os.getenv("GOLEM_ARTIFACT_ROOT", os.path.join(TESTS_DIR, "artifacts"))
 HBM_DIR = os.getenv("GOLEM_HBM_DIR", os.path.join(ARTIFACT_ROOT, "hbm"))
+SFU_STANDALONE_SOFTMAX = int(os.getenv("GOLEM_SFU_STANDALONE_SOFTMAX", "0")) != 0
+SOFTMAX_LOGITS_FILE = os.getenv("GOLEM_SOFTMAX_LOGITS_FILE", "")
 HBM_DUMP_OUTPUT = os.getenv("GOLEM_HBM_DUMP_OUTPUT", "1").strip().lower() not in {
     "0",
     "false",
@@ -429,6 +431,37 @@ def _build_vector_tile(n_tile: int, k_tile: int, n_col: int, length: int):
     return [((seed + i) % 9) + 1 for i in range(length)]
 
 
+def _build_softmax_logits_matrix(rows: int, cols: int):
+    matrix = []
+    for r in range(rows):
+        row = []
+        for c in range(cols):
+            raw = ((r * 3 + c * 5 + (r // 7) * 11) % 31) - 15
+            row.append(cast_scalar(MATMUL_DTYPE, raw / 8.0))
+        matrix.append(row)
+    return matrix
+
+
+def _write_matrix_to_file(path: str, matrix):
+    flat = [value for row in matrix for value in row]
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    if path.endswith(".csv"):
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerows(matrix)
+    elif path.endswith(".npy"):
+        try:
+            import numpy as np
+        except ImportError as exc:
+            raise RuntimeError(
+                f"standalone softmax logits uses .npy but numpy is not available: {path}"
+            ) from exc
+        np.save(path, np.array(matrix, dtype=numpy_dtype_name(MATMUL_DTYPE)))
+    else:
+        with open(path, "wb") as f:
+            f.write(_pack_tensor_values(flat))
+
+
 def _load_matrix_from_file(path: str, rows: int, cols: int, tensor_name: str):
     if not path:
         return None
@@ -549,6 +582,42 @@ def _load_bias_vector_from_file(path: str, length: int):
     return [cast_scalar(MATMUL_DTYPE, v) for v in values]
 
 
+def _write_standalone_softmax_logits(node_buffers, logits_matrix):
+    out_tile_bytes = BLOCK_M * BLOCK_N * elem_nbytes(MATMUL_DTYPE)
+    for task_id in range(TOTAL_GEMM_TASKS):
+        m_tile = task_id // GEMM_N_TILES
+        n_tile = task_id % GEMM_N_TILES
+        m_group = m_tile // B_REUSE_M_TILES
+        n_group = n_tile // A_REUSE_N_TILES
+        m_offset = m_tile % B_REUSE_M_TILES
+        n_offset = n_tile % A_REUSE_N_TILES
+        macro_task_id = _macro_task_for_group(m_group, n_group)
+        node_idx = _data_node_for_task(macro_task_id)
+        task_slot = _task_slot_in_node(macro_task_id)
+        reuse_offset = m_offset * VEC_REUSE_SLOTS + n_offset
+        tile_off = OFF_GEMM_OUT_BASE + (task_slot * OUT_REUSE_SLOTS + reuse_offset) * GEMM_OUT_STRIDE_MM
+
+        tile = [cast_scalar(MATMUL_DTYPE, 0) for _ in range(BLOCK_M * BLOCK_N)]
+        for r in range(BLOCK_M):
+            for cc in range(BLOCK_N):
+                global_m = m_tile * BLOCK_M + r
+                global_n = n_tile * BLOCK_N + cc
+                tile[cc * BLOCK_M + r] = cast_scalar(
+                    MATMUL_DTYPE, logits_matrix[global_m][global_n]
+                )
+        tile_data = _pack_tensor_values(tile)
+        if len(tile_data) != out_tile_bytes:
+            raise ValueError(
+                f"standalone softmax logits tile size mismatch: expected {out_tile_bytes}, got {len(tile_data)}"
+            )
+        _write_block(
+            node_buffers[node_idx],
+            tile_off,
+            tile_data,
+            f"softmax_logits_m{m_tile}_n{n_tile}_node{node_idx}",
+        )
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Generate HBM init files for GOLEM matmul"
@@ -567,6 +636,11 @@ def main(argv=None):
         "--bias-file",
         default=os.getenv("GOLEM_BIAS_FILE", ""),
         help="Optional bias vector file (.bin/.csv/.npy), length should be GEMM_N",
+    )
+    parser.add_argument(
+        "--softmax-logits-file",
+        default=SOFTMAX_LOGITS_FILE,
+        help="Optional standalone softmax logits file (.bin/.csv/.npy), shape=GEMM_MxGEMM_N",
     )
     parser.add_argument(
         "--pool1-file",
@@ -744,6 +818,7 @@ def main(argv=None):
     a_matrix = _load_matrix_from_file(args.a_file, GEMM_M, GEMM_K, "A")
     b_matrix = _load_matrix_from_file(args.b_file, GEMM_K, GEMM_N, "B")
     bias_vec = _load_bias_vector_from_file(args.bias_file, GEMM_N)
+    softmax_logits = None
     bias_enabled = int(os.getenv("GOLEM_BIAS_ENABLE", "0")) != 0
     bias_value = parse_scalar_text(MATMUL_DTYPE, os.getenv("GOLEM_BIAS_VALUE", "0"))
 
@@ -754,6 +829,20 @@ def main(argv=None):
         print(f"Using external tensor files: A={args.a_file}, B={args.b_file}")
     else:
         print("Using synthetic matrix/vector seed data (no --a-file/--b-file)")
+
+    if SFU_STANDALONE_SOFTMAX:
+        if args.softmax_logits_file and os.path.exists(args.softmax_logits_file):
+            softmax_logits = _load_matrix_from_file(
+                args.softmax_logits_file, GEMM_M, GEMM_N, "standalone softmax logits"
+            )
+            print(f"Using standalone softmax logits file: {args.softmax_logits_file}")
+        else:
+            softmax_logits = _build_softmax_logits_matrix(GEMM_M, GEMM_N)
+            if args.softmax_logits_file:
+                _write_matrix_to_file(args.softmax_logits_file, softmax_logits)
+                print(f"Generated standalone softmax logits file: {args.softmax_logits_file}")
+            else:
+                print("Using synthetic standalone softmax logits without file export")
 
     if bias_enabled and bias_vec is None:
         print(
@@ -1006,6 +1095,10 @@ def main(argv=None):
                 bias_data,
                 f"bias_node{node_idx}",
             )
+
+    if softmax_logits is not None:
+        _write_standalone_softmax_logits(node_buffers, softmax_logits)
+        print("Preloaded standalone softmax logits into GEMM C tile region")
 
     for node_idx in DATA_NODE_IDS:
         init_file = os.path.join(HBM_DIR, f"hbm_init_node{node_idx}.bin")

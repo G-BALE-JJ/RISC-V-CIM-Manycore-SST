@@ -36,6 +36,30 @@ golem_status_t golemRunSoftmaxSfuForCore(
     const MatmulRuntimeConfig* cfg,
     uint64_t job_id);
 
+golem_status_t golemRunStandaloneSoftmaxSfuForCore(
+    const golem_softmax_op_desc_t* op_desc,
+    int executor_core_id,
+    int worker_core_id,
+    const MatmulRuntimeConfig* cfg,
+    uint64_t job_id);
+
+golem_status_t golemRunSoftmaxSfuTileFromLocalAccum(
+    const golem_softmax_op_desc_t* op_desc,
+    int executor_core_id,
+    const MatmulRuntimeConfig* cfg,
+    const GemmTaskDescriptor* task,
+    uint64_t local_accum_gm,
+    uint64_t local_output_gm,
+    uint64_t desc_gm,
+    uint64_t job_id,
+    uint64_t tag);
+
+golem_status_t golemWaitSoftmaxSfuTileAndStore(
+    uint64_t tag,
+    uint64_t local_output_gm,
+    uint64_t output_hbm,
+    uint64_t bytes);
+
 #ifdef __cplusplus
 }
 #endif

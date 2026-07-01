@@ -106,6 +106,62 @@ class SfuSoftmaxPipelineWrapperTest(unittest.TestCase):
         self.assertNotIn("Unknown option: --group-manager-enable", result.stdout)
         self.assertNotIn("Unknown option: --ctrl-link-enable", result.stdout)
 
+    def test_wrapper_exports_interleaved_experiment_knob(self):
+        result = self.run_wrapper("--group-manager-enable", "0", "--ctrl-link-enable", "0")
+        source = self.read_wrapper()
+        with open(
+            os.path.join(SCRIPT_DIR, "..", "mvm_noc_softmax_cpu", "ncores_selfcom_dma_softmax_archive.py"),
+            "r",
+            encoding="utf-8",
+        ) as archive_file:
+            archive_source = archive_file.read()
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn('GOLEM_SFU_INTERLEAVE_GEMM="${GOLEM_SFU_INTERLEAVE_GEMM:-0}"', source)
+        self.assertIn("GOLEM_SFU_INTERLEAVE_GEMM", result.stdout)
+        self.assertIn("GOLEM_SFU_INTERLEAVE_GEMM", source)
+        self.assertIn('"GOLEM_SFU_INTERLEAVE_GEMM"', archive_source)
+
+    def test_wrapper_exports_standalone_softmax_knob_and_logits_file(self):
+        result = self.run_wrapper(
+            "--group-manager-enable",
+            "0",
+            "--ctrl-link-enable",
+            "0",
+            "--softmax-logits-file",
+            os.path.join(SCRIPT_DIR, "data", "standalone_logits.bin"),
+        )
+        source = self.read_wrapper()
+        with open(
+            os.path.join(SCRIPT_DIR, "..", "mvm_noc_softmax_cpu", "ncores_selfcom_dma_softmax_archive.py"),
+            "r",
+            encoding="utf-8",
+        ) as archive_file:
+            archive_source = archive_file.read()
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn('GOLEM_SFU_STANDALONE_SOFTMAX="${GOLEM_SFU_STANDALONE_SOFTMAX:-0}"', source)
+        self.assertIn('GOLEM_SOFTMAX_LOGITS_FILE="${GOLEM_SOFTMAX_LOGITS_FILE:-}"', source)
+        self.assertIn("--softmax-logits-file", source)
+        self.assertIn("GOLEM_SFU_STANDALONE_SOFTMAX", result.stdout)
+        self.assertIn("GOLEM_SOFTMAX_LOGITS_FILE", result.stdout)
+        self.assertIn("GOLEM_SFU_STANDALONE_SOFTMAX", source)
+        self.assertIn('"GOLEM_SFU_STANDALONE_SOFTMAX"', archive_source)
+
+    def test_wrapper_uses_logits_golden_for_standalone_softmax(self):
+        source = self.read_wrapper()
+
+        self.assertIn("GOLEM_SFU_STANDALONE_SOFTMAX", source)
+        self.assertIn('GOLEM_SOFTMAX_VERIFY_REFERENCE="logits"', source)
+        self.assertIn("--logits-file", source)
+        self.assertIn("$GOLEM_SOFTMAX_LOGITS_FILE", source)
+
+    def test_wrapper_normalizes_relative_softmax_logits_file_to_script_dir(self):
+        source = self.read_wrapper()
+
+        self.assertIn("normalize_path_under_script_dir", source)
+        self.assertIn('GOLEM_SOFTMAX_LOGITS_FILE="$(normalize_path_under_script_dir "$GOLEM_SOFTMAX_LOGITS_FILE")"', source)
+
 
 if __name__ == "__main__":
     unittest.main()
