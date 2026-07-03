@@ -3,10 +3,12 @@
 ## 当前状态
 
 - 已实现独立 `golem.SFU` 子组件，并通过 `GOLEM_SFU_ENABLE` 默认关闭地挂载到 RoCC。
-- 当前对 workload 暴露的是 fused full row-wise softmax，不是 standalone primitive。
+- 当前对 workload 暴露 fused full row-wise softmax，以及 standalone unary primitive
+  最小集合：`EXP`、`LOG`、`RECIPROCAL`。
 - fused softmax 已通过 `64x64`、`128x128`、`256x256` golden checker。
 - 旧 GEMM smoke 在不设置 `GOLEM_SFU_ENABLE` 时已验证通过。
-- 下一步是 `512x512` 压力验证，以及 Phase 9 通用 SFU standalone primitive ABI。
+- 下一步是 Phase 9C 扩展 `RSQRT`、`TANH`、`SIGMOID`，以及继续评估 fused
+  GEMM+softmax 的数据通路优化。
 
 ## 总目标
 
@@ -579,21 +581,26 @@ GOLEM_ROCC_FUNC7_SFU_PRIMITIVE_WAIT = 0x1a;
 
 ### 分阶段实施建议
 
-- [ ] Phase 9A：只加 ABI 和测试，不改数学实现。
+- [x] Phase 9A：只加 ABI 和测试，不改数学实现。
   - 在 `sfu.h` 中定义 `SFUPrimitiveDesc` 和 `SFUPrimitiveOp`。
   - 在 RISC-V `ex_instr.h` 中新增 primitive wrapper。
   - 加 static/assert 测试，固定 descriptor size、offset、op 编码。
-- [ ] Phase 9B：实现 unary primitive 最小集合。
+- [x] Phase 9B：实现 unary primitive 最小集合。
   - 先实现 `EXP`、`RECIPROCAL`、`LOG`。
   - 输入输出都在 local GM，元素类型先只支持 fp32。
-  - checker 使用 Python `math`/NumPy golden 比较。
-- [ ] Phase 9C：实现 `RSQRT`、`TANH`、`SIGMOID`。
+  - 组件单测和 RISC-V primitive smoke 使用 `math` golden 比较。
+- [x] Phase 9C：实现 `RSQRT`、`TANH`、`SIGMOID`。
   - 允许后续通过 `approx_mode` 切换精确数学库和近似 LUT/多项式模型。
   - 统计项区分 exact/approx primitive latency。
-- [ ] Phase 9D：实现 reduction primitive。
+- [x] Phase 9D：实现最小 HBM streaming primitive benchmark。
+  - 先覆盖 `EXP`，执行 HBM C region read -> local GM -> SFU primitive ->
+    HBM writeback。
+  - 统计 guest `hbm_read_bytes/hbm_write_bytes`，并对照 DMA summary 与
+    `sfu_primitive_elems`。
+- [ ] Phase 9E：实现 reduction primitive。
   - `REDUCE_MAX` 和 `REDUCE_SUM` 先支持单 local buffer。
   - 后续再考虑跨 core reducer，与 fused softmax 的 reducer state 复用。
-- [ ] Phase 9E：把 fused softmax 可选拆解为 primitive pipeline 对照测试。
+- [ ] Phase 9F：把 fused softmax 可选拆解为 primitive pipeline 对照测试。
   - 保留 fused softmax 快路径。
   - 新增一个 debug workload：`reduce_max -> exp -> reduce_sum -> reciprocal -> normalize`。
   - 用它对照 fused softmax 的数值和事件统计。

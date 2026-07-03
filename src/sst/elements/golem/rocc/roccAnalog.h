@@ -57,6 +57,10 @@ constexpr uint8_t GOLEM_ROCC_FUNC7_WCP_START = 0x15;
 constexpr uint8_t GOLEM_ROCC_FUNC7_WCP_WAIT = 0x16;
 constexpr uint8_t GOLEM_ROCC_FUNC7_SFU_SOFTMAX_TILE = 0x17;
 constexpr uint8_t GOLEM_ROCC_FUNC7_SFU_WAIT = 0x18;
+constexpr uint8_t GOLEM_ROCC_FUNC7_SFU_PRIMITIVE = 0x19;
+constexpr uint8_t GOLEM_ROCC_FUNC7_SFU_PRIMITIVE_WAIT = 0x1a;
+constexpr uint8_t GOLEM_ROCC_FUNC7_SFU_PRIMITIVE_BATCH = 0x1b;
+constexpr uint8_t GOLEM_ROCC_FUNC7_SFU_PRIMITIVE_BATCH_WAIT = 0x1c;
 
 template <typename T>
 class RoCCAnalog : public SST::Vanadis::VanadisRoCCInterface {
@@ -531,6 +535,34 @@ public:
             if (next_cmd != nullptr && next_cmd->inst != nullptr && next_cmd->inst->func7 == GOLEM_ROCC_FUNC7_SFU_WAIT) {
                 roccCmd_q.pop_front();
                 if (!tryWaitSfuCommand(next_cmd)) {
+                    roccCmd_q.push_front(next_cmd);
+                }
+                return;
+            }
+            if (next_cmd != nullptr && next_cmd->inst != nullptr && next_cmd->inst->func7 == GOLEM_ROCC_FUNC7_SFU_PRIMITIVE) {
+                roccCmd_q.pop_front();
+                if (!tryIssueSfuPrimitiveCommand(next_cmd)) {
+                    roccCmd_q.push_front(next_cmd);
+                }
+                return;
+            }
+            if (next_cmd != nullptr && next_cmd->inst != nullptr && next_cmd->inst->func7 == GOLEM_ROCC_FUNC7_SFU_PRIMITIVE_WAIT) {
+                roccCmd_q.pop_front();
+                if (!tryWaitSfuPrimitiveCommand(next_cmd)) {
+                    roccCmd_q.push_front(next_cmd);
+                }
+                return;
+            }
+            if (next_cmd != nullptr && next_cmd->inst != nullptr && next_cmd->inst->func7 == GOLEM_ROCC_FUNC7_SFU_PRIMITIVE_BATCH) {
+                roccCmd_q.pop_front();
+                if (!tryIssueSfuPrimitiveBatchCommand(next_cmd)) {
+                    roccCmd_q.push_front(next_cmd);
+                }
+                return;
+            }
+            if (next_cmd != nullptr && next_cmd->inst != nullptr && next_cmd->inst->func7 == GOLEM_ROCC_FUNC7_SFU_PRIMITIVE_BATCH_WAIT) {
+                roccCmd_q.pop_front();
+                if (!tryWaitSfuPrimitiveBatchCommand(next_cmd)) {
                     roccCmd_q.push_front(next_cmd);
                 }
                 return;
@@ -1010,6 +1042,52 @@ public:
             cmd->inst->rd, status, cmd->cmd_id, cmd->hw_thread));
         delete cmd;
         return true;
+    }
+
+    bool tryIssueSfuPrimitiveCommand(SST::Vanadis::RoCCCommand* cmd) {
+        if (cmd == nullptr || cmd->inst == nullptr) {
+            return true;
+        }
+        if (sfu == nullptr) {
+            enqueueResponse(new SST::Vanadis::RoCCResponse(
+                cmd->inst->rd, 1, cmd->cmd_id, cmd->hw_thread));
+            delete cmd;
+            return true;
+        }
+        if (!sfu->issuePrimitive(cmd->rs1, cmd->rs2)) {
+            return false;
+        }
+        enqueueResponse(new SST::Vanadis::RoCCResponse(
+            cmd->inst->rd, 0, cmd->cmd_id, cmd->hw_thread));
+        delete cmd;
+        return true;
+    }
+
+    bool tryWaitSfuPrimitiveCommand(SST::Vanadis::RoCCCommand* cmd) {
+        return tryWaitSfuCommand(cmd);
+    }
+
+    bool tryIssueSfuPrimitiveBatchCommand(SST::Vanadis::RoCCCommand* cmd) {
+        if (cmd == nullptr || cmd->inst == nullptr) {
+            return true;
+        }
+        if (sfu == nullptr) {
+            enqueueResponse(new SST::Vanadis::RoCCResponse(
+                cmd->inst->rd, 1, cmd->cmd_id, cmd->hw_thread));
+            delete cmd;
+            return true;
+        }
+        if (!sfu->issuePrimitiveBatch(cmd->rs1, cmd->rs2)) {
+            return false;
+        }
+        enqueueResponse(new SST::Vanadis::RoCCResponse(
+            cmd->inst->rd, 0, cmd->cmd_id, cmd->hw_thread));
+        delete cmd;
+        return true;
+    }
+
+    bool tryWaitSfuPrimitiveBatchCommand(SST::Vanadis::RoCCCommand* cmd) {
+        return tryWaitSfuCommand(cmd);
     }
 
     bool isArrayComputeInflight(uint32_t array_id) const {

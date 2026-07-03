@@ -23,8 +23,12 @@ class SfuWorkloadScaffoldTest(unittest.TestCase):
         text = read_local("ex_instr.h")
         self.assertIn("GOLEM_ROCC_FUNC7_SFU_SOFTMAX_TILE = 0x17", text)
         self.assertIn("GOLEM_ROCC_FUNC7_SFU_WAIT = 0x18", text)
+        self.assertIn("GOLEM_ROCC_FUNC7_SFU_PRIMITIVE = 0x19", text)
+        self.assertIn("GOLEM_ROCC_FUNC7_SFU_PRIMITIVE_WAIT = 0x1a", text)
         self.assertIn("sfu_softmax_tile", text)
         self.assertIn("sfu_wait", text)
+        self.assertIn("sfu_primitive", text)
+        self.assertIn("sfu_primitive_wait", text)
         self.assertIn(".insn r 0x0b, 7", text)
 
     def test_runtime_header_declares_descriptor_and_entry_point(self):
@@ -33,6 +37,17 @@ class SfuWorkloadScaffoldTest(unittest.TestCase):
         self.assertIn("golemRunSoftmaxSfuForCore", text)
         self.assertIn("job_id", text)
         self.assertIn("n_tiles_per_row", text)
+
+    def test_runtime_header_declares_primitive_descriptor_for_guest(self):
+        text = read_local("golem_softmax_sfu_runtime.h")
+        self.assertIn("enum class SFUPrimitiveOp", text)
+        self.assertIn("EXP = 0x01", text)
+        self.assertIn("LOG = 0x02", text)
+        self.assertIn("RECIPROCAL = 0x03", text)
+        self.assertIn("struct SFUPrimitiveDesc", text)
+        self.assertIn("input0_gm_addr", text)
+        self.assertIn("output_gm_addr", text)
+        self.assertRegex(text, r"static_assert\s*\(\s*sizeof\s*\(\s*SFUPrimitiveDesc\s*\)\s*==\s*64")
 
     def test_runtime_uses_existing_dma_and_two_phase_issue_wait(self):
         text = read_local("golem_softmax_sfu_runtime.cpp")
@@ -126,6 +141,108 @@ class SfuWorkloadScaffoldTest(unittest.TestCase):
             entry_source.index("run_gemm_for_core(executor_core_id, requested_core_id, op_desc)"),
         )
 
+    def test_workload_has_local_gm_primitive_smoke_before_softmax_modes(self):
+        entry_source = read_local("test_noc_dma_softmax_sfu.cpp")
+        wrapper_source = read_local("run_noc_dma_softmax_sfu_pipeline.sh")
+
+        self.assertIn('read_i64_env_or_default("GOLEM_SFU_PRIMITIVE_SMOKE", 0)', entry_source)
+        self.assertIn("mode=sfu-primitive-smoke", entry_source)
+        self.assertIn("run_sfu_primitive_smoke_for_core", entry_source)
+        self.assertIn("sfu_primitive(", entry_source)
+        self.assertIn("sfu_primitive_wait", entry_source)
+        self.assertIn("SFUPrimitiveOp::EXP", entry_source)
+        self.assertIn("SFUPrimitiveOp::LOG", entry_source)
+        self.assertIn("SFUPrimitiveOp::RECIPROCAL", entry_source)
+        self.assertIn("SFUPrimitiveOp::RSQRT", entry_source)
+        self.assertIn("SFUPrimitiveOp::TANH", entry_source)
+        self.assertIn("SFUPrimitiveOp::SIGMOID", entry_source)
+        self.assertIn("EXP,LOG,RECIPROCAL,RSQRT,TANH,SIGMOID", entry_source)
+        self.assertLess(
+            entry_source.index('read_i64_env_or_default("GOLEM_SFU_PRIMITIVE_SMOKE", 0)'),
+            entry_source.index('read_i64_env_or_default("GOLEM_SFU_STANDALONE_SOFTMAX", 0)'),
+        )
+        self.assertIn("GOLEM_SFU_PRIMITIVE_SMOKE", wrapper_source)
+        self.assertIn("export GOLEM_SFU_PRIMITIVE_SMOKE", wrapper_source)
+
+    def test_primitive_smoke_can_scale_total_elements_with_chunking(self):
+        entry_source = read_local("test_noc_dma_softmax_sfu.cpp")
+        wrapper_source = read_local("run_noc_dma_softmax_sfu_pipeline.sh")
+
+        self.assertIn('read_i64_env_or_default("GOLEM_SFU_PRIMITIVE_SMOKE_ELEMS", 4)', entry_source)
+        self.assertIn('read_i64_env_or_default("GOLEM_SFU_PRIMITIVE_SMOKE_CHUNK_ELEMS", 0)', entry_source)
+        self.assertIn("primitive_smoke_chunk_elems", entry_source)
+        self.assertIn("kPrimitiveDefaultChunkElems", entry_source)
+        self.assertIn("set_len(chunk_bytes)", entry_source)
+        self.assertIn("mm2gm", entry_source)
+        self.assertIn("gm2mm", entry_source)
+        self.assertIn("total_elems", entry_source)
+        self.assertIn("chunk_elems", entry_source)
+        self.assertIn("chunks", entry_source)
+        self.assertIn("processed_elems", entry_source)
+        self.assertIn("kPrimitiveFlagRepeatChunk", entry_source)
+        self.assertIn(".input1_gm_addr = processed_elem_count", entry_source)
+        self.assertIn(".flags = primitive_flags_for_processed_elems", entry_source)
+        self.assertIn("GOLEM_SFU_PRIMITIVE_SMOKE_ELEMS", wrapper_source)
+        self.assertIn("export GOLEM_SFU_PRIMITIVE_SMOKE_ELEMS", wrapper_source)
+        self.assertIn("GOLEM_SFU_PRIMITIVE_SMOKE_CHUNK_ELEMS", wrapper_source)
+        self.assertIn("export GOLEM_SFU_PRIMITIVE_SMOKE_CHUNK_ELEMS", wrapper_source)
+
+    def test_workload_has_hbm_streaming_primitive_benchmark_before_local_smoke(self):
+        entry_source = read_local("test_noc_dma_softmax_sfu.cpp")
+        wrapper_source = read_local("run_noc_dma_softmax_sfu_pipeline.sh")
+
+        self.assertIn('read_i64_env_or_default("GOLEM_SFU_PRIMITIVE_HBM_STREAM", 0)', entry_source)
+        self.assertIn('read_i64_env_or_default("GOLEM_SFU_PRIMITIVE_HBM_ELEMS", 64)', entry_source)
+        self.assertIn('read_i64_env_or_default("GOLEM_SFU_PRIMITIVE_HBM_CHUNK_ELEMS", 0)', entry_source)
+        self.assertIn("run_sfu_primitive_hbm_stream_for_core", entry_source)
+        self.assertIn("mode=sfu-primitive-hbm-stream", entry_source)
+        self.assertIn("dma_remote_load_to_gm(executor_core_id,", entry_source)
+        self.assertIn("remote_store(", entry_source)
+        self.assertIn("hbm_read_bytes", entry_source)
+        self.assertIn("hbm_write_bytes", entry_source)
+        self.assertIn("SFUPrimitiveOp::EXP", entry_source)
+        self.assertLess(
+            entry_source.index('read_i64_env_or_default("GOLEM_SFU_PRIMITIVE_HBM_STREAM", 0)'),
+            entry_source.index('read_i64_env_or_default("GOLEM_SFU_PRIMITIVE_SMOKE", 0)'),
+        )
+        for knob in (
+            "GOLEM_SFU_PRIMITIVE_HBM_STREAM",
+            "GOLEM_SFU_PRIMITIVE_HBM_ELEMS",
+            "GOLEM_SFU_PRIMITIVE_HBM_CHUNK_ELEMS",
+        ):
+            self.assertIn(knob, wrapper_source)
+            self.assertIn(f"export {knob}", wrapper_source)
+
+    def test_hbm_streaming_primitive_supports_configurable_multi_op_list(self):
+        entry_source = read_local("test_noc_dma_softmax_sfu.cpp")
+        wrapper_source = read_local("run_noc_dma_softmax_sfu_pipeline.sh")
+
+        self.assertIn('read_string_env_or_default("GOLEM_SFU_PRIMITIVE_HBM_OPS", "EXP")', entry_source)
+        self.assertIn("parse_sfu_primitive_hbm_ops", entry_source)
+        self.assertIn("primitive_op_name", entry_source)
+        self.assertIn("input_hbm_base", entry_source)
+        self.assertIn("hbm_init_write_bytes", entry_source)
+        self.assertIn("ops=", entry_source)
+        for op_name in ("EXP", "LOG", "RECIPROCAL", "RSQRT", "TANH", "SIGMOID"):
+            self.assertIn(f'"{op_name}"', entry_source)
+        self.assertIn("GOLEM_SFU_PRIMITIVE_HBM_OPS", wrapper_source)
+        self.assertIn("export GOLEM_SFU_PRIMITIVE_HBM_OPS", wrapper_source)
+
+    def test_hbm_streaming_primitive_supports_batch_mode(self):
+        entry_source = read_local("test_noc_dma_softmax_sfu.cpp")
+        wrapper_source = read_local("run_noc_dma_softmax_sfu_pipeline.sh")
+        ex_instr_source = read_local("ex_instr.h")
+
+        self.assertIn('read_i64_env_or_default("GOLEM_SFU_PRIMITIVE_HBM_BATCH", 0)', entry_source)
+        self.assertIn("run_hbm_stream_sfu_primitive_batch_case", entry_source)
+        self.assertIn("sfu_primitive_batch(", entry_source)
+        self.assertIn("sfu_primitive_batch_wait", entry_source)
+        self.assertIn("SFUPrimitiveBatchDesc", entry_source)
+        self.assertIn("GOLEM_SFU_PRIMITIVE_HBM_BATCH", wrapper_source)
+        self.assertIn("export GOLEM_SFU_PRIMITIVE_HBM_BATCH", wrapper_source)
+        self.assertIn("GOLEM_ROCC_FUNC7_SFU_PRIMITIVE_BATCH", ex_instr_source)
+        self.assertIn("GOLEM_ROCC_FUNC7_SFU_PRIMITIVE_BATCH_WAIT", ex_instr_source)
+
     def test_standalone_softmax_uses_row_band_issue_wait_window(self):
         runtime_source = read_local("golem_softmax_sfu_runtime.cpp")
         body_match = re.search(
@@ -158,6 +275,16 @@ class SfuWorkloadScaffoldTest(unittest.TestCase):
         self.assertIn("GEMM_OUT_STRIDE_MM", source)
         self.assertIn("macro_task_id = _macro_task_for_group(m_group, n_group)", source)
         self.assertIn("cc * BLOCK_M + r", source)
+
+    def test_hbm_generator_preloads_safe_primitive_stream_inputs(self):
+        source = read_repo_relative("../../tools/gen_hbm_init.py")
+
+        self.assertIn("GOLEM_SFU_PRIMITIVE_HBM_STREAM", source)
+        self.assertIn("_write_sfu_primitive_hbm_input", source)
+        self.assertIn("_sfu_primitive_hbm_input_value", source)
+        self.assertIn("Preloaded SFU primitive HBM stream input", source)
+        self.assertIn("OFF_GEMM_OUT_BASE", source)
+        self.assertIn("GEMM_OUT_STRIDE_MM", source)
 
     def test_explicit_gemm_baseline_keeps_columns_independent_on_single_array_path(self):
         text = read_repo_relative("../mvm_noc_int_array/gemm_matmul_op.h")

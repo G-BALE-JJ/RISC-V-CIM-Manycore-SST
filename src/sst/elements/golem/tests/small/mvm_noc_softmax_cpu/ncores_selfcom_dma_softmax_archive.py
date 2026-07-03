@@ -62,6 +62,24 @@ source = source.replace(
     '    "GOLEM_SFU_STANDALONE_SOFTMAX",\n]',
     1,
 )
+source = source.replace(
+    '    "GOLEM_SFU_STANDALONE_SOFTMAX",\n]',
+    '    "GOLEM_SFU_STANDALONE_SOFTMAX",\n'
+    '    "GOLEM_SFU_PRIMITIVE_HBM_STREAM",\n'
+    '    "GOLEM_SFU_PRIMITIVE_HBM_ELEMS",\n'
+    '    "GOLEM_SFU_PRIMITIVE_HBM_CHUNK_ELEMS",\n'
+    '    "GOLEM_SFU_PRIMITIVE_HBM_OPS",\n'
+    '    "GOLEM_SFU_PRIMITIVE_HBM_BATCH",\n'
+    '    "GOLEM_SFU_PRIMITIVE_SMOKE",\n]',
+    1,
+)
+source = source.replace(
+    '    "GOLEM_SFU_PRIMITIVE_SMOKE",\n]',
+    '    "GOLEM_SFU_PRIMITIVE_SMOKE",\n'
+    '    "GOLEM_SFU_PRIMITIVE_SMOKE_ELEMS",\n'
+    '    "GOLEM_SFU_PRIMITIVE_SMOKE_CHUNK_ELEMS",\n]',
+    1,
+)
 
 globals_dict = {
     "__file__": ARCHIVE_SCRIPT,

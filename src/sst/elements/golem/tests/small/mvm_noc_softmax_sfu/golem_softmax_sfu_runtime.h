@@ -25,6 +25,50 @@ struct SFUSoftmaxTileDesc {
 static_assert(sizeof(SFUSoftmaxTileDesc) == 72,
               "SFUSoftmaxTileDesc ABI must match golem.SFU");
 
+enum class SFUPrimitiveOp : uint32_t {
+    EXP = 0x01,
+    LOG = 0x02,
+    RECIPROCAL = 0x03,
+    RSQRT = 0x04,
+    SQRT = 0x05,
+    TANH = 0x06,
+    SIGMOID = 0x07,
+    REDUCE_MAX = 0x20,
+    REDUCE_SUM = 0x21,
+    GELU = 0x40,
+    LAYERNORM = 0x41,
+    FUSED_SOFTMAX = 0x80,
+};
+
+struct SFUPrimitiveDesc {
+    uint64_t job_id;
+    uint64_t input0_gm_addr;
+    uint64_t input1_gm_addr;
+    uint64_t output_gm_addr;
+    uint32_t op;
+    uint32_t dtype;
+    uint32_t elem_count;
+    uint32_t input0_stride_bytes;
+    uint32_t input1_stride_bytes;
+    uint32_t output_stride_bytes;
+    uint32_t flags;
+    uint32_t approx_mode;
+};
+
+static_assert(sizeof(SFUPrimitiveDesc) == 64,
+              "SFUPrimitiveDesc ABI must match golem.SFU");
+
+struct SFUPrimitiveBatchDesc {
+    uint64_t job_id;
+    uint64_t desc_array_gm_addr;
+    uint32_t desc_count;
+    uint32_t flags;
+    uint64_t reserved0;
+};
+
+static_assert(sizeof(SFUPrimitiveBatchDesc) == 32,
+              "SFUPrimitiveBatchDesc ABI must match golem.SFU");
+
 #ifdef __cplusplus
 extern "C" {
 #endif

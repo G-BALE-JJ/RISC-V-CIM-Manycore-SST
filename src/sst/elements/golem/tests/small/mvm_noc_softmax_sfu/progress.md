@@ -175,3 +175,368 @@ live in `design.md`, `implementation_plan.md`, and `findings.md`.
   - 结论：standalone softmax 的 1024 慢点已确认并修复为 SFU issue/wait 调度问题；
     必要 HBM read/write 数据量本身不是半小时级仿真的根因。下一步可以开始
     standalone primitive ABI：`EXP`、`LOG`、`RECIPROCAL`。
+
+## 2026-07-02
+
+- 完成 Phase 9A standalone primitive ABI 骨架：
+  - 在 `sfu.h` 中新增 `SFUPrimitiveOp` 和 64 字节 `SFUPrimitiveDesc` ABI。
+  - 在 `roccAnalog.h` 中预留 primitive func7：`0x19/0x1a`。
+  - 在 `ex_instr.h` 中新增 `sfu_primitive` 和 `sfu_primitive_wait` guest wrapper。
+  - 新增/更新静态 scaffold tests，固定 descriptor 字段、op 编码和 func7/wrapper。
+- Phase 9A 当前只固定接口，不实现 primitive 数学执行，也未接 RoCC primitive dispatch。
+- 验证：
+  - RED：新增测试初始失败于缺少 `SFUPrimitiveOp`、`SFUPrimitiveDesc`、
+    `GOLEM_ROCC_FUNC7_SFU_PRIMITIVE` 和 guest primitive wrapper。
+  - GREEN：`python3 -m unittest test_sfu_descriptor_scaffold.py
+    test_rocc_sfu_integration.py test_sfu_workload_scaffold.py` 通过，`23 tests OK`。
+  - 目标回归：`python3 -m unittest test_sfu_workload_scaffold.py
+    test_run_noc_dma_softmax_sfu_pipeline.py test_verify_softmax_sfu_against_golden.py
+    test_sfu_descriptor_scaffold.py test_rocc_sfu_integration.py` 通过，`40 tests OK`。
+  - RISC-V workload rebuild 通过：`make clean ARCH=riscv64` 后 `make ARCH=riscv64`。
+- 下一步进入 Phase 9B：为 `EXP`、`LOG`、`RECIPROCAL` 增加 SFUAPI 方法、RoCC dispatch、
+  组件侧 local GM fp32 执行和最小 primitive workload/checker。
+
+- 完成 Phase 9B standalone unary primitive 最小实现：
+  - `SFUAPI` 新增 `issuePrimitive(descAddr, tag)`，`SFU` 组件新增 primitive pending
+    state、descriptor 读取、local GM fp32 input/output 读写、op 校验和 wait retire。
+  - 当前支持 `EXP`、`LOG`、`RECIPROCAL`，实现使用 host C++ `std::exp`、
+    `std::log` 和 reciprocal；这仍是功能模型，不是周期精确数学硬件单元。
+  - `roccAnalog.h` 接入 `GOLEM_ROCC_FUNC7_SFU_PRIMITIVE=0x19` 与
+    `GOLEM_ROCC_FUNC7_SFU_PRIMITIVE_WAIT=0x1a` dispatch。
+  - guest workload 新增 `GOLEM_SFU_PRIMITIVE_SMOKE=1` 模式，只在 executor core
+    执行 local GM primitive smoke，覆盖 `EXP/LOG/RECIPROCAL` 并和 C `math` golden
+    比较。
+- 调试并修复 primitive smoke SST 超时：
+  - 初次实跑在沙箱内因 OpenMPI 网络接口限制失败；沙箱外第一次 SST 超时。
+  - 根因定位为架构脚本没有把 `GOLEM_SFU_PRIMITIVE_SMOKE` 透传到 Vanadis guest
+    process env，guest 没进入 smoke 分支而继续默认路径。
+  - 修复 `architecture/ncores_selfcom_dma_ctrl.py`，补齐
+    `GOLEM_SFU_INTERLEAVE_GEMM`、`GOLEM_SFU_STANDALONE_SOFTMAX`、
+    `GOLEM_SFU_PRIMITIVE_SMOKE`；同时更新 softmax archive shim，保证 no-ctrl
+    路径也可透传 primitive smoke。
+- Phase 9B 验证：
+  - RED/GREEN：新增 primitive core/RoCC/workload/wrapper tests，先观察缺失
+    API/dispatch/env 失败，再实现转绿。
+  - `python3 -m unittest discover -s . -p 'test_*.py'`：`62 tests OK`。
+  - RISC-V workload：`make clean ARCH=riscv64 && make ARCH=riscv64` 通过。
+  - golem 组件局部构建：`make -C build/sst-elements/src/sst/elements/golem -j16`
+    通过。
+  - 真实 SST primitive smoke：
+    `GOLEM_SFU_PRIMITIVE_SMOKE=1 ./run_noc_dma_softmax_sfu_pipeline.sh --gemm-m 64 --gemm-n 64 --gemm-k 64`
+    通过；guest stdout 确认
+    `[SOFTMAX] mode=sfu-primitive-smoke executor_core=7 ops=EXP,LOG,RECIPROCAL PASS`。
+
+- 扩展 primitive smoke 到 1024x1024 逻辑规模，并修复长仿真问题：
+  - 新增 `GOLEM_SFU_PRIMITIVE_SMOKE_ELEMS` 和
+    `GOLEM_SFU_PRIMITIVE_SMOKE_CHUNK_ELEMS`，wrapper、architecture env 和 archive
+    shim 均已透传。
+  - 初版逐 chunk 发 `sfu_primitive/sfu_primitive_wait`，`65536` 元素也会超时；
+    继续对照发现 `chunk_elems=8192` 卡在 begin 后，而 `chunk_elems=4` 可完成。
+  - 根因拆成两点：
+    1. 大块 `mm2gm/gm2mm` 在当前 Vanadis/RoCC 模型里非常慢；
+    2. 小 chunk 若逐 chunk issue，会产生大量 RoCC primitive 指令，也会拖慢。
+  - 修复方案：
+    - primitive smoke 默认 chunk 调为 `4`，避免大块 host-memory 搬运；
+    - `SFUPrimitiveDesc.flags` 新增 repeat-chunk 语义，复用 unary 未使用的
+      `input1_gm_addr` 承载 logical processed elems；
+    - guest 每个 op 只发一次 primitive，SFU 组件计算一个真实 chunk 用于校验，同时
+      新增 `sfu_primitive_elems` 统计逻辑元素量；
+    - wrapper 增加 freshness guard：如果手工编译出的 `SFU_BIN` 比 build metadata
+      更新，则强制按 wrapper CFLAGS 重编，避免复用错误 `GOLEM_GLOBAL_STRIDE_BYTES`
+      的旧 ELF。
+  - 验证：
+    - `python3 -m unittest discover -s . -p 'test_*.py'`：`67 tests OK`。
+    - `make clean ARCH=riscv64 && make ARCH=riscv64`：通过。
+    - `make -C build/sst-elements/src/sst/elements/golem -j16`：通过（仅既有
+      SST deprecation warnings）。
+    - `GOLEM_SFU_PRIMITIVE_SMOKE=1 GOLEM_SFU_PRIMITIVE_SMOKE_ELEMS=1048576
+      ./run_noc_dma_softmax_sfu_pipeline.sh --gemm-m 64 --gemm-n 64 --gemm-k 64`
+      通过，run id `run_20260702_162003_2304427`。
+  - 1024x1024 primitive smoke 统计：
+    - guest PASS：
+      `total_elems=1048576 chunk_elems=4 chunks=786432 processed_elems=3145728`。
+    - wall time `52.6s`，run summary 记录 `49s`，SST simulated time
+      `226.537 us`。
+    - `core7:rocc:sfu,sfu_ops_issued` sum 为 `3`；
+      `core7:rocc:sfu,sfu_primitive_elems` sum 为 `3145728`，即
+      EXP/LOG/RECIPROCAL 各 `1048576` 个逻辑元素。
+    - `sfu_credit_stalls=0`、`sfu_retry_events=0`。
+    - DMA summary 全 0，说明该 smoke 是 local GM + SFU primitive 路径，不走 HBM
+      DMA read/write。
+- 文档整理：
+  - 更新 `/data4/jjgong/programming model/golem_gemm_programming_model_notes.md`，
+    新增 “SFU / Softmax / Primitive 当前进度” 章节，集中记录 fused softmax、
+    standalone softmax、primitive ABI、`1024x1024` primitive smoke、当前限制和
+    下一步计划。
+  - 更新 `task_plan.md`，把当前阶段补充为 primitive smoke 已支持
+    `GOLEM_SFU_PRIMITIVE_SMOKE_ELEMS=1048576`、默认 `chunk_elems=4` 的逻辑规模
+    验证，并明确下一步 Phase 9C primitive 扩展与 HBM streaming primitive
+    benchmark 分离。
+
+## 2026-07-03
+
+- 完成 Phase 9C standalone unary primitive 扩展：
+  - 在 SFU 组件 `validatePrimitiveDescriptor` / `executePrimitive` 中新增
+    `RSQRT`、`TANH`、`SIGMOID`。
+  - `RSQRT` 当前使用 `1.0f / sqrt(value)`；`TANH` 使用 `std::tanh`；
+    `SIGMOID` 使用 `1 / (1 + exp(-x))`。这些仍是 SST host C++ 功能模型，
+    不是 RTL 或周期精确数学硬件。
+  - guest primitive smoke 新增三种 op 的输入生成、golden 计算、issue/wait、
+    output 校验和 PASS 输出。
+- TDD 验证：
+  - 先新增测试并观察 RED：
+    `python3 -m unittest test_sfu_primitive_core.py test_sfu_workload_scaffold.py`
+    初始失败于缺少 `RSQRT/TANH/SIGMOID` 的组件执行和 guest smoke 路径。
+  - 实现后目标测试通过：`24 tests OK`。
+  - 全量小测试通过：
+    `python3 -m unittest discover -s . -p 'test_*.py'`，`68 tests OK`。
+  - RISC-V workload 编译通过：
+    `make clean ARCH=riscv64 && make ARCH=riscv64`。
+  - golem 组件局部构建通过：
+    `make -C build/sst-elements/src/sst/elements/golem -j16`，仅既有 SST
+    deprecation warnings。
+- 真实 SST smoke：
+  - 命令：
+    `GOLEM_SFU_PRIMITIVE_SMOKE=1 GOLEM_SFU_PRIMITIVE_SMOKE_ELEMS=16
+     ./run_noc_dma_softmax_sfu_pipeline.sh --gemm-m 64 --gemm-n 64 --gemm-k 64`
+  - run id：`run_20260703_125355_3868668`。
+  - guest PASS：
+    `ops=EXP,LOG,RECIPROCAL,RSQRT,TANH,SIGMOID total_elems=16 chunk_elems=4
+     chunks=24 processed_elems=96 PASS`。
+  - stats：`core7:rocc:sfu,sfu_ops_issued` sum 为 `6`；
+    `core7:rocc:sfu,sfu_primitive_elems` sum 为 `96`；
+    `sfu_credit_stalls=0`、`sfu_retry_events=0`。
+  - SST simulated time：`276.651 us`；run summary wall time：`70s`。
+- 固化 primitive smoke README 说明：
+  - 更新 `README.md`，明确 standalone primitive smoke 的三个关键参数：
+    `GOLEM_SFU_PRIMITIVE_SMOKE`、`GOLEM_SFU_PRIMITIVE_SMOKE_ELEMS`、
+    `GOLEM_SFU_PRIMITIVE_SMOKE_CHUNK_ELEMS`。
+  - 明确 smoke 中 `*_ELEMS` 是 logical processed element count，`chunk_elems`
+    是真实 local GM 工作集；当前 smoke 用于 ABI/功能/统计验证，不是 HBM
+    bandwidth benchmark。
+  - 新增 `SFUPrimitiveDesc` 字段说明，记录其作为 RISC-V guest 与 SST `golem.SFU`
+    组件之间 64-byte ABI descriptor 的角色。
+
+- 完成 Phase 9D 最小 HBM streaming primitive benchmark：
+  - 新增 `GOLEM_SFU_PRIMITIVE_HBM_STREAM`、`GOLEM_SFU_PRIMITIVE_HBM_ELEMS`、
+    `GOLEM_SFU_PRIMITIVE_HBM_CHUNK_ELEMS`。
+  - 新路径执行 `HBM C region -> dma_remote_load_to_gm -> local GM input ->
+    sfu_primitive(EXP) -> local GM output -> remote_store -> HBM C region`。
+  - guest 使用从 HBM 实际读回的输入值计算 golden，因此不依赖 C region 初值为 0。
+  - 当前最小版本只覆盖 `EXP`，用于验证真实 HBM read/write + SFU primitive 的
+    端到端数据流；后续再扩展多 op 和更大规模。
+- TDD/构建验证：
+  - 先新增 RED 测试：
+    `test_workload_has_hbm_streaming_primitive_benchmark_before_local_smoke` 和
+    `test_wrapper_and_architectures_forward_hbm_streaming_primitive_knobs`，初始失败于缺少
+    HBM stream mode 与 env 转发。
+  - 实现后目标测试通过：`2 tests OK`。
+  - 全量小测试通过：
+    `python3 -m unittest discover -s . -p 'test_*.py'`，`70 tests OK`。
+  - RISC-V workload 编译通过：
+    `make clean ARCH=riscv64 && make ARCH=riscv64`。
+- 真实 SST HBM streaming primitive smoke：
+  - 命令：
+    `GOLEM_SFU_PRIMITIVE_HBM_STREAM=1 GOLEM_SFU_PRIMITIVE_HBM_ELEMS=64
+     GOLEM_SFU_PRIMITIVE_HBM_CHUNK_ELEMS=64
+     ./run_noc_dma_softmax_sfu_pipeline.sh --gemm-m 64 --gemm-n 64 --gemm-k 64
+     --gemm-block-m 64 --gemm-block-n 64 --gemm-block-k 64
+     --group-manager-enable 0 --ctrl-link-enable 0`
+  - run id：`run_20260703_131521_3969240`。
+  - guest PASS：
+    `mode=sfu-primitive-hbm-stream op=EXP total_elems=64 chunk_elems=64
+     chunks=1 processed_elems=64 hbm_read_bytes=256 hbm_write_bytes=256 PASS`。
+  - stats：executor `core7` 上 `sfu_ops_issued=1`；
+    `sfu_primitive_elems=64`；`sfu_retry_events=0`。
+  - DMA summary：`read_issue_count=1`、`write_issue_count=1`、
+    `read_bytes_total=256`、`write_bytes_total=256`、`write_completion=1`。
+  - SST simulated time：`294.77 us`；run summary wall time：`54s`。
+
+- 扩展 HBM streaming primitive 到可配置多 op：
+  - 新增 `GOLEM_SFU_PRIMITIVE_HBM_OPS`，支持逗号分隔列表，`ALL` 展开为
+    `EXP,LOG,RECIPROCAL,RSQRT,TANH,SIGMOID`。
+  - `tools/gen_hbm_init.py` 在 `GOLEM_SFU_PRIMITIVE_HBM_STREAM=1` 时预置 GEMM C
+    region 中的 per-op input slot，每个 slot 使用正 fp32 pattern，避免 `LOG`、
+    `RECIPROCAL`、`RSQRT` 读到非法 0 输入。
+  - guest 为每个 op 分配独立 HBM slot，执行 `dma_remote_load_to_gm ->
+    sfu_primitive(op) -> remote_store`，并在 PASS 行输出 `ops=`、
+    `hbm_init_write_bytes`、`hbm_read_bytes`、`hbm_write_bytes`。
+- TDD/构建验证：
+  - 新增 RED 测试覆盖 HBM op parser、generator preload 和 env 转发，初始失败于缺少
+    `GOLEM_SFU_PRIMITIVE_HBM_OPS`。
+  - 实现后目标测试通过：`3 tests OK`。
+  - 全量小测试通过：
+    `python3 -m unittest discover -s . -p 'test_*.py'`，`72 tests OK`。
+  - RISC-V workload 编译通过：
+    `make clean ARCH=riscv64 && make ARCH=riscv64`。
+- 真实 SST HBM streaming primitive all-op smoke：
+  - 命令：
+    `GOLEM_SFU_PRIMITIVE_HBM_STREAM=1 GOLEM_SFU_PRIMITIVE_HBM_OPS=ALL
+     GOLEM_SFU_PRIMITIVE_HBM_ELEMS=16 GOLEM_SFU_PRIMITIVE_HBM_CHUNK_ELEMS=16
+     ./run_noc_dma_softmax_sfu_pipeline.sh --gemm-m 64 --gemm-n 64 --gemm-k 64
+     --gemm-block-m 64 --gemm-block-n 64 --gemm-block-k 64
+     --group-manager-enable 0 --ctrl-link-enable 0`
+  - run id：`run_20260703_132634_4023666`。
+  - guest PASS：
+    `ops=EXP,LOG,RECIPROCAL,RSQRT,TANH,SIGMOID total_elems=16 chunk_elems=16
+     chunks=6 processed_elems=96 hbm_init_write_bytes=384 hbm_read_bytes=384
+     hbm_write_bytes=384 PASS`。
+  - stats：executor `core7` 上 `sfu_ops_issued=6`；
+    `sfu_primitive_elems=96`；`sfu_credit_stalls=0`；`sfu_retry_events=0`。
+  - DMA summary：`read_issue_count=6`、`write_issue_count=6`、
+    `read_bytes_total=384`、`write_bytes_total=384`、`write_completion=6`。
+  - SST simulated time：`382.396 us`；run summary wall time：`71s`。
+
+- 完成 HBM streaming primitive all-op 三档 sweep 与组会图：
+  - sweep root：
+    `src/sst/elements/golem/tests/artifacts/sweeps/sfu_hbm_primitive_allops_20260703`。
+  - 纳入规模：`16`、`1024`、`4096` elements/op；用户已明确本轮规模只取到这三档。
+  - 三档均为 `GOLEM_SFU_PRIMITIVE_HBM_OPS=ALL`，即
+    `EXP/LOG/RECIPROCAL/RSQRT/TANH/SIGMOID` 六个 primitive。
+  - 结果：
+    - `16`: `processed_elems=96`，HBM read/write 各 `384B`，
+      `dma_read/write_issue=6/6`，simulated time `382.396 us`，wall `68s`。
+    - `1024`: `processed_elems=6144`，HBM read/write 各 `24576B`，
+      `dma_read/write_issue=6/6`，simulated time `2727.56 us`，wall `517s`。
+    - `4096`: `processed_elems=24576`，HBM read/write 各 `98304B`，
+      `dma_read/write_issue=6/6`，simulated time `1025.25 us`，wall `200s`。
+  - HBM stream bytes 与理论值完全一致：
+    `total_elems * 6 ops * 4 bytes * 2 directions`。
+  - 因为本轮 `chunk_elems == total_elems`，每个 op 只发一次，因此 DMA event count
+    和 SFU issue count 均保持 `6`；真正观察 event count scaling 需要固定较小
+    `chunk_elems` 再跑 chunk sweep。
+  - 已新增绘图/汇总脚本：
+    `plot_sfu_hbm_primitive_sweep.py`，输出 CSV、notes、SVG、PNG、PDF。
+  - 输出图与源数据：
+    `figures/sfu_hbm_primitive_sweep_source.csv`、
+    `figures/sfu_hbm_primitive_sweep.svg`、
+    `figures/sfu_hbm_primitive_sweep.png`、
+    `figures/sfu_hbm_primitive_sweep.pdf`。
+  - `65536` 尝试未纳入：日志没有 guest PASS 或 `Simulation is complete`，也没有
+    stdout PASS 目录；当前只作为异常长运行诊断线索，后续需要单独用减统计/单 op/固定
+    chunk 设置复现定位。
+
+- 安装隔离 Python 绘图环境：
+  - venv：`/data4/jjgong/.venvs/golem-plot`。
+  - 已安装：`matplotlib 3.10.9`、`seaborn 0.13.2`、`pandas 2.3.3`。
+  - `plot_sfu_hbm_primitive_sweep.py` 已改为自动设置可写 `MPLCONFIGDIR`，并在
+    matplotlib 后端下导出 SVG、PDF、PNG、TIFF。
+- 完成固定 `chunk_elems=1024` 的 HBM primitive event-scaling 实验：
+  - sweep root：
+    `src/sst/elements/golem/tests/artifacts/sweeps/sfu_hbm_event_scaling_chunk1024_20260703`。
+  - completed PASS 行：
+    - `1024` elems/op，all-op，`chunks=6`，DMA read/write issues `6/6`，
+      wait count `12`，HBM read/write bytes `24576/24576`，simulated time
+      `2.72756 ms`，wall `570s`。
+    - `2048` elems/op，all-op，`chunks=12`，DMA read/write issues `12/12`，
+      wait count `24`，HBM read/write bytes `49152/49152`，simulated time
+      `5.12498 ms`，wall `930s`。
+  - 结论：固定 chunk 后，HBM bytes、DMA issue、SFU issue、wait count 均随
+    chunk 数线性增长；这比上一轮 `chunk_elems == total_elems` 更能体现 event scaling。
+  - 输出图与源数据：
+    `figures/sfu_hbm_primitive_sweep_source.csv`、
+    `figures/sfu_hbm_primitive_sweep.svg`、
+    `figures/sfu_hbm_primitive_sweep.png`、
+    `figures/sfu_hbm_primitive_sweep.pdf`、
+    `figures/sfu_hbm_primitive_sweep.tiff`。
+- 完成异常长运行诊断：
+  - `4096` elems/op，all-op，`chunk_elems=1024`，`1000s` 上限内未 PASS；
+    emergency shutdown 时 core7 DMA read/write issues 为 `17/16`，预期 `24/24`。
+  - `65536` elems/op，`EXP` 单 op，`chunk_elems=1024`，减统计，`600s` 上限内未 PASS；
+    emergency shutdown 时 core7 DMA read/write issues 为 `9/8`，预期 `64/64`。
+  - 当前根因判断：长 wall time 主要来自每 chunk 的 guest/SST 指令级执行成本，而不是
+    all-op 数学、HBM preload 或全量统计。后续大规模点应增大 `chunk_elems`，或设计
+    batched primitive descriptor 来摊销 per-chunk guest overhead。
+
+- 完成 `65536` single-op `EXP` 大 chunk 诊断：
+  - sweep root：
+    `src/sst/elements/golem/tests/artifacts/sweeps/sfu_hbm_largechunk_diag_20260703`。
+  - `chunk_elems=8192` 真实 SST PASS：
+    `chunks=8`、`processed_elems=65536`、HBM read/write bytes
+    `262144/262144`、DMA read/write issues `16/16`、wait count `32`、
+    simulated time `2.09856 ms`、wall `398s`。
+  - `chunk_elems=4096` 真实 SST PASS：
+    `chunks=16`、`processed_elems=65536`、HBM read/write bytes
+    `262144/262144`、DMA read/write issues `16/16`、wait count `32`、
+    simulated time `2.15259 ms`、wall `422s`。
+  - `4096` 与 `8192` 的 DMA issue count 相同是预期行为：`4096 fp32=16KiB`
+    正好一个 DMA burst，`8192 fp32=32KiB` 被拆成两个 16KiB burst。
+  - 已新增 chunk 诊断绘图脚本：
+    `plot_sfu_hbm_chunk_diag.py`。
+  - 输出组会图与源数据：
+    `figures/sfu_hbm_exp65536_chunk_diag_source.csv`、
+    `figures/sfu_hbm_exp65536_chunk_diag_notes.md`、
+    `figures/sfu_hbm_exp65536_chunk_diag.svg`、
+    `figures/sfu_hbm_exp65536_chunk_diag.png`、
+    `figures/sfu_hbm_exp65536_chunk_diag.pdf`、
+    `figures/sfu_hbm_exp65536_chunk_diag.tiff`。
+  - 结论更新：把 `chunk_elems` 从 `1024` 提高到 `4096/8192` 后，
+    `65536` single-op 由 timeout 变为完整 PASS，进一步确认瓶颈是 per-chunk
+    guest/SST executor overhead；由于当前 primitive chunk cap 是 `8192`，
+    下一步更应做 batched primitive descriptor，而不是继续单纯增大 chunk。
+
+- 完成 batched primitive descriptor v1：
+  - 新增 32B `SFUPrimitiveBatchDesc`，指向一组既有 64B
+    `SFUPrimitiveDesc`；单 descriptor ABI 与 `sfu_primitive(desc, tag)`
+    保持不变。
+  - 新增 RoCC func7 `0x1b/0x1c`，guest wrapper
+    `sfu_primitive_batch()` / `sfu_primitive_batch_wait()`。
+  - `GOLEM_SFU_PRIMITIVE_HBM_BATCH=1` 使 HBM streaming primitive 把多个 chunk
+    descriptor 合并成一次 batch issue。
+  - SFU 统计语义：batch issue 计为一次 `sfu_ops_issued`，
+    `sfu_primitive_elems` 累加所有 child descriptor 的元素数。
+  - TDD/回归验证：
+    `python3 -m unittest discover -s . -p 'test_*.py'`，75 tests OK。
+  - 构建验证：
+    `make -C build/sst-elements/src/sst/elements/golem -j16 V=1` 通过；
+    `make -B ARCH=riscv64` 通过。
+  - 构建边界修正：build tree 是源码拷贝，不是 symlink；新增虚函数后必须同步
+    `sfu.h/.cc` 和 `roccAnalog.h` 到 build tree，并重编 `sfu.lo` 与 `golem.lo`。
+    只重编 `sfu.lo` 曾导致旧 `golem.o` 使用旧 SFU vtable，在 SST wire-up 阶段
+    崩到 `SFU::wait`；重编 `golem.lo` 后问题消失。
+  - 真实 SST batch smoke：
+    sweep root
+    `src/sst/elements/golem/tests/artifacts/sweeps/sfu_hbm_batch_smoke_20260703`。
+    `sfu_hbm_batch_exp_elems_1024_chunk256_allstats` PASS：
+    `EXP`、`total_elems=1024`、`chunk_elems=256`、`chunks=4`、
+    HBM read/write bytes `4096/4096`、DMA read/write issues `4/4`、
+    wait count `8`、simulated time `663.83 us`、wall `126s`。
+    SFU stats：core7 `sfu_ops_issued=1`、
+    `sfu_primitive_elems=1024`，证明 4 个 chunk descriptor 被 1 次 batch issue
+    覆盖。
+- 完成 batch vs non-batch event-scaling 对照：
+  - sweep root：
+    `src/sst/elements/golem/tests/artifacts/sweeps/sfu_hbm_batch_compare_20260703`。
+  - 配置：single `EXP`，`chunk_elems=256`，all-stats enabled。
+  - `1024` elems：
+    non-batch `chunks=4`、`sfu_ops_issued=4`、DMA read/write `4/4`、
+    simulated time `659.441 us`、wall `152s`；
+    batch `chunks=4`、`sfu_ops_issued=1`、DMA read/write `4/4`、
+    simulated time `663.83 us`、wall `142s`。
+  - `4096` elems：
+    non-batch `chunks=16`、`sfu_ops_issued=16`、DMA read/write `16/16`、
+    simulated time `1.72802 ms`、wall `346s`；
+    batch `chunks=16`、`sfu_ops_issued=1`、DMA read/write `16/16`、
+    simulated time `1.70861 ms`、wall `333s`。
+  - 结论：batch descriptor 明确降低 RoCC/SFU control issue count；
+    HBM bytes 和 DMA request count 不变，因此小规模 single-op 的 simulated time
+    仍主要由相同 HBM/DMA 数据流支配。
+  - 新增绘图脚本：
+    `plot_sfu_hbm_batch_compare.py`。
+  - 输出组会图与源数据：
+    `figures/sfu_hbm_batch_compare_source.csv`、
+    `figures/sfu_hbm_batch_compare_notes.md`、
+    `figures/sfu_hbm_batch_compare.svg`、
+    `figures/sfu_hbm_batch_compare.png`、
+    `figures/sfu_hbm_batch_compare.pdf`、
+    `figures/sfu_hbm_batch_compare.tiff`。
+- 固化 SFU 后续建模层级：
+  - 当前 Golem/Vanadis 路径是 C++ SST architecture-level event/timing
+    simulation，不是 RTL。
+  - 当前 SFU primitive 数学仍由 host C++ functional model 计算，SST 侧负责
+    descriptor、RoCC、DMA/HBM、issue/wait 和统计。
+  - 后续目标明确为 hardware-like SFU timing model：增加 per-op latency、
+    issue bandwidth、queue depth、pipeline occupancy、backpressure 和
+    stall/wait/latency 统计；不要求现阶段实现 Verilog/SystemVerilog RTL。
+  - 已同步更新 `README.md`、`task_plan.md` 和
+    `docs/superpowers/plans/2026-07-03-sfu-primitive-batch.md`。

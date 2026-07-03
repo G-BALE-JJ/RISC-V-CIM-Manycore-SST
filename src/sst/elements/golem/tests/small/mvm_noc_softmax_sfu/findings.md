@@ -62,6 +62,7 @@
 | 传统三阶段 softmax 不是 online softmax | 设计更新为 tile stats + online merge + normalize |
 | `scripts/build_and_install_local.sh --reconfigure --jobs 16` 在 rsync/chgrp 阶段失败 | 不是 SFU 编译错误；脚本在 `prepare_local_build.sh` 使用 `rsync -a` 保留 group 属性，当前文件系统对部分文件 chgrp 返回 `Invalid argument`。已在复制出的 build tree 中手动 `autogen/configure/make -C src/sst/elements/golem -j16` 验证 SFU 骨架编译通过 |
 | build tree 不是源码目录 symlink | 修改 `src/sst/elements/golem/sfu/sfu.h/.cc` 后，必须同步到 `build/sst-elements/src/sst/elements/golem/sfu/` 再运行 golem 局部 make，才能真正编译新 SFU 源码 |
+| 新增 SFU 虚函数后只重编 `sfu.lo` 会导致 SST wire-up 崩溃 | `roccAnalog.h`/`sfu.h` 被 `golem.cc` 包含；新增 `issuePrimitiveBatch` 后旧 `golem.o` 仍按旧 vtable 调用，曾在 `SFU::wait` 崩溃。同步 `sfu.h/.cc`、`roccAnalog.h` 到 build tree 后，必须重编 `golem.lo` 和 `sfu.lo` 并重新链接 `libgolem.so` |
 | Vanadis 逻辑 core id 与实际 RoCC/global-memory executor core id 不一致 | workload 区分 `requested_core_id` 与 `executor_core_id`：任务分配使用 requested core，local GM/RoCC 操作使用 executor core |
 | wrapper 一度解包错布局 | SFU wrapper 显式导出 `GOLEM_GEMM_OUT_LAYOUT=colmajor_tile` 和 `GOLEM_MATMUL_*`，保证 checker 按 GEMM tile-packed C layout 解包 |
 | GEMM baseline 曾只产生第 0 列正确输出 | 单 array baseline 每列只 DMA 一个 B 向量到 `rt.local_vec_in`，但 compute 曾读 `vec_col_addr(rt,n_col)`；修复为每列 compute 读取 `rt.local_vec_in`，GEMM-only golden 已通过 |

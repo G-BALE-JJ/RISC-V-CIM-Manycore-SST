@@ -90,6 +90,12 @@ class SfuSoftmaxPipelineWrapperTest(unittest.TestCase):
         self.assertIn("gemm_matmul_op.h", source)
         self.assertIn("test_noc_dma_softmax_sfu.build.env", source)
 
+    def test_wrapper_rebuilds_if_binary_is_newer_than_build_metadata(self):
+        source = self.read_wrapper()
+
+        self.assertIn('[[ "$SFU_BIN" -nt "$SFU_BUILD_ENV" ]]', source)
+        self.assertIn("return 1", source)
+
     def test_sst_shim_sets_ld_library_path_for_local_sst(self):
         with open(os.path.join(SCRIPT_DIR, "bin", "sst"), "r", encoding="utf-8") as source_file:
             source = source_file.read()
@@ -161,6 +167,82 @@ class SfuSoftmaxPipelineWrapperTest(unittest.TestCase):
 
         self.assertIn("normalize_path_under_script_dir", source)
         self.assertIn('GOLEM_SOFTMAX_LOGITS_FILE="$(normalize_path_under_script_dir "$GOLEM_SOFTMAX_LOGITS_FILE")"', source)
+
+    def test_ctrl_architecture_forwards_sfu_mode_knobs_to_guest(self):
+        with open(
+            os.path.join(SCRIPT_DIR, "..", "..", "architecture", "ncores_selfcom_dma_ctrl.py"),
+            "r",
+            encoding="utf-8",
+        ) as arch_file:
+            arch_source = arch_file.read()
+
+        self.assertIn('"GOLEM_SFU_INTERLEAVE_GEMM"', arch_source)
+        self.assertIn('"GOLEM_SFU_STANDALONE_SOFTMAX"', arch_source)
+        self.assertIn('"GOLEM_SFU_PRIMITIVE_SMOKE"', arch_source)
+
+    def test_archive_shim_forwards_sfu_primitive_smoke_to_guest(self):
+        with open(
+            os.path.join(SCRIPT_DIR, "..", "mvm_noc_softmax_cpu", "ncores_selfcom_dma_softmax_archive.py"),
+            "r",
+            encoding="utf-8",
+        ) as archive_file:
+            archive_source = archive_file.read()
+
+        self.assertIn('"GOLEM_SFU_PRIMITIVE_SMOKE"', archive_source)
+
+    def test_wrapper_and_architectures_forward_scaled_primitive_smoke_knobs(self):
+        source = self.read_wrapper()
+        with open(
+            os.path.join(SCRIPT_DIR, "..", "..", "architecture", "ncores_selfcom_dma_ctrl.py"),
+            "r",
+            encoding="utf-8",
+        ) as arch_file:
+            arch_source = arch_file.read()
+        with open(
+            os.path.join(SCRIPT_DIR, "..", "mvm_noc_softmax_cpu", "ncores_selfcom_dma_softmax_archive.py"),
+            "r",
+            encoding="utf-8",
+        ) as archive_file:
+            archive_source = archive_file.read()
+
+        for knob in (
+            "GOLEM_SFU_PRIMITIVE_SMOKE_ELEMS",
+            "GOLEM_SFU_PRIMITIVE_SMOKE_CHUNK_ELEMS",
+        ):
+            self.assertIn(f'{knob}="${{{knob}:-', source)
+            self.assertIn(f"export {knob}", source)
+            self.assertIn(knob, self.run_wrapper("--group-manager-enable", "0", "--ctrl-link-enable", "0").stdout)
+            self.assertIn(f'"{knob}"', arch_source)
+            self.assertIn(f'"{knob}"', archive_source)
+
+    def test_wrapper_and_architectures_forward_hbm_streaming_primitive_knobs(self):
+        source = self.read_wrapper()
+        result = self.run_wrapper("--group-manager-enable", "0", "--ctrl-link-enable", "0")
+        with open(
+            os.path.join(SCRIPT_DIR, "..", "..", "architecture", "ncores_selfcom_dma_ctrl.py"),
+            "r",
+            encoding="utf-8",
+        ) as arch_file:
+            arch_source = arch_file.read()
+        with open(
+            os.path.join(SCRIPT_DIR, "..", "mvm_noc_softmax_cpu", "ncores_selfcom_dma_softmax_archive.py"),
+            "r",
+            encoding="utf-8",
+        ) as archive_file:
+            archive_source = archive_file.read()
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        for knob in (
+            "GOLEM_SFU_PRIMITIVE_HBM_STREAM",
+            "GOLEM_SFU_PRIMITIVE_HBM_ELEMS",
+            "GOLEM_SFU_PRIMITIVE_HBM_CHUNK_ELEMS",
+            "GOLEM_SFU_PRIMITIVE_HBM_OPS",
+        ):
+            self.assertIn(f'{knob}="${{{knob}:-', source)
+            self.assertIn(f"export {knob}", source)
+            self.assertIn(knob, result.stdout)
+            self.assertIn(f'"{knob}"', arch_source)
+            self.assertIn(f'"{knob}"', archive_source)
 
 
 if __name__ == "__main__":

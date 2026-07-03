@@ -33,6 +33,9 @@ TESTS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ARTIFACT_ROOT = os.getenv("GOLEM_ARTIFACT_ROOT", os.path.join(TESTS_DIR, "artifacts"))
 HBM_DIR = os.getenv("GOLEM_HBM_DIR", os.path.join(ARTIFACT_ROOT, "hbm"))
 SFU_STANDALONE_SOFTMAX = int(os.getenv("GOLEM_SFU_STANDALONE_SOFTMAX", "0")) != 0
+SFU_PRIMITIVE_HBM_STREAM = int(os.getenv("GOLEM_SFU_PRIMITIVE_HBM_STREAM", "0")) != 0
+SFU_PRIMITIVE_HBM_OPS = os.getenv("GOLEM_SFU_PRIMITIVE_HBM_OPS", "EXP")
+SFU_PRIMITIVE_HBM_ELEMS = max(1, int(os.getenv("GOLEM_SFU_PRIMITIVE_HBM_ELEMS", "64")))
 SOFTMAX_LOGITS_FILE = os.getenv("GOLEM_SOFTMAX_LOGITS_FILE", "")
 HBM_DUMP_OUTPUT = os.getenv("GOLEM_HBM_DUMP_OUTPUT", "1").strip().lower() not in {
     "0",
@@ -618,6 +621,58 @@ def _write_standalone_softmax_logits(node_buffers, logits_matrix):
         )
 
 
+def _sfu_primitive_hbm_op_count() -> int:
+    tokens = [
+        token.strip()
+        for token in SFU_PRIMITIVE_HBM_OPS.replace(";", ",").split(",")
+        if token.strip()
+    ]
+    if not tokens:
+        return 1
+    return 6 if any(token.upper() == "ALL" for token in tokens) else len(tokens)
+
+
+def _sfu_primitive_hbm_input_value(elem_idx: int) -> float:
+    return 0.5 + float(elem_idx % 32) * 0.125
+
+
+def _write_sfu_primitive_hbm_input(node_buffers):
+    if MATMUL_DTYPE != "fp32":
+        raise ValueError("SFU primitive HBM stream input preload currently requires fp32")
+    task_id = 0
+    m_tile = task_id // GEMM_N_TILES
+    n_tile = task_id % GEMM_N_TILES
+    m_group = m_tile // B_REUSE_M_TILES
+    n_group = n_tile // A_REUSE_N_TILES
+    m_offset = m_tile % B_REUSE_M_TILES
+    n_offset = n_tile % A_REUSE_N_TILES
+    macro_task_id = _macro_task_for_group(m_group, n_group)
+    node_idx = _data_node_for_task(macro_task_id)
+    task_slot = _task_slot_in_node(macro_task_id)
+    reuse_offset = m_offset * VEC_REUSE_SLOTS + n_offset
+    base_off = OFF_GEMM_OUT_BASE + (task_slot * OUT_REUSE_SLOTS + reuse_offset) * GEMM_OUT_STRIDE_MM
+    op_count = _sfu_primitive_hbm_op_count()
+    elem_bytes = elem_nbytes(MATMUL_DTYPE)
+    total_bytes = SFU_PRIMITIVE_HBM_ELEMS * elem_bytes
+    if base_off + total_bytes * op_count > OFF_GEMM_BIAS_BASE:
+        raise ValueError(
+            "SFU primitive HBM stream input exceeds GEMM C region before bias area: "
+            f"bytes={total_bytes * op_count}, base=0x{base_off:X}, bias=0x{OFF_GEMM_BIAS_BASE:X}"
+        )
+    values = [
+        cast_scalar(MATMUL_DTYPE, _sfu_primitive_hbm_input_value(i))
+        for i in range(SFU_PRIMITIVE_HBM_ELEMS)
+    ]
+    data = _pack_tensor_values(values)
+    for op_idx in range(op_count):
+        _write_block(
+            node_buffers[node_idx],
+            base_off + op_idx * total_bytes,
+            data,
+            f"sfu_primitive_hbm_input_op{op_idx}_node{node_idx}",
+        )
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Generate HBM init files for GOLEM matmul"
@@ -1099,6 +1154,10 @@ def main(argv=None):
     if softmax_logits is not None:
         _write_standalone_softmax_logits(node_buffers, softmax_logits)
         print("Preloaded standalone softmax logits into GEMM C tile region")
+
+    if SFU_PRIMITIVE_HBM_STREAM:
+        _write_sfu_primitive_hbm_input(node_buffers)
+        print("Preloaded SFU primitive HBM stream input into GEMM C tile region")
 
     for node_idx in DATA_NODE_IDS:
         init_file = os.path.join(HBM_DIR, f"hbm_init_node{node_idx}.bin")

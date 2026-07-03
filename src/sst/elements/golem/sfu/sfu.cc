@@ -14,6 +14,9 @@ namespace Golem {
 namespace {
 
 using SoftmaxReducerKey = std::pair<uint64_t, uint32_t>;
+constexpr uint32_t GOLEM_DTYPE_FP32_VALUE = 1;
+constexpr uint32_t GOLEM_SFU_PRIMITIVE_FLAG_REPEAT_CHUNK = 0x1;
+constexpr uint32_t GOLEM_SFU_PRIMITIVE_BATCH_MAX_DESCS = 64;
 
 struct SoftmaxReducerRowState {
     double m_acc = -std::numeric_limits<double>::infinity();
@@ -42,6 +45,11 @@ size_t tilePackedIndex(const SFUSoftmaxTileDesc& desc, uint32_t row, uint32_t co
     return static_cast<size_t>(col) * desc.block_m + row;
 }
 
+uint32_t effectiveStride(uint32_t strideBytes)
+{
+    return strideBytes == 0 ? static_cast<uint32_t>(sizeof(float)) : strideBytes;
+}
+
 } // namespace
 
 SFU::SFU(ComponentId_t id, SST::Params& params)
@@ -67,6 +75,7 @@ SFU::SFU(ComponentId_t id, SST::Params& params)
     statOpsIssued_ = registerStatistic<uint64_t>("sfu_ops_issued");
     statSoftmaxRows_ = registerStatistic<uint64_t>("sfu_softmax_rows");
     statSoftmaxTiles_ = registerStatistic<uint64_t>("sfu_softmax_tiles");
+    statPrimitiveElems_ = registerStatistic<uint64_t>("sfu_primitive_elems");
     statPartialSubmits_ = registerStatistic<uint64_t>("sfu_partial_submits");
     statPartialDone_ = registerStatistic<uint64_t>("sfu_partial_done");
     statCreditStalls_ = registerStatistic<uint64_t>("sfu_credit_stalls");
@@ -124,6 +133,89 @@ bool SFU::issueSoftmaxTile(uint64_t descAddr, uint64_t tag)
     return true;
 }
 
+bool SFU::issuePrimitive(uint64_t descAddr, uint64_t tag)
+{
+    if (inflight_ >= maxInflight_) {
+        statCreditStalls_->addData(1);
+        return false;
+    }
+
+    PrimitiveOpState state = {};
+    state.descAddr = descAddr;
+    state.tag = tag;
+    state.status = SFUStatus::Success;
+
+    if (!readPrimitiveDescriptor(descAddr, &state.desc)) {
+        state.status = (globalMem_ == nullptr) ? SFUStatus::GlobalMemoryUnavailable
+                                               : SFUStatus::InvalidDescriptor;
+    } else {
+        state.status = validatePrimitiveDescriptor(state.desc);
+    }
+
+    if (state.status == SFUStatus::Success && !readPrimitiveInput(state.desc, &state.input0)) {
+        state.status = SFUStatus::InvalidDescriptor;
+    }
+    if (state.status == SFUStatus::Success && !executePrimitive(&state)) {
+        state.status = SFUStatus::InvalidDescriptor;
+    }
+    if (state.status == SFUStatus::Success && !writePrimitiveOutput(state.desc, state.output)) {
+        state.status = SFUStatus::InvalidDescriptor;
+    }
+
+    pendingPrimitiveOps_[tag] = state;
+
+    ++inflight_;
+    statOpsIssued_->addData(1);
+    if (state.status == SFUStatus::Success) {
+        statPrimitiveElems_->addData(primitiveProcessedElems(state.desc));
+    } else {
+        statPrimitiveElems_->addData(0);
+    }
+    return true;
+}
+
+bool SFU::issuePrimitiveBatch(uint64_t descAddr, uint64_t tag)
+{
+    if (inflight_ >= maxInflight_) {
+        statCreditStalls_->addData(1);
+        return false;
+    }
+
+    PrimitiveBatchOpState state = {};
+    state.descAddr = descAddr;
+    state.tag = tag;
+    state.status = SFUStatus::Success;
+    state.processedElems = 0;
+
+    if (!readPrimitiveBatchDescriptor(descAddr, &state.desc)) {
+        state.status = (globalMem_ == nullptr) ? SFUStatus::GlobalMemoryUnavailable
+                                               : SFUStatus::InvalidDescriptor;
+    } else {
+        state.status = validatePrimitiveBatchDescriptor(state.desc);
+    }
+
+    if (state.status == SFUStatus::Success) {
+        for (uint32_t i = 0; i < state.desc.desc_count; ++i) {
+            const uint64_t childDescAddr =
+                state.desc.desc_array_gm_addr +
+                static_cast<uint64_t>(i) * sizeof(SFUPrimitiveDesc);
+            uint64_t childElems = 0;
+            if (!executePrimitiveDesc(childDescAddr, tag + i + 1, &childElems)) {
+                state.status = SFUStatus::InvalidDescriptor;
+                break;
+            }
+            state.processedElems += childElems;
+        }
+    }
+
+    pendingPrimitiveBatchOps_[tag] = state;
+
+    ++inflight_;
+    statOpsIssued_->addData(1);
+    statPrimitiveElems_->addData(state.processedElems);
+    return true;
+}
+
 bool SFU::wait(uint64_t tag, uint64_t* status)
 {
     SFUStatus opStatus = SFUStatus::Success;
@@ -148,6 +240,18 @@ bool SFU::wait(uint64_t tag, uint64_t* status)
         }
 
         pendingSoftmaxOps_.erase(it);
+    } else {
+        auto primitiveIt = pendingPrimitiveOps_.find(tag);
+        if (primitiveIt != pendingPrimitiveOps_.end()) {
+            opStatus = primitiveIt->second.status;
+            pendingPrimitiveOps_.erase(primitiveIt);
+        } else {
+            auto batchIt = pendingPrimitiveBatchOps_.find(tag);
+            if (batchIt != pendingPrimitiveBatchOps_.end()) {
+                opStatus = batchIt->second.status;
+                pendingPrimitiveBatchOps_.erase(batchIt);
+            }
+        }
     }
 
     if (inflight_ > 0) {
@@ -157,6 +261,201 @@ bool SFU::wait(uint64_t tag, uint64_t* status)
         *status = static_cast<uint64_t>(opStatus);
     }
     return true;
+}
+
+bool SFU::readPrimitiveDescriptor(uint64_t descAddr, SFUPrimitiveDesc* desc)
+{
+    if (globalMem_ == nullptr || desc == nullptr || descAddr == 0) {
+        return false;
+    }
+
+    std::vector<uint8_t> raw;
+    globalMem_->rd_from_globalmem(descAddr, sizeof(SFUPrimitiveDesc), raw);
+    if (raw.size() != sizeof(SFUPrimitiveDesc)) {
+        return false;
+    }
+
+    std::memcpy(desc, raw.data(), sizeof(SFUPrimitiveDesc));
+    return true;
+}
+
+bool SFU::readPrimitiveBatchDescriptor(uint64_t descAddr, SFUPrimitiveBatchDesc* desc)
+{
+    if (globalMem_ == nullptr || desc == nullptr || descAddr == 0) {
+        return false;
+    }
+
+    std::vector<uint8_t> raw;
+    globalMem_->rd_from_globalmem(descAddr, sizeof(SFUPrimitiveBatchDesc), raw);
+    if (raw.size() != sizeof(SFUPrimitiveBatchDesc)) {
+        return false;
+    }
+
+    std::memcpy(desc, raw.data(), sizeof(SFUPrimitiveBatchDesc));
+    return true;
+}
+
+SFUStatus SFU::validatePrimitiveDescriptor(const SFUPrimitiveDesc& desc) const
+{
+    if (desc.dtype != GOLEM_DTYPE_FP32_VALUE) {
+        return SFUStatus::UnsupportedElemBytes;
+    }
+    if (desc.input0_gm_addr == 0 || desc.output_gm_addr == 0 || desc.elem_count == 0) {
+        return SFUStatus::InvalidShape;
+    }
+    if (effectiveStride(desc.input0_stride_bytes) < sizeof(float) ||
+        effectiveStride(desc.output_stride_bytes) < sizeof(float)) {
+        return SFUStatus::InvalidShape;
+    }
+
+    switch (desc.op) {
+        case static_cast<uint32_t>(SFUPrimitiveOp::EXP):
+        case static_cast<uint32_t>(SFUPrimitiveOp::LOG):
+        case static_cast<uint32_t>(SFUPrimitiveOp::RECIPROCAL):
+        case static_cast<uint32_t>(SFUPrimitiveOp::RSQRT):
+        case static_cast<uint32_t>(SFUPrimitiveOp::TANH):
+        case static_cast<uint32_t>(SFUPrimitiveOp::SIGMOID):
+            return SFUStatus::Success;
+        default:
+            return SFUStatus::InvalidDescriptor;
+    }
+}
+
+SFUStatus SFU::validatePrimitiveBatchDescriptor(const SFUPrimitiveBatchDesc& desc) const
+{
+    if (desc.desc_array_gm_addr == 0 || desc.desc_count == 0 ||
+        desc.desc_count > GOLEM_SFU_PRIMITIVE_BATCH_MAX_DESCS) {
+        return SFUStatus::InvalidShape;
+    }
+    return SFUStatus::Success;
+}
+
+bool SFU::executePrimitiveDesc(uint64_t descAddr, uint64_t tag, uint64_t* processedElems)
+{
+    PrimitiveOpState state = {};
+    state.descAddr = descAddr;
+    state.tag = tag;
+    state.status = SFUStatus::Success;
+
+    if (!readPrimitiveDescriptor(descAddr, &state.desc)) {
+        return false;
+    }
+    state.status = validatePrimitiveDescriptor(state.desc);
+    if (state.status != SFUStatus::Success) {
+        return false;
+    }
+    if (!readPrimitiveInput(state.desc, &state.input0)) {
+        return false;
+    }
+    if (!executePrimitive(&state)) {
+        return false;
+    }
+    if (!writePrimitiveOutput(state.desc, state.output)) {
+        return false;
+    }
+    if (processedElems != nullptr) {
+        *processedElems = primitiveProcessedElems(state.desc);
+    }
+    return true;
+}
+
+bool SFU::readPrimitiveInput(const SFUPrimitiveDesc& desc, std::vector<float>* values)
+{
+    if (globalMem_ == nullptr || values == nullptr) {
+        return false;
+    }
+
+    values->assign(desc.elem_count, 0.0f);
+    const uint32_t stride = effectiveStride(desc.input0_stride_bytes);
+    if (stride == sizeof(float)) {
+        std::vector<uint8_t> raw;
+        const size_t byteCount = static_cast<size_t>(desc.elem_count) * sizeof(float);
+        globalMem_->rd_from_globalmem(desc.input0_gm_addr, byteCount, raw);
+        if (raw.size() != byteCount) {
+            return false;
+        }
+        std::memcpy(values->data(), raw.data(), byteCount);
+        return true;
+    }
+
+    for (uint32_t i = 0; i < desc.elem_count; ++i) {
+        std::vector<uint8_t> raw;
+        globalMem_->rd_from_globalmem(desc.input0_gm_addr + static_cast<uint64_t>(i) * stride,
+                                      sizeof(float), raw);
+        if (raw.size() != sizeof(float)) {
+            return false;
+        }
+        float value = 0.0f;
+        std::memcpy(&value, raw.data(), sizeof(float));
+        (*values)[i] = value;
+    }
+    return true;
+}
+
+bool SFU::executePrimitive(PrimitiveOpState* state)
+{
+    if (state == nullptr) {
+        return false;
+    }
+
+    state->output.assign(state->input0.size(), 0.0f);
+    for (size_t i = 0; i < state->input0.size(); ++i) {
+        const float value = state->input0[i];
+        switch (state->desc.op) {
+            case static_cast<uint32_t>(SFUPrimitiveOp::EXP):
+                state->output[i] = static_cast<float>(std::exp(static_cast<double>(value)));
+                break;
+            case static_cast<uint32_t>(SFUPrimitiveOp::LOG):
+                state->output[i] = static_cast<float>(std::log(static_cast<double>(value)));
+                break;
+            case static_cast<uint32_t>(SFUPrimitiveOp::RECIPROCAL):
+                state->output[i] = 1.0f / value;
+                break;
+            case static_cast<uint32_t>(SFUPrimitiveOp::RSQRT):
+                state->output[i] = 1.0f / static_cast<float>(std::sqrt(static_cast<double>(value)));
+                break;
+            case static_cast<uint32_t>(SFUPrimitiveOp::TANH):
+                state->output[i] = static_cast<float>(std::tanh(static_cast<double>(value)));
+                break;
+            case static_cast<uint32_t>(SFUPrimitiveOp::SIGMOID):
+                state->output[i] = 1.0f / (1.0f + static_cast<float>(std::exp(-static_cast<double>(value))));
+                break;
+            default:
+                return false;
+        }
+    }
+    return true;
+}
+
+bool SFU::writePrimitiveOutput(const SFUPrimitiveDesc& desc, const std::vector<float>& values)
+{
+    if (globalMem_ == nullptr || values.size() != desc.elem_count) {
+        return false;
+    }
+
+    const uint32_t stride = effectiveStride(desc.output_stride_bytes);
+    if (stride == sizeof(float)) {
+        std::vector<uint8_t> raw(values.size() * sizeof(float));
+        std::memcpy(raw.data(), values.data(), raw.size());
+        globalMem_->wr_to_globalmem(desc.output_gm_addr, raw.size(), raw);
+        return true;
+    }
+
+    for (uint32_t i = 0; i < desc.elem_count; ++i) {
+        std::vector<uint8_t> raw;
+        appendBytes(raw, values[i]);
+        globalMem_->wr_to_globalmem(desc.output_gm_addr + static_cast<uint64_t>(i) * stride,
+                                    raw.size(), raw);
+    }
+    return true;
+}
+
+uint64_t SFU::primitiveProcessedElems(const SFUPrimitiveDesc& desc) const
+{
+    if ((desc.flags & GOLEM_SFU_PRIMITIVE_FLAG_REPEAT_CHUNK) == 0) {
+        return desc.elem_count;
+    }
+    return desc.input1_gm_addr > desc.elem_count ? desc.input1_gm_addr : desc.elem_count;
 }
 
 bool SFU::readSoftmaxDescriptor(uint64_t descAddr, SFUSoftmaxTileDesc* desc)

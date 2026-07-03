@@ -45,6 +45,14 @@ class RoCCSfuIntegrationTest(unittest.TestCase):
             self.text,
             r"constexpr\s+uint8_t\s+GOLEM_ROCC_FUNC7_SFU_WAIT\s*=\s*0x18\s*;",
         )
+        self.assertRegex(
+            self.text,
+            r"constexpr\s+uint8_t\s+GOLEM_ROCC_FUNC7_SFU_PRIMITIVE\s*=\s*0x19\s*;",
+        )
+        self.assertRegex(
+            self.text,
+            r"constexpr\s+uint8_t\s+GOLEM_ROCC_FUNC7_SFU_PRIMITIVE_WAIT\s*=\s*0x1a\s*;",
+        )
 
     def test_loads_sfu_only_when_enabled_and_binds_resources(self):
         self.assertIn("#include <sst/elements/golem/sfu/sfu.h>", self.text)
@@ -68,6 +76,22 @@ class RoCCSfuIntegrationTest(unittest.TestCase):
         self.assertIn("GOLEM_ROCC_FUNC7_SFU_SOFTMAX_TILE", self.text)
         self.assertIn("GOLEM_ROCC_FUNC7_SFU_WAIT", self.text)
         self.assertIn("sfu->issueSoftmaxTile", self.text)
+        self.assertIn("sfu->wait", self.text)
+
+    def test_tick_dispatches_sfu_primitive_commands_without_using_busy_path(self):
+        self.assertIn("tryIssueSfuPrimitiveCommand", self.text)
+        self.assertIn("tryWaitSfuPrimitiveCommand", self.text)
+        self.assertIn("GOLEM_ROCC_FUNC7_SFU_PRIMITIVE", self.text)
+        self.assertIn("GOLEM_ROCC_FUNC7_SFU_PRIMITIVE_WAIT", self.text)
+        self.assertIn("sfu->issuePrimitive", self.text)
+        self.assertIn("sfu->wait", self.text)
+
+    def test_tick_dispatches_sfu_primitive_batch_commands_without_using_busy_path(self):
+        self.assertIn("tryIssueSfuPrimitiveBatchCommand", self.text)
+        self.assertIn("tryWaitSfuPrimitiveBatchCommand", self.text)
+        self.assertIn("GOLEM_ROCC_FUNC7_SFU_PRIMITIVE_BATCH", self.text)
+        self.assertIn("GOLEM_ROCC_FUNC7_SFU_PRIMITIVE_BATCH_WAIT", self.text)
+        self.assertIn("sfu->issuePrimitiveBatch", self.text)
         self.assertIn("sfu->wait", self.text)
 
 
