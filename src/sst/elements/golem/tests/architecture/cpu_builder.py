@@ -207,6 +207,8 @@ sfu_max_inflight = os.getenv("GOLEM_SFU_MAX_INFLIGHT", "8")
 sfu_stats_latency = os.getenv("GOLEM_SFU_STATS_LATENCY", "1")
 sfu_merge_latency = os.getenv("GOLEM_SFU_MERGE_LATENCY", "1")
 sfu_normalize_latency = os.getenv("GOLEM_SFU_NORMALIZE_LATENCY", "1")
+sfu_distributed_reduction_transport = os.getenv("GOLEM_SFU_DISTRIBUTED_REDUCTION_TRANSPORT", "shared")
+sfu_reduction_vn = os.getenv("GOLEM_SFU_REDUCTION_VN", "")
 sfu_verbose = os.getenv("GOLEM_SFU_VERBOSE", "0")
 
 num_arrays = int(os.getenv("GOLEM_NUM_ARRAYS", 1))
@@ -649,6 +651,7 @@ class CPU_Builder:
             cpu_rocc.addParam("groupCtrlEnable", ctrl_link_enable)
             cpu_rocc.addParam("requestSchedulerEnable", request_scheduler_enable)
             cpu_rocc.addParam("sfuEnable", 1 if sfu_enable else 0)
+            cpu_rocc.addParam("active_worker_cores", active_worker_cores)
             cpu_rocc.addParam("groupCtrlLatency", ctrl_link_latency)
             cpu_rocc.addParam("groupCtrlQueueDepth", ctrl_link_queue_depth)
             cpu_rocc.addParam(
@@ -703,6 +706,8 @@ class CPU_Builder:
             mem_node_size = os.getenv("GOLEM_MEM_NODE_SIZE", "")
             if mem_node_size:
                 gm_params["memNodeSize"] = mem_node_size
+            if sfu_reduction_vn:
+                gm_params["reduction_vn"] = sfu_reduction_vn
             GlobalMemory.addParams(gm_params)
 
             if sfu_enable:
@@ -715,6 +720,7 @@ class CPU_Builder:
                         "stats_latency": sfu_stats_latency,
                         "merge_latency": sfu_merge_latency,
                         "normalize_latency": sfu_normalize_latency,
+                        "distributed_reduction_transport": sfu_distributed_reduction_transport,
                         "verbose": sfu_verbose,
                     }
                 )

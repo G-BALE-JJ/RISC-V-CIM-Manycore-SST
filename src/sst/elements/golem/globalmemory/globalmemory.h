@@ -38,6 +38,60 @@ static constexpr uint8_t MEMORY_ROUTERS[4] = {16, 17, 18, 19};
 
 using DmaCallback = std::function<void(bool)>;
 
+enum class ReductionTransportMessageKind {
+    MaxRequest,
+    MaxResponse,
+    SumRequest,
+    SumResponse,
+};
+
+struct ReductionTransportMessage {
+    ReductionTransportMessageKind kind = ReductionTransportMessageKind::MaxRequest;
+    uint64_t jobId = 0;
+    uint64_t tag = 0;
+    uint32_t ownerCore = 0;
+    uint32_t workerSlot = 0;
+    uint32_t row = 0;
+    uint32_t expectedWorkers = 0;
+    uint32_t expectedRows = 0;
+    uint32_t expectedCols = 0;
+    uint64_t sendCycle = 0;
+    double value = 0.0;
+
+    void serialize_order(SST::Core::Serialization::serializer& ser) {
+        ser & kind;
+        ser & jobId;
+        ser & tag;
+        ser & ownerCore;
+        ser & workerSlot;
+        ser & row;
+        ser & expectedWorkers;
+        ser & expectedRows;
+        ser & expectedCols;
+        ser & sendCycle;
+        ser & value;
+    }
+};
+
+class ReductionTransportEvent : public SST::Event {
+public:
+    ReductionTransportEvent() = default;
+    explicit ReductionTransportEvent(const ReductionTransportMessage& message)
+        : message_(message) {}
+
+    const ReductionTransportMessage& getMessage() const { return message_; }
+
+    void serialize_order(SST::Core::Serialization::serializer& ser) override {
+        Event::serialize_order(ser);
+        ser & message_;
+    }
+
+    ImplementSerializable(SST::Golem::ReductionTransportEvent);
+
+private:
+    ReductionTransportMessage message_;
+};
+
 class NetworkDataEvent : public Event {
 public:
     // 枚举类型表示事件类型: READ=读请求, WRITE=写请求或读回复, DMA_WRITE=DMA写请求,
@@ -116,6 +170,7 @@ public:
 
     // 定义虚函数
     using DmaCallback = ::SST::Golem::DmaCallback;
+    using ReductionMessageHandler = std::function<void(const ReductionTransportMessage&)>;
     virtual void wr_to_globalmem(uint64_t wr_addr, size_t length, const std::vector<uint8_t>& wr_data) = 0;
     virtual void rd_from_globalmem(uint64_t rd_addr, size_t length, std::vector<uint8_t>& rd_data) = 0;
     virtual void wr_to_network(uint64_t wr_addr, size_t length, std::vector<uint8_t>& wr_data) = 0;
@@ -125,6 +180,10 @@ public:
     virtual uint64_t getSize() const = 0;
     virtual void dma_write_to_host(uint64_t dst_pa, size_t length, const std::vector<uint8_t>& data, DmaCallback cb) = 0;
     virtual void dma_read_from_host_to_globalmem(uint64_t src_pa, size_t length, uint64_t gm_dst_addr, DmaCallback cb) = 0;
+    virtual bool reductionNetworkAvailable() const = 0;
+    virtual bool sendReductionMessage(uint32_t destinationCore,
+                                      const ReductionTransportMessage& message) = 0;
+    virtual void setReductionMessageHandler(ReductionMessageHandler handler) = 0;
 };
 
 
@@ -161,8 +220,15 @@ public:
         {"dma_read_max_inflight", "Maximum in-flight DMA READ chunks per core", "8"},
         {"dma_burst_bytes", "DMA chunk size in bytes for read/write burst splitting", "64"},
         {"dma_retry_tick_cpu_cycles", "CPU cycles represented by one DMA retry tick", "1"},
+        {"reduction_vn", "Virtual network for reduction transport (defaults to request VN).", ""},
         {"memoryRouters", "Comma-separated memory router IDs for DMA fallback routing (e.g., \"24,0,1,2,3\")", ""}
     })
+
+    SST_ELI_DOCUMENT_STATISTICS(
+        {"gmem_reduction_send_immediate", "Reduction messages sent immediately", "messages", 1},
+        {"gmem_reduction_send_queued", "Reduction messages queued for later send", "messages", 1},
+        {"gmem_reduction_send_rejected", "Reduction messages rejected before transport ownership", "messages", 1},
+        {"gmem_reduction_received", "Reduction messages received from the network", "messages", 1})
 
     SST_ELI_DOCUMENT_SUBCOMPONENT_SLOTS(
         {"networkIF", "Network interface (SimpleNetwork)", "SST::Interfaces::SimpleNetwork"},
@@ -196,6 +262,10 @@ public:
 
     void dma_write_to_host(uint64_t dst_pa, size_t length, const std::vector<uint8_t>& data, DmaCallback cb) override;
     void dma_read_from_host_to_globalmem(uint64_t src_pa, size_t length, uint64_t gm_dst_addr, DmaCallback cb) override;
+    bool reductionNetworkAvailable() const override;
+    bool sendReductionMessage(uint32_t destinationCore,
+                              const ReductionTransportMessage& message) override;
+    void setReductionMessageHandler(ReductionMessageHandler handler) override;
     uint64_t dma_write_to_host_async(uint64_t dst_pa, size_t length, const std::vector<uint8_t>& data);
     uint64_t dma_read_from_host_to_globalmem_async(uint64_t src_pa, size_t length, uint64_t gm_dst_addr);
     bool dma_completion_done(uint64_t token) const;
@@ -366,6 +436,7 @@ private:
     bool dma_retry_event_scheduled = false;
     uint32_t request_vn = 0;
     uint32_t response_vn = 0;
+    uint32_t reduction_vn = 0;
     uint64_t dma_retry_tick_counter = 0;
     uint64_t dma_read_send_immediate_count = 0;
     uint64_t dma_read_send_queued_count = 0;
@@ -396,6 +467,14 @@ private:
     uint64_t request_read_submit_ready_samples = 0;
     uint64_t request_read_submit_ready_cycles_sum = 0;
     uint64_t request_read_submit_ready_cycles_max = 0;
+    uint64_t reduction_send_immediate_count = 0;
+    uint64_t reduction_send_queued_count = 0;
+    uint64_t reduction_receive_count = 0;
+    Statistic<uint64_t>* statReductionSendImmediate_ = nullptr;
+    Statistic<uint64_t>* statReductionSendQueued_ = nullptr;
+    Statistic<uint64_t>* statReductionSendRejected_ = nullptr;
+    Statistic<uint64_t>* statReductionReceived_ = nullptr;
+    ReductionMessageHandler reduction_message_handler;
     size_t send_retry_queue_max_depth = 0;
     std::unordered_map<SST::Interfaces::SimpleNetwork::Request*, uint64_t> dma_read_req_to_key;
 
@@ -440,6 +519,9 @@ public:
     uint64_t getSize() const override { return size; }
     void dma_write_to_host(uint64_t, size_t, const std::vector<uint8_t>&, DmaCallback) override;
     void dma_read_from_host_to_globalmem(uint64_t, size_t, uint64_t, DmaCallback) override;
+    bool reductionNetworkAvailable() const override { return false; }
+    bool sendReductionMessage(uint32_t, const ReductionTransportMessage&) override { return false; }
+    void setReductionMessageHandler(ReductionMessageHandler) override {}
     uint64_t dma_write_to_host_async(uint64_t dst_pa, size_t length, const std::vector<uint8_t>& data);
     uint64_t dma_read_from_host_to_globalmem_async(uint64_t src_pa, size_t length, uint64_t gm_dst_addr);
     bool dma_completion_done(uint64_t token) const;

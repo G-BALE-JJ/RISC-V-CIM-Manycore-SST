@@ -41,6 +41,10 @@ class SfuComponentScaffoldTest(unittest.TestCase):
         self.assertIn("sfu/sfu.h", makefile)
         self.assertIn("sfu/sfu.cc", makefile)
 
+    def test_golem_eli_aggregation_includes_global_memory_registration(self):
+        golem_cc = read_rel("golem.cc")
+        self.assertIn("#include <sst/elements/golem/globalmemory/globalmemory.h>", golem_cc)
+
 
 if __name__ == "__main__":
     unittest.main()

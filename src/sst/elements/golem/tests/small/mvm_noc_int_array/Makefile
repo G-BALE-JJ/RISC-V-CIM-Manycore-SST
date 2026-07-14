@@ -1,5 +1,6 @@
 CC=$(ARCH)-linux-musl-gcc
-CXX=$(ARCH)-linux-musl-g++
+RISCV_MUSL_TOOLCHAIN_BIN ?= /data/lzq/packages/install/riscv64_musl_toolchain/bin
+CXX=$(RISCV_MUSL_TOOLCHAIN_BIN)/riscv64-linux-musl-g++
 
 LDFLAGS=-static -fopenmp
 LDFLAGS_PTHREAD=-static -pthread

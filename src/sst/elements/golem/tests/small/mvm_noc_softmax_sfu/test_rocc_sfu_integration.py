@@ -8,6 +8,7 @@ import unittest
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 GOLEM_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "..", ".."))
 ROCC = os.path.join(GOLEM_DIR, "rocc", "roccAnalog.h")
+EX_INSTR = os.path.join(SCRIPT_DIR, "ex_instr.h")
 
 
 def read_rocc():
@@ -15,10 +16,16 @@ def read_rocc():
         return f.read()
 
 
+def read(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
 class RoCCSfuIntegrationTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.text = read_rocc()
+        cls.ex_instr_header = read(EX_INSTR)
 
     def test_existing_gemm_func7_values_are_unchanged(self):
         expected = {
@@ -93,6 +100,17 @@ class RoCCSfuIntegrationTest(unittest.TestCase):
         self.assertIn("GOLEM_ROCC_FUNC7_SFU_PRIMITIVE_BATCH_WAIT", self.text)
         self.assertIn("sfu->issuePrimitiveBatch", self.text)
         self.assertIn("sfu->wait", self.text)
+
+    def test_rocc_declares_unified_sfu_job_func7(self):
+        self.assertIn("GOLEM_ROCC_FUNC7_SFU_JOB = 0x1d", self.text)
+        self.assertIn("GOLEM_ROCC_FUNC7_SFU_JOB", self.ex_instr_header)
+        self.assertIn("static inline void sfu_job", self.ex_instr_header)
+        self.assertIn("static inline uint64_t sfu_job_wait", self.ex_instr_header)
+
+    def test_rocc_routes_unified_sfu_job_to_issue_job_api(self):
+        self.assertIn("tryIssueSfuJobCommand", self.text)
+        self.assertIn("sfu->issueJob(cmd->rs1, cmd->rs2)", self.text)
+        self.assertIn("GOLEM_ROCC_FUNC7_SFU_JOB", self.text)
 
 
 if __name__ == "__main__":

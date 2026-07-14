@@ -9,6 +9,7 @@
 #include <cctype>
 #include <sstream>
 #include <limits>
+#include <new>
 
 #include "sst/elements/memHierarchy/memNICBase.h"
 #include "sst/elements/memHierarchy/memLinkBase.h"
@@ -116,6 +117,16 @@ GlobalMemoryImplement::GlobalMemoryImplement(ComponentId_t id, Params& params)
     // - Move replies to VN1 when available for request/reply separation.
     request_vn = 0;
     response_vn = (num_vns >= 2) ? 1 : 0;
+    reduction_vn = params.find<uint32_t>("reduction_vn", request_vn);
+    if (reduction_vn >= static_cast<uint32_t>(num_vns)) {
+        output->fatal(CALL_INFO, -1,
+                      "GlobalMemory '%s' reduction_vn=%u is outside num_vns=%d\n",
+                      getName().c_str(), reduction_vn, num_vns);
+    }
+    statReductionSendImmediate_ = registerStatistic<uint64_t>("gmem_reduction_send_immediate");
+    statReductionSendQueued_ = registerStatistic<uint64_t>("gmem_reduction_send_queued");
+    statReductionSendRejected_ = registerStatistic<uint64_t>("gmem_reduction_send_rejected");
+    statReductionReceived_ = registerStatistic<uint64_t>("gmem_reduction_received");
 
     // 读取 Identity Window 基础地址
     identityWindowBase = params.find<uint64_t>("identityWindowBase", 0x04000000ULL);
@@ -182,8 +193,8 @@ GlobalMemoryImplement::GlobalMemoryImplement(ComponentId_t id, Params& params)
                     "GlobalMemory DMA fallback routers: [%s]\n",
                     routers_desc.str().c_str());
     output->verbose(CALL_INFO, 2, 0,
-                    "GlobalMemory VN mapping: request_vn=%u response_vn=%u (num_vns=%d)\n",
-                    request_vn, response_vn, num_vns);
+                    "GlobalMemory VN mapping: request_vn=%u response_vn=%u reduction_vn=%u (num_vns=%d)\n",
+                    request_vn, response_vn, reduction_vn, num_vns);
     output->verbose(CALL_INFO, 2, 0,
                     "GlobalMemory DMA window: max_inflight=%u retry_ticks=%u max_retries=%u\n",
                     dma_read_max_inflight, dma_read_retry_ticks, dma_read_max_retries);
@@ -322,6 +333,65 @@ void GlobalMemoryImplement::ctrlRegisterPendingReadRequest(uint64_t requestId, u
 bool GlobalMemoryImplement::ctrlIsReadRequestPending(uint64_t requestId) const
 {
     return request_pending.find(requestId) != request_pending.end();
+}
+
+bool GlobalMemoryImplement::reductionNetworkAvailable() const
+{
+    return link_control != nullptr && reduction_vn < static_cast<uint32_t>(num_vns);
+}
+
+void GlobalMemoryImplement::setReductionMessageHandler(ReductionMessageHandler handler)
+{
+    reduction_message_handler = std::move(handler);
+}
+
+bool GlobalMemoryImplement::sendReductionMessage(uint32_t destinationCore,
+                                                  const ReductionTransportMessage& message)
+{
+    if (!reductionNetworkAvailable() ||
+        destinationCore > static_cast<uint32_t>(std::numeric_limits<int>::max())) {
+        statReductionSendRejected_->addData(1);
+        return false;
+    }
+
+    if (network_id == -1) {
+        network_id = link_control->getEndpointID();
+        coreEndpointMap[core_id] = network_id;
+    }
+
+    const auto destination = coreEndpointMap.find(static_cast<int>(destinationCore));
+    if (destination == coreEndpointMap.end() || destination->second < 0) {
+        statReductionSendRejected_->addData(1);
+        return false;
+    }
+
+    auto* req = new (std::nothrow) SST::Interfaces::SimpleNetwork::Request();
+    ReductionTransportMessage stampedMessage = message;
+    stampedMessage.sendCycle = getCurrentSimCycle();
+    auto* payload = new ReductionTransportEvent(stampedMessage);
+    if (req == nullptr || payload == nullptr) {
+        delete req;
+        delete payload;
+        statReductionSendRejected_->addData(1);
+        return false;
+    }
+
+    req->size_in_bits = sizeof(ReductionTransportMessage) * 8;
+    req->src = network_id;
+    req->dest = static_cast<SST::Interfaces::SimpleNetwork::nid_t>(destination->second);
+    req->vn = reduction_vn;
+    req->givePayload(payload);
+
+    const bool immediateSend = try_send_or_queue(req, "sendReductionMessage");
+    if (immediateSend) {
+        reduction_send_immediate_count++;
+        statReductionSendImmediate_->addData(1);
+    } else {
+        // try_send_or_queue retains ownership in send_retry_queue on a full NIC.
+        reduction_send_queued_count++;
+        statReductionSendQueued_->addData(1);
+    }
+    return true;
 }
 
 bool GlobalMemoryImplement::try_send_or_queue(SST::Interfaces::SimpleNetwork::Request* req, const char* context)
@@ -943,6 +1013,15 @@ void GlobalMemoryImplement::finish() {
                    request_avg_submit_ready_cycles,
                    request_read_submit_ready_cycles_max,
                    send_retry_queue_max_depth);
+    if (reduction_send_immediate_count != 0 || reduction_send_queued_count != 0 ||
+        reduction_receive_count != 0) {
+        output->output("GlobalMemory core=%d reduction transport stats: immediate_send=%" PRIu64
+                       " queued_send=%" PRIu64 " received=%" PRIu64 "\n",
+                       core_id,
+                       reduction_send_immediate_count,
+                       reduction_send_queued_count,
+                       reduction_receive_count);
+    }
     link_control->finish();
 }
 
@@ -1235,6 +1314,16 @@ bool GlobalMemoryImplement::handle_receives(int vn) {
         handled_any = true;
         // 获取并转换请求中的事件负载
         Event* ev_base = req->takePayload();
+        if (auto* reductionEvent = dynamic_cast<ReductionTransportEvent*>(ev_base)) {
+            reduction_receive_count++;
+            statReductionReceived_->addData(1);
+            if (reduction_message_handler) {
+                reduction_message_handler(reductionEvent->getMessage());
+            }
+            delete reductionEvent;
+            delete req;
+            continue;
+        }
         NetworkDataEvent* ev = dynamic_cast<NetworkDataEvent*>(ev_base);
         if (!ev) {
             // 收到非预期的事件类型，忽略处理

@@ -12,17 +12,47 @@ cd "$SCRIPT_DIR"
 RUN_START_EPOCH="$(date +%s)"
 RUN_ID="${GOLEM_RUN_ID:-run_$(date +%Y%m%d_%H%M%S)_$$}"
 DRAMSIM3_LIB_DIR="${DRAMSIM3_LIB_DIR:-/data4/lishun/pkg/DRAMsim3}"
+RISCV_MUSL_TOOLCHAIN_BIN="${RISCV_MUSL_TOOLCHAIN_BIN:-/data/lzq/packages/install/riscv64_musl_toolchain/bin}"
+SST_CORE_HOME="${SST_CORE_HOME:-/data4/jjgong/local/sstcore}"
+SST_ELEMENTS_HOME="${SST_ELEMENTS_HOME:-/data4/jjgong/RISC-V-CIM-Manycore-SST/install}"
+SST_BUILD_LIB_PATH="${SST_BUILD_LIB_PATH:-/data4/jjgong/RISC-V-CIM-Manycore-SST/build/sst-elements/src/sst/elements/golem/.libs}"
+SST_INSTALL_LIB_PATH="${SST_INSTALL_LIB_PATH:-/data4/jjgong/RISC-V-CIM-Manycore-SST/install/lib/sst-elements-library}"
+if [[ -z "${SST_LIB_PATH+x}" ]]; then
+	if [[ -f "$SST_BUILD_LIB_PATH/libgolem.so" ]]; then
+		SST_LIB_PATH="$SST_BUILD_LIB_PATH"
+	else
+		SST_LIB_PATH="$SST_INSTALL_LIB_PATH"
+	fi
+fi
+CONDA_LIB_DIR="${CONDA_LIB_DIR:-/data4/jjgong/miniconda3/lib}"
+REAL_SST_BIN="${REAL_SST_BIN:-$SST_CORE_HOME/bin/sst}"
+export RISCV_MUSL_TOOLCHAIN_BIN
 
 if [[ -d "$DRAMSIM3_LIB_DIR" ]]; then
 	export LD_LIBRARY_PATH="$DRAMSIM3_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 fi
 
+export SST_CORE_HOME
+export SST_ELEMENTS_HOME
+export SST_LIB_PATH
+export SST_SOFTMAX_LD_LIBRARY_PATH="${SST_SOFTMAX_LD_LIBRARY_PATH:-$CONDA_LIB_DIR:$SST_LIB_PATH:$SST_INSTALL_LIB_PATH:$SST_CORE_HOME/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"
+export LD_LIBRARY_PATH="$SST_SOFTMAX_LD_LIBRARY_PATH"
+
 DEFAULT_PRESET_FILE="$SCRIPT_DIR/configs/default.env"
 AUTO_PRESET_FILE=""
+CALLER_SET_GOLEM_ARCH_SCRIPT=0
+CALLER_GOLEM_ARCH_SCRIPT=""
+if [[ -n "${GOLEM_ARCH_SCRIPT+x}" ]]; then
+	CALLER_SET_GOLEM_ARCH_SCRIPT=1
+	CALLER_GOLEM_ARCH_SCRIPT="$GOLEM_ARCH_SCRIPT"
+fi
 if [[ -f "$DEFAULT_PRESET_FILE" ]]; then
 	# shellcheck source=/dev/null
 	source "$DEFAULT_PRESET_FILE"
 	AUTO_PRESET_FILE="$DEFAULT_PRESET_FILE"
+fi
+if [[ "$CALLER_SET_GOLEM_ARCH_SCRIPT" -eq 1 ]]; then
+	GOLEM_ARCH_SCRIPT="$CALLER_GOLEM_ARCH_SCRIPT"
 fi
 
 STATS_DIR_FROM_ENV=0
@@ -1795,7 +1825,7 @@ echo "  GOLEM_DUMP_C_FILE=${GOLEM_DUMP_C_FILE:-<none>}"
 	echo "  LOG_PATH=$LOG_PATH"
 
 GEN_HBM_CMD=(python3 tools/gen_hbm_init.py)
-SST_CMD=(sst)
+SST_CMD=("$REAL_SST_BIN")
 if [[ -n "$GOLEM_SST_ARGS" ]]; then
 	read -r -a SST_EXTRA_ARGS <<< "$GOLEM_SST_ARGS"
 	SST_CMD+=("${SST_EXTRA_ARGS[@]}")

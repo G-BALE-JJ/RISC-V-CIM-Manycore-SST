@@ -23,6 +23,7 @@
 #include <sst/elements/golem/groupctrl/groupctrl.h>
 #include <sst/elements/golem/requestscheduler/requestscheduler.h>
 #include <sst/elements/golem/sfu/sfu.h>
+#include <sst/elements/golem/globalmemory/globalmemory.h>
 
 #ifdef HAVE_NUMPY
 #include <sst/elements/golem/array/crossSimComputeArray.h>
