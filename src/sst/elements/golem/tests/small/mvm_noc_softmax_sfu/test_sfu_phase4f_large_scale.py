@@ -1,6 +1,7 @@
 import dataclasses
 import csv
 import fcntl
+import hashlib
 import importlib.util
 import os
 import pathlib
@@ -9,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 SCRIPT = pathlib.Path(__file__).with_name("plot_sfu_phase4f_large_scale.py")
@@ -1152,6 +1154,250 @@ class Phase4FArtifactParserTest(unittest.TestCase):
             f"run_id={record.run_id} output_sha256={record.output_sha256}\n",
         )
         self.assertEqual(result.stderr, "")
+
+
+class Phase4FReportTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.temp.name)
+        self.records = []
+        for index, spec in enumerate(phase4f.DEFAULT_POINTS):
+            child = SyntheticChild(self.root / f"child-{index}", spec)
+            record = phase4f.parse_child_point(child.root, spec, child.verifier)
+            simulated_time = {
+                (16, 512, 16): 800.0,
+                (16, 1024, 16): 1400.0,
+                (16, 2048, 16): 2500.0,
+                (16, 4096, 16): 4000.0,
+                (16, 4096, 4): 10000.0,
+                (16, 4096, 8): 6000.0,
+                (64, 4096, 16): 15000.0,
+                (256, 4096, 16): 56000.0,
+            }[(spec.rows, spec.dim, spec.worker_cores)]
+            self.records.append(dataclasses.replace(
+                record,
+                simulated_time_us=simulated_time,
+                latency_avg_cycles=float(20 + index),
+                latency_max_cycles=40 + index,
+                total_send_packets=1000 + index,
+                total_send_bits=100000 + index,
+                total_xbar_stalls=10 + index,
+            ))
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    @staticmethod
+    def failure(record, status="TIMEOUT", exit_code=124):
+        return dataclasses.replace(
+            record,
+            status=status,
+            exit_code=exit_code,
+            artifact_validation=status,
+            golden_checked=None,
+            golden_mismatches=None,
+            transport_events=None,
+            transport_immediate=None,
+            transport_queued=None,
+            transport_rejected=None,
+            transport_stale=None,
+            inbox_high_water=None,
+            latency_avg_cycles=None,
+            latency_max_cycles=None,
+            total_send_packets=None,
+            total_send_bits=None,
+            total_xbar_stalls=None,
+            simulated_time_us=None,
+            wall_time_sec=None,
+            dma_timeout_retry=None,
+            dma_timeout_exhausted=None,
+            dma_write_timeout_retry=None,
+            output_sha256=None,
+        )
+
+    @staticmethod
+    def marker_text(record):
+        spec = record.spec
+        child_hash = "a" * 64
+        pipeline_hash = "b" * 64
+        signature = ";".join((
+            "schema=phase4f-parent-v1",
+            f"stage={spec.stage}",
+            f"rows={spec.rows}",
+            f"dim={spec.dim}",
+            f"workers={spec.worker_cores}",
+            f"bands={spec.band_cores}",
+            "cooperative_groups=1",
+            "transport=explicit_noc",
+            "request_vn=0",
+            "ordinary_response_vn=1",
+            "reduction_vn=0",
+            "num_vns=3",
+            "dma_response_vn=0",
+            "noc_link_bw=1200GB/s",
+            "noc_xbar_bw=1200GB/s",
+            "dirctrl_highlink_bw=1200GB/s",
+            "noc_input_buffer=512KB",
+            "noc_output_buffer=512KB",
+            "gm_buffer=1024KB",
+            "flit_size=128B",
+            "inter_router_no_cut=0",
+            "local_no_cut=0",
+            f"mem_node_size={spec.mem_node_size}",
+            f"timeout_sec={spec.timeout_sec}",
+            "chunk=256",
+            "staging_rows=4",
+            "job_rows=4",
+            "retry_ticks=1024",
+            "max_retries=8",
+            f"child_runner_sha256={child_hash}",
+            f"pipeline_args_sha256={pipeline_hash}",
+        ))
+        signature_hash = hashlib.sha256(signature.encode("utf-8")).hexdigest()
+        return (
+            "schema=phase4f-parent-v1\nstate=PASS\n"
+            f"signature_sha256={signature_hash}\nsignature={signature}\n"
+            f"child_runner_sha256={child_hash}\n"
+            f"pipeline_args_sha256={pipeline_hash}\n"
+            f"child_root={record.child_root}\n"
+            f"output_sha256={record.output_sha256}\n"
+        )
+
+    def test_complete_matrix_and_lifecycle_gates(self):
+        phase4f.validate_complete_matrix(self.records)
+        invalid = (
+            self.records[:-1],
+            self.records + [self.records[0]],
+            [dataclasses.replace(self.records[0], noc_link_bw="25GB/s")] + self.records[1:],
+            [dataclasses.replace(self.records[0], transport_stale=1)] + self.records[1:],
+        )
+        for records in invalid:
+            with self.subTest(length=len(records)), self.assertRaises(ValueError):
+                phase4f.validate_complete_matrix(records)
+
+    def test_metrics_use_four_worker_baseline_without_single_worker(self):
+        metrics = phase4f.derive_metrics(self.records)
+        self.assertEqual(metrics["r16_d4096_w4_time_per_row_us"], 625.0)
+        self.assertAlmostEqual(metrics["r16_d4096_w4_time_per_element_us"], 10000 / 65536)
+        self.assertEqual(metrics["r16_d4096_w4_speedup"], 1.0)
+        self.assertAlmostEqual(metrics["r16_d4096_w8_speedup"], 10 / 6)
+        self.assertAlmostEqual(metrics["r16_d4096_w8_efficiency"], (10 / 6) / 2)
+        self.assertEqual(metrics["r16_d4096_w16_speedup"], 2.5)
+        self.assertEqual(metrics["r16_d4096_w16_efficiency"], 2.5 / 4)
+        self.assertAlmostEqual(metrics["r16_d4096_w8_marginal_gain"], 0.4)
+        self.assertAlmostEqual(metrics["r16_d4096_w16_marginal_gain"], 1 / 3)
+        self.assertFalse(any(
+            re.search(r"(?:^|_)w1(?:_|$)", key) or "single" in key
+            for key in metrics
+        ))
+
+    def test_failed_outcome_round_trips_without_performance(self):
+        outcomes = self.records[:-1] + [self.failure(self.records[-1])]
+        phase4f.validate_complete_matrix(outcomes)
+        path = self.root / "source.csv"
+        phase4f.write_source_csv(outcomes, path)
+        loaded = phase4f.load_source_csv(path)
+        self.assertEqual(loaded, outcomes)
+        with path.open(newline="", encoding="utf-8") as handle:
+            rows = list(csv.DictReader(handle))
+        row = rows[0]
+        failed = next(item for item in rows if item["status"] == "TIMEOUT")
+        self.assertEqual(failed["simulated_time_us"], "")
+        self.assertEqual(failed["time_per_row_us"], "")
+        self.assertEqual(failed["time_per_element_us"], "")
+        self.assertEqual(row["status"], "PASS")
+
+    def test_source_csv_is_sorted_and_byte_deterministic(self):
+        first = self.root / "first.csv"
+        second = self.root / "second.csv"
+        phase4f.write_source_csv(list(reversed(self.records)), first)
+        phase4f.write_source_csv(self.records, second)
+        self.assertEqual(first.read_bytes(), second.read_bytes())
+        self.assertEqual(phase4f.load_source_csv(first), self.records)
+
+    def test_exports_are_english_editable_and_deterministic(self):
+        prefix_a = self.root / "a" / "sfu_phase4f_large_scale"
+        prefix_b = self.root / "b" / "sfu_phase4f_large_scale"
+        phase4f.render_figure(self.records, prefix_a)
+        phase4f.render_figure(self.records, prefix_b)
+        for suffix in (".svg", ".pdf", ".png"):
+            self.assertTrue(prefix_a.with_suffix(suffix).is_file())
+        svg = prefix_a.with_suffix(".svg").read_text(encoding="utf-8")
+        self.assertIn("<text", svg)
+        self.assertIn("Dimension scaling", svg)
+        self.assertIn("Worker scaling", svg)
+        self.assertIn("Row scaling", svg)
+        self.assertIn("NoC and correctness", svg)
+        self.assertIn("1200 GB/s", svg)
+        self.assertIn("us/element", svg)
+        self.assertNotIn("single-worker", svg.lower())
+        self.assertEqual(
+            prefix_a.with_suffix(".svg").read_bytes(),
+            prefix_b.with_suffix(".svg").read_bytes(),
+        )
+        pdf = prefix_a.with_suffix(".pdf").read_bytes()
+        self.assertIn(b"/FontFile2", pdf)
+        from PIL import Image
+        with Image.open(prefix_a.with_suffix(".png")) as image:
+            self.assertAlmostEqual(image.width / image.height, 16 / 9, places=2)
+            self.assertAlmostEqual(image.info["dpi"][0], 300, delta=1)
+
+    def test_qa_distinguishes_measurement_derived_and_unavailable(self):
+        outcomes = self.records[:-1] + [self.failure(self.records[-1])]
+        output = self.root / "qa.md"
+        phase4f.write_qa(outcomes, output)
+        text = output.read_text(encoding="utf-8")
+        self.assertIn("Measurements", text)
+        self.assertIn("Derived metrics", text)
+        self.assertIn("Unavailable outcomes", text)
+        self.assertIn("TIMEOUT", text)
+        self.assertIn("256:4096:16:16", text)
+        self.assertIn("1200GB/s", text)
+        self.assertIn("golden", text.lower())
+        self.assertIn("transport", text.lower())
+        self.assertIn("DMA", text)
+
+    def test_report_cli_reparses_pass_and_publishes_atomically(self):
+        experiment = self.root / "experiment"
+        report = self.root / "report"
+        experiment.mkdir()
+        manifest = experiment / "large_scale_manifest.csv"
+        for record in self.records:
+            phase4f.upsert_parent_manifest(manifest, record)
+        SyntheticChild.write_csv(
+            experiment / "point_status.csv",
+            phase4f.POINT_STATUS_FIELDS,
+            [phase4f._status_row(record) for record in self.records],
+        )
+        (experiment / "completed").mkdir()
+        for record in self.records:
+            marker = experiment / "completed" / phase4f._marker_name(record.spec)
+            marker.write_text(
+                self.marker_text(record),
+                encoding="utf-8",
+            )
+        with mock.patch.object(phase4f, "parse_child_point", side_effect=self.records) as parse:
+            self.assertEqual(phase4f.main([
+                "--root", str(experiment), "--output-dir", str(report),
+                "--verifier", str(self.root / "verifier.py"),
+            ]), 0)
+        self.assertEqual(parse.call_count, 8)
+        self.assertEqual(len(list(report.iterdir())), 5)
+
+        failed_report = self.root / "failed-report"
+        bad_status = list(self.records)
+        bad_status[0] = dataclasses.replace(bad_status[0], noc_link_bw="25GB/s")
+        SyntheticChild.write_csv(
+            experiment / "point_status.csv",
+            phase4f.POINT_STATUS_FIELDS,
+            [phase4f._status_row(record) for record in bad_status],
+        )
+        with self.assertRaises(ValueError):
+            phase4f.main([
+                "--root", str(experiment), "--output-dir", str(failed_report),
+                "--verifier", str(self.root / "verifier.py"),
+            ])
+        self.assertFalse(failed_report.exists())
 
 
 if __name__ == "__main__":
