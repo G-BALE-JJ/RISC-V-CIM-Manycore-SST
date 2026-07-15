@@ -8,6 +8,7 @@ import math
 import os
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -41,6 +42,8 @@ class PointRecord:
     noc_output_buffer: str
     gm_buffer: str
     flit_size: str
+    inter_router_no_cut: int
+    local_no_cut: int
     retry_ticks: int
     max_retries: int
     status: str
@@ -178,6 +181,7 @@ POINT_STATUS_FIELDS = [
 ]
 
 SOURCE_DATA_FIELDS = PARENT_MANIFEST_FIELDS + [
+    "cooperative_groups", "inter_router_no_cut", "local_no_cut",
     "time_per_row_us", "time_per_element_us",
 ]
 
@@ -540,7 +544,8 @@ def parse_child_point(
         noc_input_buffer=CANONICAL_NETWORK["GOLEM_NOC_INPUT_BUF_SIZE"],
         noc_output_buffer=CANONICAL_NETWORK["GOLEM_NOC_OUTPUT_BUF_SIZE"],
         gm_buffer=CANONICAL_NETWORK["GOLEM_GM_BUFFER_LENGTH"],
-        flit_size=CANONICAL_NETWORK["GOLEM_NOC_FLIT_SIZE"], retry_ticks=1024,
+        flit_size=CANONICAL_NETWORK["GOLEM_NOC_FLIT_SIZE"],
+        inter_router_no_cut=0, local_no_cut=0, retry_ticks=1024,
         max_retries=8, status="PASS", exit_code=0, artifact_validation="PASS",
         golden_checked=golden_checked, golden_mismatches=golden_mismatches,
         transport_events=transport_events, transport_immediate=transport_immediate,
@@ -640,7 +645,9 @@ def _manifest_float(path, row, field, optional=False):
     return result
 
 
-def _row_to_record(path: pathlib.Path, row: dict[str, str]) -> PointRecord:
+def _row_to_record(
+    path: pathlib.Path, row: dict[str, str], *, require_source_provenance=False
+) -> PointRecord:
     spec = PointSpec(
         stage=row["stage"], rows=_manifest_int(path, row, "rows"),
         dim=_manifest_int(path, row, "dim"),
@@ -659,10 +666,18 @@ def _row_to_record(path: pathlib.Path, row: dict[str, str]) -> PointRecord:
             "dma_timeout_retry", "dma_timeout_exhausted", "dma_write_timeout_retry",
         )
     }
+    if require_source_provenance:
+        cooperative_groups = _manifest_int(path, row, "cooperative_groups")
+        inter_router_no_cut = _manifest_int(path, row, "inter_router_no_cut")
+        local_no_cut = _manifest_int(path, row, "local_no_cut")
+    else:
+        cooperative_groups = 1
+        inter_router_no_cut = 0
+        local_no_cut = 0
     return PointRecord(
         spec=spec, run_id=row["run_id"],
         chunk_elems=_manifest_int(path, row, "chunk_elems"),
-        cooperative_groups=1, transport=row["transport"],
+        cooperative_groups=cooperative_groups, transport=row["transport"],
         reduction_vn=_manifest_int(path, row, "reduction_vn"),
         num_vns=_manifest_int(path, row, "num_vns"),
         dma_response_vn=_manifest_int(path, row, "dma_response_vn"),
@@ -670,7 +685,9 @@ def _row_to_record(path: pathlib.Path, row: dict[str, str]) -> PointRecord:
         dirctrl_highlink_bw=row["dirctrl_highlink_bw"],
         noc_input_buffer=row["noc_input_buffer"],
         noc_output_buffer=row["noc_output_buffer"], gm_buffer=row["gm_buffer"],
-        flit_size=row["flit_size"], retry_ticks=_manifest_int(path, row, "retry_ticks"),
+        flit_size=row["flit_size"], inter_router_no_cut=inter_router_no_cut,
+        local_no_cut=local_no_cut,
+        retry_ticks=_manifest_int(path, row, "retry_ticks"),
         max_retries=_manifest_int(path, row, "max_retries"), status=row["status"],
         exit_code=_manifest_int(path, row, "exit_code"),
         artifact_validation=row["artifact_validation"],
@@ -788,6 +805,8 @@ def _validate_profile(record: PointRecord) -> None:
         "noc_output_buffer": CANONICAL_NETWORK["GOLEM_NOC_OUTPUT_BUF_SIZE"],
         "gm_buffer": CANONICAL_NETWORK["GOLEM_GM_BUFFER_LENGTH"],
         "flit_size": CANONICAL_NETWORK["GOLEM_NOC_FLIT_SIZE"],
+        "inter_router_no_cut": 0,
+        "local_no_cut": 0,
         "chunk_elems": 256,
         "cooperative_groups": 1,
         "retry_ticks": 1024,
@@ -942,6 +961,9 @@ def write_source_csv(records: list[PointRecord], path: pathlib.Path) -> None:
     rows = []
     for record in _sort_records(records):
         row = _record_to_row(record)
+        row["cooperative_groups"] = str(record.cooperative_groups)
+        row["inter_router_no_cut"] = str(record.inter_router_no_cut)
+        row["local_no_cut"] = str(record.local_no_cut)
         if record.status == "PASS":
             runtime = float(record.simulated_time_us)
             row["time_per_row_us"] = format(runtime / record.spec.rows, ".17g")
@@ -960,7 +982,10 @@ def load_source_csv(path: pathlib.Path) -> list[PointRecord]:
     rows = _read_csv(
         path, path.parent, "", "source_data", SOURCE_DATA_FIELDS, exact_header=True
     )
-    records = [_row_to_record(path, row) for row in rows]
+    records = [
+        _row_to_record(path, row, require_source_provenance=True)
+        for row in rows
+    ]
     validate_complete_matrix(records)
     for record, row in zip(records, rows):
         if record.status == "PASS":
@@ -986,6 +1011,49 @@ def load_source_csv(path: pathlib.Path) -> list[PointRecord]:
 def _plot_series(axis, x, y, *, marker="o", color="#176B87", label=None):
     axis.plot(x, y, marker=marker, linewidth=2.0, markersize=5, color=color, label=label)
     axis.grid(axis="y", color="#D9DEE3", linewidth=0.7)
+
+
+_publish_replace = os.replace
+
+
+def _publish_transaction(files: list[tuple[pathlib.Path, pathlib.Path]]) -> None:
+    if not files:
+        return
+    target_dirs = {target.parent for _, target in files}
+    if len(target_dirs) != 1:
+        raise ValueError("transactional publication requires one target directory")
+    target_dir = next(iter(target_dirs))
+    target_dir_existed = target_dir.is_dir()
+    if target_dir.exists() and not target_dir_existed:
+        raise ValueError(f"publication target is not a directory: {target_dir}")
+    target_dir.parent.mkdir(parents=True, exist_ok=True)
+    target_dir.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        dir=target_dir.parent, prefix=f".{target_dir.name}.rollback."
+    ) as backup_name:
+        backup_dir = pathlib.Path(backup_name)
+        existed = {}
+        for _, target in files:
+            existed[target] = target.is_file()
+            if target.exists() and not existed[target]:
+                raise ValueError(f"publication target is not a regular file: {target}")
+            if existed[target]:
+                shutil.copy2(target, backup_dir / target.name)
+        try:
+            for staged, target in files:
+                _publish_replace(staged, target)
+        except BaseException:
+            for _, target in files:
+                if existed[target]:
+                    shutil.copy2(backup_dir / target.name, target)
+                else:
+                    target.unlink(missing_ok=True)
+            if not target_dir_existed:
+                try:
+                    target_dir.rmdir()
+                except OSError:
+                    pass
+            raise
 
 
 def render_figure(records: list[PointRecord], output_prefix: pathlib.Path) -> None:
@@ -1128,16 +1196,30 @@ def render_figure(records: list[PointRecord], output_prefix: pathlib.Path) -> No
     )
 
     output_prefix = pathlib.Path(output_prefix)
-    output_prefix.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(dir=output_prefix.parent) as temporary:
+    staging_host = output_prefix.parent
+    while not staging_host.exists():
+        if staging_host == staging_host.parent:
+            raise ValueError(f"no existing staging ancestor for {output_prefix}")
+        staging_host = staging_host.parent
+    with tempfile.TemporaryDirectory(dir=staging_host) as temporary:
         temp_prefix = pathlib.Path(temporary) / output_prefix.name
         metadata = {"Date": None, "Creator": "Phase 4F report"}
-        fig.savefig(temp_prefix.with_suffix(".svg"), metadata=metadata)
-        fig.savefig(temp_prefix.with_suffix(".pdf"), metadata={"CreationDate": None, "ModDate": None})
-        fig.savefig(temp_prefix.with_suffix(".png"), dpi=300, metadata={"Software": "Phase 4F report"})
-        plt.close(fig)
-        for suffix in (".svg", ".pdf", ".png"):
-            os.replace(temp_prefix.with_suffix(suffix), output_prefix.with_suffix(suffix))
+        try:
+            fig.savefig(temp_prefix.with_suffix(".svg"), metadata=metadata)
+            fig.savefig(
+                temp_prefix.with_suffix(".pdf"),
+                metadata={"CreationDate": None, "ModDate": None},
+            )
+            fig.savefig(
+                temp_prefix.with_suffix(".png"), dpi=300,
+                metadata={"Software": "Phase 4F report"},
+            )
+        finally:
+            plt.close(fig)
+        _publish_transaction([
+            (temp_prefix.with_suffix(suffix), output_prefix.with_suffix(suffix))
+            for suffix in (".svg", ".pdf", ".png")
+        ])
 
 
 def _atomic_text(path: pathlib.Path, text: str) -> None:
@@ -1166,7 +1248,8 @@ def write_qa(records: list[PointRecord], output_path: pathlib.Path) -> None:
         "# SFU Phase 4F Large-Scale Figure QA",
         "",
         "Fixed network: link/xbar/highlink 1200GB/s; input/output buffers 512KB; "
-        "flit 128B; GlobalMemory buffer 1024KB; explicit NoC, VN0 reduction.",
+        "flit 128B; GlobalMemory buffer 1024KB; inter-router/local no-cut 0/0; "
+        "explicit NoC, VN0 reduction.",
         "",
         "## Measurements",
         "",
@@ -1227,8 +1310,8 @@ def _status_row(record: PointRecord) -> dict[str, str]:
         "noc_output_buffer": record.noc_output_buffer,
         "gm_buffer": record.gm_buffer,
         "flit_size": record.flit_size,
-        "inter_router_no_cut": "0",
-        "local_no_cut": "0",
+        "inter_router_no_cut": str(record.inter_router_no_cut),
+        "local_no_cut": str(record.local_no_cut),
         "mem_node_size": str(record.spec.mem_node_size),
         "retry_ticks": str(record.retry_ticks),
         "max_retries": str(record.max_retries),
@@ -1270,56 +1353,68 @@ def _read_marker(path: pathlib.Path) -> dict[str, str]:
 def _validate_marker_signature(
     path: pathlib.Path, marker: dict[str, str], spec: PointSpec
 ) -> None:
-    signature = marker["signature"]
-    if hashlib.sha256(signature.encode("utf-8")).hexdigest() != marker["signature_sha256"]:
-        raise ValueError(f"marker={path}: signature hash mismatch")
-    if not re.fullmatch(r"[0-9a-f]{64}", marker["child_runner_sha256"]):
-        raise ValueError(f"marker={path}: invalid child runner hash")
-    if not re.fullmatch(r"[0-9a-f]{64}", marker["pipeline_args_sha256"]):
-        raise ValueError(f"marker={path}: invalid pipeline hash")
-    fields: dict[str, str] = {}
-    for token in signature.split(";"):
-        if "=" not in token:
-            raise ValueError(f"marker={path}: malformed signature")
-        key, value = token.split("=", 1)
-        if key in fields:
-            raise ValueError(f"marker={path}: duplicate signature key {key!r}")
-        fields[key] = value
+    child_runner = pathlib.Path(__file__).with_name(
+        "run_sfu_unified_job_distributed_scaling.sh"
+    )
+    try:
+        child_runner_sha = hashlib.sha256(child_runner.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise ValueError(f"marker={path}: cannot hash child runner: {exc}") from exc
+    pipeline_args = (
+        "--noc-in-buf 512KB --noc-out-buf 512KB --noc-link-bw 1200GB/s "
+        "--noc-xbar-bw 1200GB/s --noc-flit-size 128B --gm-buf 1024KB "
+        f"--mem-node-size {spec.mem_node_size}"
+    )
+    pipeline_sha = hashlib.sha256(
+        pipeline_args.encode("utf-8") + b"\0"
+    ).hexdigest()
+    signature = (
+        f"schema=phase4f-parent-v1;stage={spec.stage};rows={spec.rows};"
+        f"dim={spec.dim};workers={spec.worker_cores};bands={spec.band_cores};"
+        "cooperative_groups=1;transport=explicit_noc;request_vn=0;"
+        "ordinary_response_vn=1;reduction_vn=0;num_vns=3;dma_response_vn=0;"
+        "noc_link_bw=1200GB/s;noc_xbar_bw=1200GB/s;"
+        "dirctrl_highlink_bw=1200GB/s;noc_input_buffer=512KB;"
+        "noc_output_buffer=512KB;gm_buffer=1024KB;flit_size=128B;"
+        "inter_router_no_cut=0;local_no_cut=0;"
+        f"mem_node_size={spec.mem_node_size};timeout_sec={spec.timeout_sec};"
+        "chunk=256;staging_rows=4;job_rows=4;retry_ticks=1024;max_retries=8;"
+        f"child_runner_sha256={child_runner_sha};pipeline_args_sha256={pipeline_sha}"
+    )
     expected = {
-        "schema": "phase4f-parent-v1",
-        "stage": spec.stage,
-        "rows": str(spec.rows),
-        "dim": str(spec.dim),
-        "workers": str(spec.worker_cores),
-        "bands": str(spec.band_cores),
-        "cooperative_groups": "1",
-        "transport": TRANSPORT,
-        "request_vn": "0",
-        "ordinary_response_vn": "1",
-        "reduction_vn": "0",
-        "num_vns": "3",
-        "dma_response_vn": "0",
-        "noc_link_bw": "1200GB/s",
-        "noc_xbar_bw": "1200GB/s",
-        "dirctrl_highlink_bw": "1200GB/s",
-        "noc_input_buffer": "512KB",
-        "noc_output_buffer": "512KB",
-        "gm_buffer": "1024KB",
-        "flit_size": "128B",
-        "inter_router_no_cut": "0",
-        "local_no_cut": "0",
-        "mem_node_size": str(spec.mem_node_size),
-        "timeout_sec": str(spec.timeout_sec),
-        "chunk": "256",
-        "staging_rows": "4",
-        "job_rows": "4",
-        "retry_ticks": "1024",
-        "max_retries": "8",
-        "child_runner_sha256": marker["child_runner_sha256"],
-        "pipeline_args_sha256": marker["pipeline_args_sha256"],
+        "child_runner_sha256": child_runner_sha,
+        "pipeline_args_sha256": pipeline_sha,
+        "signature": signature,
+        "signature_sha256": hashlib.sha256(signature.encode("utf-8")).hexdigest(),
     }
-    if fields != expected:
-        raise ValueError(f"marker={path}: noncanonical signature")
+    for field, value in expected.items():
+        if marker[field] != value:
+            raise ValueError(f"marker={path}: canonical {field} mismatch")
+
+
+def _validate_child_attempt(root: pathlib.Path, spec: PointSpec, value: str) -> pathlib.Path:
+    children = root / "children"
+    identity = children / (
+        f"stage_{spec.stage}_r{spec.rows}_d{spec.dim}_"
+        f"w{spec.worker_cores}_b{spec.band_cores}"
+    )
+    child = pathlib.Path(value)
+    if child.parent != identity or not re.fullmatch(r"attempt-[0-9]{4,}", child.name):
+        raise ValueError(f"child_root={child}: noncanonical attempt path")
+    for field, candidate in (
+        ("children", children), ("identity", identity), ("attempt", child)
+    ):
+        if candidate.is_symlink() or not candidate.is_dir():
+            raise ValueError(f"child_root={child}: {field} is missing or symlinked")
+    try:
+        children_real = children.resolve(strict=True)
+        identity_real = identity.resolve(strict=True)
+        child_real = child.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError(f"child_root={child}: cannot resolve attempt: {exc}") from exc
+    if identity_real.parent != children_real or child_real.parent != identity_real:
+        raise ValueError(f"child_root={child}: resolved containment violation")
+    return child
 
 
 def _failure_record(row: dict[str, str], spec: PointSpec) -> PointRecord:
@@ -1334,7 +1429,8 @@ def _failure_record(row: dict[str, str], spec: PointSpec) -> PointRecord:
         noc_input_buffer=CANONICAL_NETWORK["GOLEM_NOC_INPUT_BUF_SIZE"],
         noc_output_buffer=CANONICAL_NETWORK["GOLEM_NOC_OUTPUT_BUF_SIZE"],
         gm_buffer=CANONICAL_NETWORK["GOLEM_GM_BUFFER_LENGTH"],
-        flit_size=CANONICAL_NETWORK["GOLEM_NOC_FLIT_SIZE"], retry_ticks=1024,
+        flit_size=CANONICAL_NETWORK["GOLEM_NOC_FLIT_SIZE"],
+        inter_router_no_cut=0, local_no_cut=0, retry_ticks=1024,
         max_retries=8, status=status, exit_code=int(row["exit_code"]),
         artifact_validation=status, golden_checked=None, golden_mismatches=None,
         transport_events=None, transport_immediate=None, transport_queued=None,
@@ -1391,6 +1487,7 @@ def _load_report_records(root: pathlib.Path, verifier: pathlib.Path) -> list[Poi
                 raise ValueError(
                     f"status={status_path} point={identity} field={field}: profile drift"
                 )
+        child_root = _validate_child_attempt(root, spec, row["child_root"])
         marker_path = root / "completed" / _marker_name(spec)
         marker = _read_marker(marker_path)
         _validate_marker_signature(marker_path, marker, spec)
@@ -1399,7 +1496,7 @@ def _load_report_records(root: pathlib.Path, verifier: pathlib.Path) -> list[Poi
         if row["status"] == "PASS":
             if identity not in parent_by_identity:
                 raise ValueError(f"manifest={parent_path} point={identity}: PASS is missing")
-            parsed = parse_child_point(pathlib.Path(row["child_root"]), spec, verifier)
+            parsed = parse_child_point(child_root, spec, verifier)
             if parsed != parent_by_identity[identity]:
                 raise ValueError(f"manifest={parent_path} point={identity}: child evidence drift")
             if marker["output_sha256"] != parsed.output_sha256:
@@ -1436,9 +1533,9 @@ def _report(root: pathlib.Path, output_dir: pathlib.Path, verifier: pathlib.Path
         ]
         if not all(path.is_file() and path.stat().st_size > 0 for path in expected):
             raise ValueError("report export set is incomplete")
-        output_dir.mkdir(parents=True, exist_ok=True)
-        for path in expected:
-            os.replace(path, output_dir / path.name)
+        _publish_transaction([
+            (path, output_dir / path.name) for path in expected
+        ])
 
 
 def main(argv=None) -> int:

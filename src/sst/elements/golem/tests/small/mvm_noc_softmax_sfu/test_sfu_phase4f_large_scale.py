@@ -77,6 +77,8 @@ class Phase4FLargeScaleContractTest(unittest.TestCase):
                 "noc_output_buffer",
                 "gm_buffer",
                 "flit_size",
+                "inter_router_no_cut",
+                "local_no_cut",
                 "retry_ticks",
                 "max_retries",
                 "status",
@@ -1218,8 +1220,16 @@ class Phase4FReportTest(unittest.TestCase):
     @staticmethod
     def marker_text(record):
         spec = record.spec
-        child_hash = "a" * 64
-        pipeline_hash = "b" * 64
+        child_runner = SCRIPT.with_name("run_sfu_unified_job_distributed_scaling.sh")
+        child_hash = hashlib.sha256(child_runner.read_bytes()).hexdigest()
+        pipeline_args = (
+            "--noc-in-buf 512KB --noc-out-buf 512KB --noc-link-bw 1200GB/s "
+            "--noc-xbar-bw 1200GB/s --noc-flit-size 128B --gm-buf 1024KB "
+            f"--mem-node-size {spec.mem_node_size}"
+        )
+        pipeline_hash = hashlib.sha256(
+            pipeline_args.encode("utf-8") + b"\0"
+        ).hexdigest()
         signature = ";".join((
             "schema=phase4f-parent-v1",
             f"stage={spec.stage}",
@@ -1255,13 +1265,49 @@ class Phase4FReportTest(unittest.TestCase):
         ))
         signature_hash = hashlib.sha256(signature.encode("utf-8")).hexdigest()
         return (
-            "schema=phase4f-parent-v1\nstate=PASS\n"
+            f"schema=phase4f-parent-v1\nstate={record.status}\n"
             f"signature_sha256={signature_hash}\nsignature={signature}\n"
             f"child_runner_sha256={child_hash}\n"
             f"pipeline_args_sha256={pipeline_hash}\n"
             f"child_root={record.child_root}\n"
-            f"output_sha256={record.output_sha256}\n"
+            f"output_sha256={record.output_sha256 or ''}\n"
         )
+
+    def build_report_experiment(self, name, failure_status=None):
+        experiment = self.root / name
+        experiment.mkdir()
+        records = []
+        failure_index = len(self.records) - 1 if failure_status else None
+        for index, record in enumerate(self.records):
+            spec = record.spec
+            identity = (
+                f"stage_{spec.stage}_r{spec.rows}_d{spec.dim}_"
+                f"w{spec.worker_cores}_b{spec.band_cores}"
+            )
+            child_root = experiment / "children" / identity / "attempt-0001"
+            child_root.mkdir(parents=True)
+            current = dataclasses.replace(record, child_root=str(child_root))
+            if index == failure_index:
+                exit_code = {"TIMEOUT": 124, "FAIL": 7, "ARTIFACT_FAIL": 3}[
+                    failure_status
+                ]
+                current = self.failure(current, failure_status, exit_code)
+            records.append(current)
+
+        manifest = experiment / "large_scale_manifest.csv"
+        for record in records:
+            if record.status == "PASS":
+                phase4f.upsert_parent_manifest(manifest, record)
+        SyntheticChild.write_csv(
+            experiment / "point_status.csv",
+            phase4f.POINT_STATUS_FIELDS,
+            [phase4f._status_row(record) for record in records],
+        )
+        (experiment / "completed").mkdir()
+        for record in records:
+            marker = experiment / "completed" / phase4f._marker_name(record.spec)
+            marker.write_text(self.marker_text(record), encoding="utf-8")
+        return experiment, records
 
     def test_complete_matrix_and_lifecycle_gates(self):
         phase4f.validate_complete_matrix(self.records)
@@ -1315,6 +1361,26 @@ class Phase4FReportTest(unittest.TestCase):
         self.assertEqual(first.read_bytes(), second.read_bytes())
         self.assertEqual(phase4f.load_source_csv(first), self.records)
 
+    def test_source_provenance_fields_are_parsed_not_defaulted(self):
+        source = self.root / "provenance.csv"
+        phase4f.write_source_csv(self.records, source)
+        self.assertEqual(phase4f.load_source_csv(source), self.records)
+        with source.open(newline="", encoding="utf-8") as handle:
+            canonical = list(csv.DictReader(handle))
+        for field, replacement in (
+            ("cooperative_groups", "2"),
+            ("inter_router_no_cut", "1"),
+            ("local_no_cut", "1"),
+        ):
+            with self.subTest(field=field):
+                rows = [dict(row) for row in canonical]
+                rows[0][field] = replacement
+                SyntheticChild.write_csv(
+                    source, phase4f.SOURCE_DATA_FIELDS, rows
+                )
+                with self.assertRaisesRegex(ValueError, field):
+                    phase4f.load_source_csv(source)
+
     def test_exports_are_english_editable_and_deterministic(self):
         prefix_a = self.root / "a" / "sfu_phase4f_large_scale"
         prefix_b = self.root / "b" / "sfu_phase4f_large_scale"
@@ -1353,30 +1419,17 @@ class Phase4FReportTest(unittest.TestCase):
         self.assertIn("TIMEOUT", text)
         self.assertIn("256:4096:16:16", text)
         self.assertIn("1200GB/s", text)
+        self.assertIn("no-cut 0/0", text)
         self.assertIn("golden", text.lower())
         self.assertIn("transport", text.lower())
         self.assertIn("DMA", text)
 
     def test_report_cli_reparses_pass_and_publishes_atomically(self):
-        experiment = self.root / "experiment"
+        experiment, report_records = self.build_report_experiment("experiment")
         report = self.root / "report"
-        experiment.mkdir()
-        manifest = experiment / "large_scale_manifest.csv"
-        for record in self.records:
-            phase4f.upsert_parent_manifest(manifest, record)
-        SyntheticChild.write_csv(
-            experiment / "point_status.csv",
-            phase4f.POINT_STATUS_FIELDS,
-            [phase4f._status_row(record) for record in self.records],
-        )
-        (experiment / "completed").mkdir()
-        for record in self.records:
-            marker = experiment / "completed" / phase4f._marker_name(record.spec)
-            marker.write_text(
-                self.marker_text(record),
-                encoding="utf-8",
-            )
-        with mock.patch.object(phase4f, "parse_child_point", side_effect=self.records) as parse:
+        with mock.patch.object(
+            phase4f, "parse_child_point", side_effect=report_records
+        ) as parse:
             self.assertEqual(phase4f.main([
                 "--root", str(experiment), "--output-dir", str(report),
                 "--verifier", str(self.root / "verifier.py"),
@@ -1398,6 +1451,184 @@ class Phase4FReportTest(unittest.TestCase):
                 "--verifier", str(self.root / "verifier.py"),
             ])
         self.assertFalse(failed_report.exists())
+
+    def test_failed_outcomes_merge_without_fabricated_measurements(self):
+        def fake_render(records, prefix):
+            for suffix in (".svg", ".pdf", ".png"):
+                prefix.with_suffix(suffix).write_bytes(f"fixture-{suffix}".encode())
+
+        for status in ("TIMEOUT", "FAIL", "ARTIFACT_FAIL"):
+            with self.subTest(status=status):
+                experiment, records = self.build_report_experiment(
+                    f"failed-{status.lower()}", status
+                )
+                pass_records = [record for record in records if record.status == "PASS"]
+                with mock.patch.object(
+                    phase4f, "parse_child_point", side_effect=pass_records
+                ) as parse:
+                    outcomes = phase4f._load_report_records(
+                        experiment, self.root / "verifier.py"
+                    )
+                self.assertEqual(parse.call_count, 7)
+                failed = outcomes[-1]
+                self.assertEqual(failed.status, status)
+                self.assertIsNone(failed.simulated_time_us)
+                self.assertIsNone(failed.total_send_packets)
+                report = self.root / f"failed-cli-{status.lower()}"
+                with mock.patch.object(
+                    phase4f, "parse_child_point", side_effect=pass_records
+                ), mock.patch.object(
+                    phase4f, "render_figure", side_effect=fake_render
+                ):
+                    self.assertEqual(phase4f.main([
+                        "--root", str(experiment), "--output-dir", str(report),
+                    ]), 0)
+                source_records = phase4f.load_source_csv(
+                    report / "sfu_phase4f_large_scale_source_data.csv"
+                )
+                self.assertEqual(source_records[-1].status, status)
+                self.assertIsNone(source_records[-1].simulated_time_us)
+
+    def test_failed_marker_tampering_and_child_escape_fail_closed(self):
+        mutations = (
+            "signature_hash", "signature", "external", "missing", "symlink"
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                experiment, records = self.build_report_experiment(
+                    f"tampered-{mutation}", "TIMEOUT"
+                )
+                failed = records[-1]
+                marker = experiment / "completed" / phase4f._marker_name(failed.spec)
+                marker_text = marker.read_text(encoding="utf-8")
+                if mutation == "signature_hash":
+                    marker_text = re.sub(
+                        r"^signature_sha256=.*$", "signature_sha256=" + "0" * 64,
+                        marker_text, flags=re.MULTILINE,
+                    )
+                elif mutation == "signature":
+                    marker_text = marker_text.replace(
+                        f"rows={failed.spec.rows}", "rows=999", 1
+                    )
+                elif mutation in {"external", "missing"}:
+                    child_root = self.root / (
+                        "external-attempt-0001" if mutation == "external"
+                        else "missing-attempt-0001"
+                    )
+                    if mutation == "external":
+                        child_root.mkdir(exist_ok=True)
+                    marker_text = re.sub(
+                        r"^child_root=.*$", f"child_root={child_root}",
+                        marker_text, flags=re.MULTILINE,
+                    )
+                    status_path = experiment / "point_status.csv"
+                    with status_path.open(newline="", encoding="utf-8") as handle:
+                        status_rows = list(csv.DictReader(handle))
+                    status_rows[-1]["child_root"] = str(child_root)
+                    SyntheticChild.write_csv(
+                        status_path, phase4f.POINT_STATUS_FIELDS, status_rows
+                    )
+                else:
+                    child_root = pathlib.Path(failed.child_root)
+                    external = self.root / "symlink-external"
+                    external.mkdir(exist_ok=True)
+                    child_root.rmdir()
+                    child_root.symlink_to(external, target_is_directory=True)
+                marker.write_text(marker_text, encoding="utf-8")
+                output_dir = self.root / f"tampered-report-{mutation}"
+                pass_records = [record for record in records if record.status == "PASS"]
+                with mock.patch.object(
+                    phase4f, "parse_child_point", side_effect=pass_records
+                ), self.assertRaises(ValueError):
+                    phase4f.main([
+                        "--root", str(experiment), "--output-dir", str(output_dir),
+                    ])
+                self.assertFalse(output_dir.exists())
+
+    @staticmethod
+    def fail_nth_replace(call_number):
+        calls = 0
+
+        def replace(source, target):
+            nonlocal calls
+            calls += 1
+            if calls == call_number:
+                raise OSError(f"injected replace failure {call_number}")
+            return os.replace(source, target)
+
+        return replace
+
+    def test_report_publish_rolls_back_every_file_on_replace_failure(self):
+        names = (
+            "sfu_phase4f_large_scale_source_data.csv",
+            "sfu_phase4f_large_scale.svg",
+            "sfu_phase4f_large_scale.pdf",
+            "sfu_phase4f_large_scale.png",
+            "sfu_phase4f_large_scale_qa.md",
+        )
+
+        def fake_render(records, prefix):
+            for suffix in (".svg", ".pdf", ".png"):
+                prefix.with_suffix(suffix).write_bytes(f"new-{suffix}".encode())
+
+        for call_number in range(2, 6):
+            with self.subTest(existing=True, call_number=call_number):
+                output = self.root / f"atomic-existing-{call_number}"
+                output.mkdir()
+                for name in names:
+                    (output / name).write_bytes(f"old-{name}".encode())
+                before = {name: (output / name).read_bytes() for name in names}
+                with mock.patch.object(
+                    phase4f, "_load_report_records", return_value=self.records
+                ), mock.patch.object(
+                    phase4f, "render_figure", side_effect=fake_render
+                ), mock.patch.object(
+                    phase4f, "_publish_replace",
+                    side_effect=self.fail_nth_replace(call_number),
+                ), self.assertRaises(OSError):
+                    phase4f._report(self.root, output, self.root / "verifier.py")
+                self.assertEqual(
+                    {name: (output / name).read_bytes() for name in names}, before
+                )
+
+        output = self.root / "atomic-first-publish"
+        with mock.patch.object(
+            phase4f, "_load_report_records", return_value=self.records
+        ), mock.patch.object(
+            phase4f, "render_figure", side_effect=fake_render
+        ), mock.patch.object(
+            phase4f, "_publish_replace", side_effect=self.fail_nth_replace(2)
+        ), self.assertRaises(OSError):
+            phase4f._report(self.root, output, self.root / "verifier.py")
+        self.assertFalse(output.exists())
+
+    def test_direct_render_rolls_back_all_formats_on_replace_failure(self):
+        prefix = self.root / "render-existing" / "figure"
+        phase4f.render_figure(self.records, prefix)
+        before = {
+            suffix: prefix.with_suffix(suffix).read_bytes()
+            for suffix in (".svg", ".pdf", ".png")
+        }
+        for call_number in (2, 3):
+            with self.subTest(existing=True, call_number=call_number), mock.patch.object(
+                phase4f, "_publish_replace",
+                side_effect=self.fail_nth_replace(call_number),
+            ), self.assertRaises(OSError):
+                phase4f.render_figure(self.records, prefix)
+            self.assertEqual(
+                {
+                    suffix: prefix.with_suffix(suffix).read_bytes()
+                    for suffix in (".svg", ".pdf", ".png")
+                },
+                before,
+            )
+
+        new_prefix = self.root / "render-first" / "figure"
+        with mock.patch.object(
+            phase4f, "_publish_replace", side_effect=self.fail_nth_replace(2)
+        ), self.assertRaises(OSError):
+            phase4f.render_figure(self.records, new_prefix)
+        self.assertFalse(new_prefix.parent.exists())
 
 
 if __name__ == "__main__":
