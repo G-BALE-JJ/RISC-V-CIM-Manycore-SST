@@ -22,6 +22,7 @@ matplotlib.rcParams.update({
     "ytick.labelsize": 10,
     "legend.fontsize": 10,
     "svg.fonttype": "none",
+    "svg.hashsalt": "sfu-phase4e-group-figure-20260715",
     "pdf.fonttype": 42,
     "axes.spines.top": False,
     "axes.spines.right": False,
@@ -895,8 +896,16 @@ def render_figure(records: list[PointRecord], output_prefix: pathlib.Path) -> No
     output_prefix.parent.mkdir(parents=True, exist_ok=True)
     figure = build_figure(records)
     try:
-        figure.savefig(output_prefix.with_suffix(".svg"), facecolor="white")
-        figure.savefig(output_prefix.with_suffix(".pdf"), facecolor="white")
+        figure.savefig(
+            output_prefix.with_suffix(".svg"),
+            facecolor="white",
+            metadata={"Date": None},
+        )
+        figure.savefig(
+            output_prefix.with_suffix(".pdf"),
+            facecolor="white",
+            metadata={"CreationDate": None, "ModDate": None},
+        )
         figure.savefig(output_prefix.with_suffix(".png"), dpi=300, facecolor="white")
     finally:
         plt.close(figure)

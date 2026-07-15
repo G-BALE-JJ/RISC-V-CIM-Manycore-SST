@@ -7,6 +7,8 @@ import tempfile
 import unittest
 import xml.etree.ElementTree as ET
 
+from PIL import Image
+
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[7]
 SCRIPT = (
@@ -654,6 +656,13 @@ class Phase4EFigureRenderingTests(unittest.TestCase):
                 self.assertTrue(output.is_file(), suffix)
                 self.assertGreater(output.stat().st_size, 0, suffix)
 
+            with Image.open(prefix.with_suffix(".png")) as image:
+                self.assertEqual((3999, 2250), image.size)
+                self.assertIn("dpi", image.info)
+                dpi_x, dpi_y = image.info["dpi"]
+                self.assertAlmostEqual(300.0, dpi_x, delta=0.1)
+                self.assertAlmostEqual(300.0, dpi_y, delta=0.1)
+
     def test_svg_contains_approved_data_derived_annotations(self):
         expected = {
             "VN0/VN1/VN2 overlap exactly",
@@ -674,6 +683,21 @@ class Phase4EFigureRenderingTests(unittest.TestCase):
         for annotation in expected:
             with self.subTest(annotation=annotation):
                 self.assertIn(annotation, svg_text)
+
+    def test_render_repeats_byte_identically_for_all_formats(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = pathlib.Path(temporary)
+            first = base / "first"
+            second = base / "second"
+            phase4e_figure.render_figure(self.records, first)
+            phase4e_figure.render_figure(self.records, second)
+
+            for suffix in (".svg", ".pdf", ".png"):
+                with self.subTest(suffix=suffix):
+                    self.assertEqual(
+                        first.with_suffix(suffix).read_bytes(),
+                        second.with_suffix(suffix).read_bytes(),
+                    )
 
 
 if __name__ == "__main__":
