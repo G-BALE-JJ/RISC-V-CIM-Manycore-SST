@@ -1,5 +1,11 @@
 # SFU Phase 4F NoC Pressure Experiment Design
 
+> **Status: Deferred optional diagnostic.** This experiment is no longer the
+> next softmax mainline. The canonical GEMM and Phase 4E softmax artifacts both
+> resolve the same `1200GB/s` NoC profile, so the approved next step is the
+> fixed-network large-scale explicit-NoC design in
+> `2026-07-15-sfu-phase4f-large-scale-explicit-noc-softmax-design.md`.
+
 ## Purpose
 
 Measure where the completed unified-job `explicit_noc` softmax path first
