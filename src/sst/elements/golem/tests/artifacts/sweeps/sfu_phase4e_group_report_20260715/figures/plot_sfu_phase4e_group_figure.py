@@ -77,11 +77,16 @@ def select_manifest_rows(
     manifest = root / "sweep_manifest.csv"
     try:
         with manifest.open(newline="", encoding="utf-8") as handle:
-            rows = list(csv.DictReader(handle))
-    except OSError as exc:
+            reader = csv.DictReader(handle, strict=True)
+            rows = list(reader)
+    except (OSError, UnicodeError, csv.Error) as exc:
         raise _error(root, "", "sweep_manifest.csv", str(exc)) from exc
     if not rows:
         raise _error(root, "", "sweep_manifest.csv", "manifest is empty")
+    if reader.fieldnames is None or any(
+        None in row or any(value is None for value in row.values()) for row in rows
+    ):
+        raise _error(root, "", "sweep_manifest.csv", "malformed CSV structure")
 
     observed_workers: set[int] = set()
     by_run_id: dict[str, list[dict[str, str]]] = {}
@@ -149,12 +154,27 @@ def select_manifest_rows(
     return selected
 
 
-def _read_stats(root: pathlib.Path, run_id: str, path: pathlib.Path) -> list[dict[str, str]]:
+def _read_stats(
+    root: pathlib.Path,
+    run_id: str,
+    path: pathlib.Path,
+    required_fields: tuple[str, ...],
+) -> list[dict[str, str]]:
     try:
         with path.open(newline="", encoding="utf-8") as handle:
-            return list(csv.DictReader(handle))
-    except OSError as exc:
+            reader = csv.DictReader(handle, strict=True)
+            rows = list(reader)
+    except (OSError, UnicodeError, csv.Error) as exc:
         raise _error(root, run_id, path.name, str(exc)) from exc
+    if not rows:
+        raise _error(root, run_id, path.name, "CSV evidence is empty")
+    fieldnames = reader.fieldnames or []
+    missing = [field for field in required_fields if field not in fieldnames]
+    if missing:
+        raise _error(root, run_id, path.name, f"missing columns {missing}")
+    if any(None in row or any(value is None for value in row.values()) for row in rows):
+        raise _error(root, run_id, path.name, "malformed CSV structure")
+    return rows
 
 
 def _stat_values(
@@ -179,7 +199,7 @@ def _metric_value(
     metric: str,
     value_field: str,
 ) -> int:
-    rows = _read_stats(root, run_id, path)
+    rows = _read_stats(root, run_id, path, ("metric", value_field))
     matches = [row for row in rows if row.get("metric") == metric]
     if len(matches) != 1:
         raise _error(root, run_id, metric, f"expected one row in {path.name}, got {len(matches)}")
@@ -286,7 +306,23 @@ def parse_point(
         raise _error(root, run_id, "sst_log", "matching log is missing") from exc
     output_file = root / "outputs" / f"{run_id}.bin"
 
-    stats_rows = _read_stats(root, run_id, stats_file)
+    stats_rows = _read_stats(
+        root,
+        run_id,
+        stats_file,
+        ("StatisticName", "Sum.u64", "Count.u64", "Max.u64"),
+    )
+    for stats_row in stats_rows:
+        for field in ("Sum.u64", "Count.u64", "Max.u64"):
+            try:
+                int(stats_row[field])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise _error(
+                    root,
+                    run_id,
+                    f"{stats_file.name}.{field}",
+                    f"invalid value {stats_row.get(field)!r}",
+                ) from exc
     noc_file = stats_dir / "noc_summary.csv"
     dma_file = stats_dir / "dma_summary.csv"
     total_send_packets = _metric_value(root, run_id, noc_file, "total_send_packets", "value")

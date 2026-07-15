@@ -263,6 +263,24 @@ class Phase4EParserTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "VN|root"):
             phase4e_figure.select_manifest_rows(root, "explicit-NoC", 1)
 
+    def test_selection_wraps_manifest_decode_failure_with_context(self):
+        root = self.fixture.create_root(cached_rows=False)
+        (root / "sweep_manifest.csv").write_bytes(b"\xff")
+        with self.assertRaisesRegex(
+            ValueError, r"root=.*run_id=<manifest> field=sweep_manifest\.csv"
+        ):
+            phase4e_figure.select_manifest_rows(root, "explicit-NoC", 0)
+
+    def test_selection_wraps_malformed_csv_failure_with_context(self):
+        root = self.fixture.create_root(cached_rows=False)
+        (root / "sweep_manifest.csv").write_text(
+            'run_id,rows\n"unterminated', encoding="utf-8"
+        )
+        with self.assertRaisesRegex(
+            ValueError, r"root=.*run_id=<manifest> field=sweep_manifest\.csv"
+        ):
+            phase4e_figure.select_manifest_rows(root, "explicit-NoC", 0)
+
     def test_parse_point_converts_all_supported_time_units(self):
         root = self.fixture.create_root(cached_rows=False)
         row = self.fixture.manifest_rows(root)[0]
@@ -300,6 +318,42 @@ class Phase4EParserTests(unittest.TestCase):
         record = phase4e_figure.parse_point(root, row, "modeled-NoC", None, self.fixture.verifier)
         self.assertEqual((0, 0.0, 0, 0, 0, 0, 0), (record.transport_events, record.latency_average_cycles, record.latency_max_cycles, record.inbox_high_water, record.queued, record.rejected, record.stale))
         self.assertEqual(1238, record.total_send_packets)
+
+    def test_modeled_point_rejects_empty_stats_evidence(self):
+        root = self.fixture.create_root(transport="modeled-NoC", vn=None, cached_rows=False)
+        row = self.fixture.manifest_rows(root)[0]
+        stats_path = root / "stats" / "overlap0" / row["run_id"] / "stats_selfcom.txt"
+        stats_path.write_text("", encoding="utf-8")
+        with self.assertRaisesRegex(
+            ValueError, r"root=.*run_id=.* field=stats_selfcom\.txt"
+        ):
+            phase4e_figure.parse_point(root, row, "modeled-NoC", None, self.fixture.verifier)
+
+    def test_modeled_point_rejects_malformed_stats_value(self):
+        root = self.fixture.create_root(transport="modeled-NoC", vn=None, cached_rows=False)
+        row = self.fixture.manifest_rows(root)[0]
+        stats_path = root / "stats" / "overlap0" / row["run_id"] / "stats_selfcom.txt"
+        with stats_path.open(newline="", encoding="utf-8") as handle:
+            stats_rows = list(csv.DictReader(handle))
+        stats_rows[0]["Sum.u64"] = "not-an-integer"
+        with stats_path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=stats_rows[0].keys())
+            writer.writeheader()
+            writer.writerows(stats_rows)
+        with self.assertRaisesRegex(
+            ValueError, r"root=.*run_id=.* field=stats_selfcom\.txt\.Sum\.u64"
+        ):
+            phase4e_figure.parse_point(root, row, "modeled-NoC", None, self.fixture.verifier)
+
+    def test_parse_point_wraps_stats_decode_failure_with_context(self):
+        root = self.fixture.create_root(cached_rows=False)
+        row = self.fixture.manifest_rows(root)[0]
+        stats_path = root / "stats" / "overlap0" / row["run_id"] / "stats_selfcom.txt"
+        stats_path.write_bytes(b"\xff")
+        with self.assertRaisesRegex(
+            ValueError, r"root=.*run_id=.* field=stats_selfcom\.txt"
+        ):
+            phase4e_figure.parse_point(root, row, "explicit-NoC", 0, self.fixture.verifier)
 
     def test_verifier_requires_successful_pass_evidence(self):
         for mode, message in (
