@@ -9,6 +9,25 @@ import re
 import subprocess
 import sys
 
+import matplotlib
+
+
+matplotlib.use("Agg")
+matplotlib.rcParams.update({
+    "font.family": "DejaVu Sans",
+    "font.size": 11,
+    "axes.titlesize": 13,
+    "axes.labelsize": 11,
+    "xtick.labelsize": 10,
+    "ytick.labelsize": 10,
+    "legend.fontsize": 10,
+    "svg.fonttype": "none",
+    "pdf.fonttype": 42,
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+})
+import matplotlib.pyplot as plt
+
 
 ROWS = 16
 DIM = 512
@@ -588,8 +607,299 @@ def validate_derived_contracts(records: list[PointRecord]) -> DerivedContracts:
     )
 
 
+def _records_by_worker(
+    records: list[PointRecord], transport: str, reduction_vn: int | None
+) -> dict[int, PointRecord]:
+    selected = {
+        record.workers: record
+        for record in records
+        if record.transport == transport and record.reduction_vn == reduction_vn
+    }
+    if tuple(sorted(selected)) != EXPECTED_WORKERS:
+        raise ValueError(
+            f"figure rendering: incomplete {transport} VN={reduction_vn} records"
+        )
+    return selected
+
+
+def _panel_label(axis, label: str) -> None:
+    axis.text(
+        -0.04,
+        1.06,
+        label,
+        transform=axis.transAxes,
+        fontsize=15,
+        fontweight="bold",
+        va="bottom",
+        ha="left",
+    )
+
+
+def build_figure(records: list[PointRecord]):
+    derived = validate_derived_contracts(records)
+    workers = list(EXPECTED_WORKERS)
+    modeled = _records_by_worker(records, "modeled-NoC", None)
+    explicit = {
+        vn: _records_by_worker(records, "explicit-NoC", vn) for vn in (0, 1, 2)
+    }
+
+    signal_blue = "#3977A8"
+    modeled_gray = "#8A9199"
+    orange = "#D9772B"
+    vn_styles = {
+        0: ("#55A6B8", "o"),
+        1: ("#3977A8", "s"),
+        2: ("#264A70", "^"),
+    }
+
+    figure = plt.figure(figsize=(13.333, 7.5), constrained_layout=True)
+    grid = figure.add_gridspec(
+        2,
+        2,
+        width_ratios=[0.82, 1.35],
+        height_ratios=[1.25, 0.82],
+    )
+    axis_a = figure.add_subplot(grid[0, 0])
+    axis_b = figure.add_subplot(grid[0, 1])
+    axis_c = figure.add_subplot(grid[1, :])
+    figure.suptitle(
+        "Phase 4E: VN equivalence and reduction-network pressure",
+        fontsize=21,
+        fontweight="bold",
+    )
+
+    modeled_runtime = [modeled[worker].simulated_time_us for worker in workers]
+    axis_a.plot(
+        workers,
+        modeled_runtime,
+        color=modeled_gray,
+        marker="D",
+        markersize=6,
+        linewidth=1.8,
+        label="modeled-NoC",
+        zorder=2,
+    )
+    offsets = {0: -0.16, 1: 0.0, 2: 0.16}
+    for vn in (0, 1, 2):
+        color, marker = vn_styles[vn]
+        axis_a.plot(
+            [worker + offsets[vn] for worker in workers],
+            [explicit[vn][worker].simulated_time_us for worker in workers],
+            color=color,
+            marker=marker,
+            markersize=6,
+            linewidth=1.2,
+            alpha=0.9,
+            label=f"explicit VN{vn}",
+            zorder=3,
+        )
+    all_runtimes = modeled_runtime + [
+        explicit[vn][worker].simulated_time_us
+        for vn in (0, 1, 2)
+        for worker in workers
+    ]
+    axis_a.set_ylim(min(all_runtimes) - 0.65, max(all_runtimes) + 1.05)
+    axis_a.set_xticks(workers)
+    axis_a.set_xlabel("Worker cores")
+    axis_a.set_ylabel("Simulated time (us)")
+    axis_a.set_title("End-to-end runtime", loc="left", fontweight="bold")
+    axis_a.grid(axis="y", color="#D8DCE0", linewidth=0.7, alpha=0.7)
+    axis_a.legend(loc="upper left", frameon=False, ncols=2, handlelength=1.6)
+    axis_a.text(
+        0.98,
+        0.12,
+        "VN0/VN1/VN2 overlap exactly",
+        transform=axis_a.transAxes,
+        color=vn_styles[2][0],
+        ha="right",
+        fontweight="bold",
+    )
+    axis_a.text(
+        0.98,
+        0.04,
+        "max |explicit - modeled| < 0.061%",
+        transform=axis_a.transAxes,
+        color="#4E555B",
+        ha="right",
+        fontsize=10,
+    )
+    _panel_label(axis_a, "a")
+
+    explicit_reference = explicit[0]
+    average_latency = [
+        explicit_reference[worker].latency_average_cycles for worker in workers
+    ]
+    maximum_latency = [explicit_reference[worker].latency_max_cycles for worker in workers]
+    axis_b.plot(
+        workers,
+        average_latency,
+        color=signal_blue,
+        marker="o",
+        markersize=7,
+        linewidth=2.6,
+        label="Average latency",
+    )
+    axis_b.plot(
+        workers,
+        maximum_latency,
+        color=orange,
+        marker="o",
+        markersize=6,
+        linewidth=2.0,
+        linestyle="--",
+        label="Maximum latency",
+    )
+    axis_b.set_xticks(workers)
+    axis_b.set_xlabel("Worker cores")
+    axis_b.set_ylabel("Latency (cycles)")
+    axis_b.set_title("Reduction transport latency", loc="left", fontweight="bold")
+    axis_b.grid(axis="y", color="#D8DCE0", linewidth=0.7, alpha=0.7)
+    axis_b.annotate(
+        f"{round(average_latency[0]):,}",
+        (workers[0], average_latency[0]),
+        xytext=(9, 10),
+        textcoords="offset points",
+        color=signal_blue,
+        fontweight="bold",
+    )
+    axis_b.annotate(
+        f"Average: {round(average_latency[-1]):,} cycles",
+        (workers[-1], average_latency[-1]),
+        xytext=(-8, -35),
+        textcoords="offset points",
+        ha="right",
+        color=signal_blue,
+        fontweight="bold",
+    )
+    axis_b.annotate(
+        f"Maximum: {round(maximum_latency[-1]):,} cycles",
+        (workers[-1], maximum_latency[-1]),
+        xytext=(-8, 10),
+        textcoords="offset points",
+        ha="right",
+        color=orange,
+        fontweight="bold",
+    )
+    axis_b.text(
+        0.98,
+        0.47,
+        f"+{round(derived.latency_growth_pct)}% average latency from 4 to 16 workers",
+        transform=axis_b.transAxes,
+        color=orange,
+        ha="right",
+        fontsize=12,
+        fontweight="bold",
+    )
+    axis_b.text(
+        0.98,
+        0.08,
+        "identical for VN0/VN1/VN2",
+        transform=axis_b.transAxes,
+        color=signal_blue,
+        ha="right",
+        fontweight="bold",
+    )
+    _panel_label(axis_b, "b")
+
+    for worker in workers:
+        stalls = [explicit[vn][worker].total_xbar_stalls for vn in (0, 1, 2)]
+        if len(set(stalls)) != 1:
+            raise ValueError(
+                f"figure rendering: VN xbar-stall mismatch at workers={worker}"
+            )
+    positions = list(range(len(workers)))
+    bar_width = 0.32
+    modeled_stalls = [modeled[worker].total_xbar_stalls for worker in workers]
+    explicit_stalls = [explicit_reference[worker].total_xbar_stalls for worker in workers]
+    modeled_bars = axis_c.bar(
+        [position - bar_width / 2 for position in positions],
+        modeled_stalls,
+        width=bar_width,
+        color=modeled_gray,
+        label="modeled-NoC",
+    )
+    explicit_bars = axis_c.bar(
+        [position + bar_width / 2 for position in positions],
+        explicit_stalls,
+        width=bar_width,
+        color=signal_blue,
+        label="explicit-NoC",
+    )
+    axis_c.bar_label(modeled_bars, padding=3, fontsize=9, color="#4E555B")
+    axis_c.bar_label(explicit_bars, padding=3, fontsize=9, color=signal_blue)
+    axis_c.set_xlim(-0.6, 5.15)
+    axis_c.set_ylim(0, max(modeled_stalls + explicit_stalls) * 1.24)
+    axis_c.set_xticks(positions, workers)
+    axis_c.set_xlabel("Worker cores")
+    axis_c.set_ylabel("Total xbar stalls")
+    axis_c.set_title("NoC pressure and validation", loc="left", fontweight="bold")
+    axis_c.grid(axis="y", color="#D8DCE0", linewidth=0.7, alpha=0.7)
+    axis_c.set_axisbelow(True)
+    axis_c.text(
+        2.35,
+        modeled_stalls[-1],
+        "modeled-NoC",
+        color="#616970",
+        va="center",
+        fontweight="bold",
+        fontsize=10,
+    )
+    axis_c.text(
+        2.35,
+        explicit_stalls[-1],
+        "explicit-NoC",
+        color=signal_blue,
+        va="center",
+        fontweight="bold",
+        fontsize=10,
+    )
+    axis_c.text(
+        0.63,
+        0.14,
+        "Transport events: 256 / 512 / 1024",
+        transform=axis_c.transAxes,
+        color=signal_blue,
+        fontweight="bold",
+    )
+    validation_text = (
+        "Inbox high-water = 4\n"
+        "Queued / rejected / stale = 0\n"
+        "Golden = 8192 checked, 0 mismatches (all points)\n"
+        "DMA retry / exhaustion = 0"
+    )
+    axis_c.text(
+        0.63,
+        0.54,
+        validation_text,
+        transform=axis_c.transAxes,
+        va="center",
+        linespacing=1.5,
+        color="#30363B",
+        fontsize=11,
+    )
+    _panel_label(axis_c, "c")
+
+    figure.text(
+        0.995,
+        0.012,
+        "Single deterministic simulation per configuration",
+        ha="right",
+        va="bottom",
+        fontsize=9,
+        color="#626A70",
+    )
+    return figure
+
+
 def render_figure(records: list[PointRecord], output_prefix: pathlib.Path) -> None:
-    raise NotImplementedError("figure rendering is implemented in Task 3")
+    output_prefix.parent.mkdir(parents=True, exist_ok=True)
+    figure = build_figure(records)
+    try:
+        figure.savefig(output_prefix.with_suffix(".svg"), facecolor="white")
+        figure.savefig(output_prefix.with_suffix(".pdf"), facecolor="white")
+        figure.savefig(output_prefix.with_suffix(".png"), dpi=300, facecolor="white")
+    finally:
+        plt.close(figure)
 
 
 def main(

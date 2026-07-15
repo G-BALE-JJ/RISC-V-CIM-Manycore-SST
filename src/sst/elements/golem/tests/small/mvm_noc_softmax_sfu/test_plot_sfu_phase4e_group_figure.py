@@ -5,6 +5,7 @@ import pathlib
 import stat
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[7]
@@ -621,6 +622,58 @@ class Phase4ESourceDataTests(unittest.TestCase):
             writer.writerows(rows)
         with self.assertRaisesRegex(ValueError, "non-finite"):
             phase4e_figure.load_source_csv(csv_path)
+
+
+class Phase4EFigureRenderingTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.source_csv = SCRIPT.parent / "sfu_phase4e_group_figure_source_data.csv"
+        cls.records = phase4e_figure.load_source_csv(cls.source_csv)
+
+    def test_builds_three_panel_16_by_9_canvas_with_panel_labels(self):
+        figure = phase4e_figure.build_figure(self.records)
+        self.addCleanup(figure.clear)
+
+        self.assertEqual(3, len(figure.axes))
+        self.assertEqual((13.333, 7.5), tuple(figure.get_size_inches()))
+        panel_labels = {
+            text.get_text()
+            for axis in figure.axes
+            for text in axis.texts
+            if text.get_text() in {"a", "b", "c"}
+        }
+        self.assertEqual({"a", "b", "c"}, panel_labels)
+
+    def test_render_exports_svg_pdf_and_300_dpi_png(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            prefix = pathlib.Path(temporary) / "phase4e"
+            phase4e_figure.render_figure(self.records, prefix)
+
+            for suffix in (".svg", ".pdf", ".png"):
+                output = prefix.with_suffix(suffix)
+                self.assertTrue(output.is_file(), suffix)
+                self.assertGreater(output.stat().st_size, 0, suffix)
+
+    def test_svg_contains_approved_data_derived_annotations(self):
+        expected = {
+            "VN0/VN1/VN2 overlap exactly",
+            "max |explicit - modeled| < 0.061%",
+            "identical for VN0/VN1/VN2",
+            "+65% average latency from 4 to 16 workers",
+            "Single deterministic simulation per configuration",
+            "Inbox high-water = 4",
+            "Queued / rejected / stale = 0",
+            "Golden = 8192 checked, 0 mismatches (all points)",
+            "DMA retry / exhaustion = 0",
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            prefix = pathlib.Path(temporary) / "phase4e"
+            phase4e_figure.render_figure(self.records, prefix)
+            svg_text = "".join(ET.parse(prefix.with_suffix(".svg")).getroot().itertext())
+
+        for annotation in expected:
+            with self.subTest(annotation=annotation):
+                self.assertIn(annotation, svg_text)
 
 
 if __name__ == "__main__":
