@@ -192,7 +192,7 @@ class SyntheticChild:
         self.root = root
         self.spec = spec
         self.run_id = (
-            f"sfu_job_dist_r{spec.rows}_d{spec.dim}_c256_w{spec.worker_cores}"
+            f"sfu_job_dist_r{spec.rows}_d{spec.dim}_w{spec.worker_cores}"
             f"_bc{spec.band_cores}_g1_vn0"
         )
         self.stats_dir = root / "stats" / "overlap0" / self.run_id
@@ -422,13 +422,23 @@ class Phase4FArtifactParserTest(unittest.TestCase):
             phase4f.select_child_manifest_row(self.root, self.spec)
 
     def test_manifest_rejects_previous_incorrect_run_id_template(self):
-        old_run_id = (
-            f"sfu_unified_job_r{self.spec.rows}_d{self.spec.dim}_c256_"
-            f"w{self.spec.worker_cores}_b{self.spec.band_cores}_g1_vn0"
+        old_run_ids = (
+            (
+                f"sfu_unified_job_r{self.spec.rows}_d{self.spec.dim}_c256_"
+                f"w{self.spec.worker_cores}_b{self.spec.band_cores}_g1_vn0"
+            ),
+            (
+                f"sfu_job_dist_r{self.spec.rows}_d{self.spec.dim}_c256_"
+                f"w{self.spec.worker_cores}_bc{self.spec.band_cores}_g1_vn0"
+            ),
         )
-        self.child.write_manifest([dict(self.child.manifest_row, run_id=old_run_id)])
-        with self.assertRaisesRegex(ValueError, r"field=run_id"):
-            phase4f.select_child_manifest_row(self.root, self.spec)
+        for old_run_id in old_run_ids:
+            with self.subTest(old_run_id=old_run_id):
+                self.child.write_manifest([
+                    dict(self.child.manifest_row, run_id=old_run_id)
+                ])
+                with self.assertRaisesRegex(ValueError, r"field=run_id"):
+                    phase4f.select_child_manifest_row(self.root, self.spec)
 
     def test_parse_canonical_child_point_aggregates_all_evidence(self):
         record = phase4f.parse_child_point(self.root, self.spec, self.child.verifier)

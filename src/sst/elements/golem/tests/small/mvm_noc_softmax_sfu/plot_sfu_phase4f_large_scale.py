@@ -235,7 +235,7 @@ def _require_equal(root, run_id, field, actual, expected):
 
 def _canonical_run_id(spec: PointSpec) -> str:
     return (
-        f"sfu_job_dist_r{spec.rows}_d{spec.dim}_c256_w{spec.worker_cores}"
+        f"sfu_job_dist_r{spec.rows}_d{spec.dim}_w{spec.worker_cores}"
         f"_bc{spec.band_cores}_g1_vn0"
     )
 
