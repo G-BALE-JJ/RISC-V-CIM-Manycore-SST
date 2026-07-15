@@ -1,8 +1,11 @@
 import csv
 import dataclasses
 import importlib.util
+import os
 import pathlib
+import re
 import stat
+import subprocess
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
@@ -309,6 +312,38 @@ class Phase4EParserTests(unittest.TestCase):
         ):
             phase4e_figure.parse_point(root, row, "explicit-NoC", 0, self.fixture.verifier)
 
+    def test_parse_point_rejects_duplicate_matching_sst_logs_with_context(self):
+        root = self.fixture.create_root(cached_rows=False)
+        row = self.fixture.manifest_rows(root)[0]
+        (root / "logs" / f"duplicate_{row['run_id']}.log").write_text(
+            "Simulation is complete, simulated time: 407.75 us\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            rf"root={re.escape(str(root))} run_id={row['run_id']} field=sst_log: expected exactly one matching log, got 2",
+        ):
+            phase4e_figure.parse_point(
+                root, row, "explicit-NoC", 0, self.fixture.verifier
+            )
+
+    def test_parse_point_rejects_duplicate_completion_lines_with_context(self):
+        root = self.fixture.create_root(cached_rows=False)
+        row = self.fixture.manifest_rows(root)[0]
+        log = next((root / "logs").glob(f"*{row['run_id']}*.log"))
+        log.write_text(
+            "Simulation is complete, simulated time: 407.75 us\n"
+            "Simulation is complete, simulated time: 408.00 us\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            rf"root={re.escape(str(root))} run_id={row['run_id']} field=simulated_time: expected exactly one valid completion line, got 2",
+        ):
+            phase4e_figure.parse_point(
+                root, row, "explicit-NoC", 0, self.fixture.verifier
+            )
+
     def test_parse_point_aggregates_transport_statistics(self):
         root = self.fixture.create_root(cached_rows=False)
         row = self.fixture.manifest_rows(root)[0]
@@ -514,6 +549,50 @@ class Phase4ESourceDataTests(unittest.TestCase):
         self.assertEqual([], list(output_dir.glob("*.pdf")))
         self.assertEqual([], list(output_dir.glob("*.svg")))
 
+    def test_system_python_parse_only_succeeds_without_matplotlib(self):
+        probe = subprocess.run(
+            ["/usr/bin/python3", "-c", "import matplotlib"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(0, probe.returncode, "system Python unexpectedly has matplotlib")
+        output_dir = self.base / "system-python-output"
+        subprocess_driver = """
+import importlib.util
+import pathlib
+import sys
+
+script, sweeps_root, output_dir, verifier = map(pathlib.Path, sys.argv[1:])
+spec = importlib.util.spec_from_file_location("phase4e_system_python", script)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+raise SystemExit(module.main([
+    "--sweeps-root", str(sweeps_root),
+    "--output-dir", str(output_dir),
+    "--parse-only",
+], verifier=verifier))
+"""
+        result = subprocess.run(
+            [
+                "/usr/bin/python3",
+                "-c",
+                subprocess_driver,
+                str(SCRIPT),
+                str(self.fixture.sweeps_root),
+                str(output_dir),
+                str(self.fixture.verifier),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            env={**dict(os.environ), "PYTHONDONTWRITEBYTECODE": "1"},
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertTrue((output_dir / phase4e_figure.SOURCE_CSV_NAME).is_file())
+        self.assertEqual([], list(output_dir.glob("sfu_phase4e_group_figure.*")))
+
     def test_source_csv_round_trips_every_point_record_field(self):
         records = self.load_records()
         csv_path = self.base / "source.csv"
@@ -599,8 +678,82 @@ class Phase4ESourceDataTests(unittest.TestCase):
             unequal_latency[3],
             latency_average_cycles=unequal_latency[3].latency_average_cycles + 1.0,
         )
-        with self.assertRaisesRegex(ValueError, "VN latency"):
+        with self.assertRaisesRegex(ValueError, "VN average latency"):
             phase4e_figure.validate_derived_contracts(unequal_latency)
+
+    def test_derived_contracts_reject_every_claim_bearing_vn_divergence(self):
+        records = self.load_records()
+        mutations = {
+            "runtime": ("simulated_time_us", 1.0),
+            "average latency": ("latency_average_cycles", 1.0),
+            "maximum latency": ("latency_max_cycles", 1),
+            "inbox high-water": ("inbox_high_water", 1),
+            "xbar stalls": ("total_xbar_stalls", 1),
+            "transport events": ("transport_events", 1),
+        }
+        explicit_index = next(
+            index
+            for index, record in enumerate(records)
+            if record.transport == "explicit-NoC"
+        )
+        for field_label, (field, delta) in mutations.items():
+            with self.subTest(field=field):
+                mutated = list(records)
+                original = mutated[explicit_index]
+                mutated[explicit_index] = dataclasses.replace(
+                    original, **{field: getattr(original, field) + delta}
+                )
+                with self.assertRaisesRegex(ValueError, re.escape(field_label)):
+                    phase4e_figure.validate_derived_contracts(mutated)
+
+    def test_derived_contracts_require_exact_vn_identities_at_every_worker(self):
+        records = self.load_records()
+        vn1_index = next(
+            index
+            for index, record in enumerate(records)
+            if record.transport == "explicit-NoC"
+            and record.workers == 4
+            and record.reduction_vn == 1
+        )
+        records[vn1_index] = dataclasses.replace(
+            records[vn1_index], reduction_vn=0
+        )
+        with self.assertRaisesRegex(ValueError, "VN identities.*expected.*0, 1, 2"):
+            phase4e_figure.validate_derived_contracts(records)
+
+    def test_derived_contracts_require_inbox_high_water_four_at_every_explicit_point(self):
+        records = [
+            dataclasses.replace(record, inbox_high_water=5)
+            if record.transport == "explicit-NoC"
+            else record
+            for record in self.load_records()
+        ]
+        with self.assertRaisesRegex(ValueError, "inbox high-water.*expected 4"):
+            phase4e_figure.validate_derived_contracts(records)
+
+    def test_validation_annotations_are_derived_from_contract_evidence(self):
+        derived = phase4e_figure.validate_derived_contracts(self.load_records())
+        alternate = dataclasses.replace(
+            derived,
+            transport_events=(111, 222, 333),
+            inbox_high_water=7,
+            golden_checked=4096,
+            golden_mismatches=2,
+            queued=3,
+            rejected=4,
+            stale=5,
+            dma_timeout_retry=6,
+            dma_timeout_exhausted=7,
+            dma_write_timeout_retry=8,
+        )
+        transport_text, validation_text = phase4e_figure._validation_annotations(
+            alternate
+        )
+        self.assertEqual("Transport events: 111 / 222 / 333", transport_text)
+        self.assertIn("Inbox high-water = 7", validation_text)
+        self.assertIn("Queued / rejected / stale = 3 / 4 / 5", validation_text)
+        self.assertIn("Golden = 4096 checked, 2 mismatches (all points)", validation_text)
+        self.assertIn("DMA retry / exhaustion / write retry = 6 / 7 / 8", validation_text)
 
     def test_source_csv_loader_rejects_trailing_columns(self):
         csv_path = self.base / "source.csv"
@@ -671,9 +824,9 @@ class Phase4EFigureRenderingTests(unittest.TestCase):
             "+65% average latency from 4 to 16 workers",
             "Single deterministic simulation per configuration",
             "Inbox high-water = 4",
-            "Queued / rejected / stale = 0",
+            "Queued / rejected / stale = 0 / 0 / 0",
             "Golden = 8192 checked, 0 mismatches (all points)",
-            "DMA retry / exhaustion = 0",
+            "DMA retry / exhaustion / write retry = 0 / 0 / 0",
         }
         with tempfile.TemporaryDirectory() as temporary:
             prefix = pathlib.Path(temporary) / "phase4e"
@@ -683,6 +836,29 @@ class Phase4EFigureRenderingTests(unittest.TestCase):
         for annotation in expected:
             with self.subTest(annotation=annotation):
                 self.assertIn(annotation, svg_text)
+
+    def test_render_rejects_claim_divergence_before_export(self):
+        mutations = {
+            "maximum latency": ("latency_max_cycles", 1),
+            "inbox high-water": ("inbox_high_water", 1),
+            "transport events": ("transport_events", 1),
+        }
+        explicit_index = next(
+            index
+            for index, record in enumerate(self.records)
+            if record.transport == "explicit-NoC"
+        )
+        for field_label, (field, delta) in mutations.items():
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as temporary:
+                records = list(self.records)
+                original = records[explicit_index]
+                records[explicit_index] = dataclasses.replace(
+                    original, **{field: getattr(original, field) + delta}
+                )
+                prefix = pathlib.Path(temporary) / "phase4e"
+                with self.assertRaisesRegex(ValueError, re.escape(field_label)):
+                    phase4e_figure.render_figure(records, prefix)
+                self.assertEqual([], list(pathlib.Path(temporary).iterdir()))
 
     def test_render_repeats_byte_identically_for_all_formats(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -698,6 +874,19 @@ class Phase4EFigureRenderingTests(unittest.TestCase):
                         first.with_suffix(suffix).read_bytes(),
                         second.with_suffix(suffix).read_bytes(),
                     )
+
+    def test_svg_has_live_text_valid_xml_and_no_trailing_whitespace(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            prefix = pathlib.Path(temporary) / "phase4e"
+            phase4e_figure.render_figure(self.records, prefix)
+            svg_path = prefix.with_suffix(".svg")
+            svg_bytes = svg_path.read_bytes()
+            for line_number, line in enumerate(svg_bytes.splitlines(), start=1):
+                with self.subTest(line=line_number):
+                    self.assertEqual(line.rstrip(b" \t"), line)
+            root = ET.parse(svg_path).getroot()
+            live_text = root.findall(".//{http://www.w3.org/2000/svg}text")
+            self.assertGreater(len(live_text), 0)
 
 
 if __name__ == "__main__":

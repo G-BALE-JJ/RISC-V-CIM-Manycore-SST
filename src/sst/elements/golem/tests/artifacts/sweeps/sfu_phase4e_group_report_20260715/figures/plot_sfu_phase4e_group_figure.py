@@ -9,26 +9,6 @@ import re
 import subprocess
 import sys
 
-import matplotlib
-
-
-matplotlib.use("Agg")
-matplotlib.rcParams.update({
-    "font.family": "DejaVu Sans",
-    "font.size": 11,
-    "axes.titlesize": 13,
-    "axes.labelsize": 11,
-    "xtick.labelsize": 10,
-    "ytick.labelsize": 10,
-    "legend.fontsize": 10,
-    "svg.fonttype": "none",
-    "svg.hashsalt": "sfu-phase4e-group-figure-20260715",
-    "pdf.fonttype": 42,
-    "axes.spines.top": False,
-    "axes.spines.right": False,
-})
-import matplotlib.pyplot as plt
-
 
 ROWS = 16
 DIM = 512
@@ -73,6 +53,39 @@ class DerivedContracts:
     explicit_runtime_spread: float
     max_explicit_modeled_pct: float
     latency_growth_pct: float
+    transport_events: tuple[int, int, int]
+    inbox_high_water: int
+    golden_checked: int
+    golden_mismatches: int
+    queued: int
+    rejected: int
+    stale: int
+    dma_timeout_retry: int
+    dma_timeout_exhausted: int
+    dma_write_timeout_retry: int
+
+
+def _load_plotting_backend():
+    import matplotlib
+
+    matplotlib.use("Agg")
+    matplotlib.rcParams.update({
+        "font.family": "DejaVu Sans",
+        "font.size": 11,
+        "axes.titlesize": 13,
+        "axes.labelsize": 11,
+        "xtick.labelsize": 10,
+        "ytick.labelsize": 10,
+        "legend.fontsize": 10,
+        "svg.fonttype": "none",
+        "svg.hashsalt": "sfu-phase4e-group-figure-20260715",
+        "pdf.fonttype": 42,
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+    })
+    import matplotlib.pyplot as plt
+
+    return plt
 
 
 def _error(root: pathlib.Path, run_id: str, field: str, detail: str) -> ValueError:
@@ -246,12 +259,18 @@ def _simulated_time_us(root: pathlib.Path, run_id: str, log: pathlib.Path) -> fl
         text = log.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as exc:
         raise _error(root, run_id, "simulated_time", str(exc)) from exc
-    match = re.search(
+    matches = list(re.finditer(
         r"Simulation is complete, simulated time:\s*([0-9]+(?:\.[0-9]+)?)\s*(us|ms|s)\b",
         text,
-    )
-    if match is None:
-        raise _error(root, run_id, "simulated_time", "completion line is missing or malformed")
+    ))
+    if len(matches) != 1:
+        raise _error(
+            root,
+            run_id,
+            "simulated_time",
+            f"expected exactly one valid completion line, got {len(matches)}",
+        )
+    match = matches[0]
     multipliers = {"us": 1.0, "ms": 1_000.0, "s": 1_000_000.0}
     return float(match.group(1)) * multipliers[match.group(2)]
 
@@ -330,10 +349,15 @@ def parse_point(
     band_cores = _required_int(root, manifest_row, "band_cores")
     stats_dir = root / "stats" / "overlap0" / run_id
     stats_file = stats_dir / "stats_selfcom.txt"
-    try:
-        sst_log = next((root / "logs").glob(f"*{run_id}*.log"))
-    except StopIteration as exc:
-        raise _error(root, run_id, "sst_log", "matching log is missing") from exc
+    matching_logs = sorted((root / "logs").glob(f"*{run_id}*.log"))
+    if len(matching_logs) != 1:
+        raise _error(
+            root,
+            run_id,
+            "sst_log",
+            f"expected exactly one matching log, got {len(matching_logs)}",
+        )
+    sst_log = matching_logs[0]
     output_file = root / "outputs" / f"{run_id}.bin"
 
     stats_rows = _read_stats(
@@ -563,22 +587,49 @@ def validate_derived_contracts(records: list[PointRecord]) -> DerivedContracts:
     spreads = []
     explicit_modeled_pct = []
     latency_by_workers = {}
+    transport_events = []
     for workers in EXPECTED_WORKERS:
         worker_records = [record for record in explicit if record.workers == workers]
         if len(worker_records) != 3 or workers not in modeled:
             raise ValueError(f"derived contracts: incomplete worker point {workers}")
+        vn_identities = [record.reduction_vn for record in worker_records]
+        if set(vn_identities) != {0, 1, 2}:
+            raise ValueError(
+                "derived contracts: VN identities "
+                f"at workers={workers}: expected [0, 1, 2], got {vn_identities}"
+            )
+        expected_events = 4 * ROWS * workers
+        for record in worker_records:
+            if record.inbox_high_water != 4:
+                raise ValueError(
+                    "derived contracts: inbox high-water "
+                    f"at workers={workers} VN={record.reduction_vn}: "
+                    f"expected 4, got {record.inbox_high_water}"
+                )
+            if record.transport_events != expected_events:
+                raise ValueError(
+                    "derived contracts: transport events "
+                    f"at workers={workers} VN={record.reduction_vn}: "
+                    f"expected {expected_events}, got {record.transport_events}"
+                )
+        equality_fields = (
+            ("simulated_time_us", "runtime"),
+            ("latency_average_cycles", "average latency"),
+            ("latency_max_cycles", "maximum latency"),
+            ("inbox_high_water", "inbox high-water"),
+            ("total_xbar_stalls", "xbar stalls"),
+            ("transport_events", "transport events"),
+        )
+        for field, label in equality_fields:
+            values = [getattr(record, field) for record in worker_records]
+            if any(value != values[0] for value in values[1:]):
+                raise ValueError(
+                    f"derived contracts: VN {label} mismatch at workers={workers}"
+                )
         runtimes = [record.simulated_time_us for record in worker_records]
         spread = max(runtimes) - min(runtimes)
         spreads.append(spread)
-        if spread != 0.0:
-            raise ValueError(
-                f"derived contracts: VN runtime mismatch at workers={workers}: spread={spread}"
-            )
         latencies = [record.latency_average_cycles for record in worker_records]
-        if max(latencies) - min(latencies) != 0.0:
-            raise ValueError(
-                f"derived contracts: VN latency mismatch at workers={workers}"
-            )
         if modeled[workers] <= 0.0:
             raise ValueError(f"derived contracts: nonpositive modeled runtime at workers={workers}")
         explicit_modeled_pct.extend(
@@ -586,6 +637,26 @@ def validate_derived_contracts(records: list[PointRecord]) -> DerivedContracts:
             for runtime in runtimes
         )
         latency_by_workers[workers] = latencies[0]
+        transport_events.append(worker_records[0].transport_events)
+
+    evidence_fields = (
+        ("golden_checked", ROWS * DIM),
+        ("golden_mismatches", 0),
+        ("queued", 0),
+        ("rejected", 0),
+        ("stale", 0),
+        ("dma_timeout_retry", 0),
+        ("dma_timeout_exhausted", 0),
+        ("dma_write_timeout_retry", 0),
+    )
+    for field, expected in evidence_fields:
+        for record in records:
+            value = getattr(record, field)
+            if value != expected:
+                raise ValueError(
+                    f"derived contracts: {field} expected {expected}, got {value} "
+                    f"for run_id={record.run_id}"
+                )
 
     max_pct = max(explicit_modeled_pct)
     if max_pct >= 0.061:
@@ -605,7 +676,34 @@ def validate_derived_contracts(records: list[PointRecord]) -> DerivedContracts:
         explicit_runtime_spread=max(spreads),
         max_explicit_modeled_pct=max_pct,
         latency_growth_pct=latency_growth_pct,
+        transport_events=tuple(transport_events),
+        inbox_high_water=explicit[0].inbox_high_water,
+        golden_checked=records[0].golden_checked,
+        golden_mismatches=records[0].golden_mismatches,
+        queued=records[0].queued,
+        rejected=records[0].rejected,
+        stale=records[0].stale,
+        dma_timeout_retry=records[0].dma_timeout_retry,
+        dma_timeout_exhausted=records[0].dma_timeout_exhausted,
+        dma_write_timeout_retry=records[0].dma_write_timeout_retry,
     )
+
+
+def _validation_annotations(derived: DerivedContracts) -> tuple[str, str]:
+    transport_text = "Transport events: " + " / ".join(
+        str(value) for value in derived.transport_events
+    )
+    validation_text = (
+        f"Inbox high-water = {derived.inbox_high_water}\n"
+        "Queued / rejected / stale = "
+        f"{derived.queued} / {derived.rejected} / {derived.stale}\n"
+        f"Golden = {derived.golden_checked} checked, "
+        f"{derived.golden_mismatches} mismatches (all points)\n"
+        "DMA retry / exhaustion / write retry = "
+        f"{derived.dma_timeout_retry} / {derived.dma_timeout_exhausted} / "
+        f"{derived.dma_write_timeout_retry}"
+    )
+    return transport_text, validation_text
 
 
 def _records_by_worker(
@@ -638,6 +736,7 @@ def _panel_label(axis, label: str) -> None:
 
 def build_figure(records: list[PointRecord]):
     derived = validate_derived_contracts(records)
+    plt = _load_plotting_backend()
     workers = list(EXPECTED_WORKERS)
     modeled = _records_by_worker(records, "modeled-NoC", None)
     explicit = {
@@ -802,12 +901,6 @@ def build_figure(records: list[PointRecord]):
     )
     _panel_label(axis_b, "b")
 
-    for worker in workers:
-        stalls = [explicit[vn][worker].total_xbar_stalls for vn in (0, 1, 2)]
-        if len(set(stalls)) != 1:
-            raise ValueError(
-                f"figure rendering: VN xbar-stall mismatch at workers={worker}"
-            )
     positions = list(range(len(workers)))
     bar_width = 0.32
     modeled_stalls = [modeled[worker].total_xbar_stalls for worker in workers]
@@ -854,19 +947,14 @@ def build_figure(records: list[PointRecord]):
         fontweight="bold",
         fontsize=10,
     )
+    transport_text, validation_text = _validation_annotations(derived)
     axis_c.text(
         0.63,
         0.14,
-        "Transport events: 256 / 512 / 1024",
+        transport_text,
         transform=axis_c.transAxes,
         color=signal_blue,
         fontweight="bold",
-    )
-    validation_text = (
-        "Inbox high-water = 4\n"
-        "Queued / rejected / stale = 0\n"
-        "Golden = 8192 checked, 0 mismatches (all points)\n"
-        "DMA retry / exhaustion = 0"
     )
     axis_c.text(
         0.63,
@@ -901,6 +989,7 @@ def render_figure(records: list[PointRecord], output_prefix: pathlib.Path) -> No
             facecolor="white",
             metadata={"Date": None},
         )
+        _normalize_svg_text(output_prefix.with_suffix(".svg"))
         figure.savefig(
             output_prefix.with_suffix(".pdf"),
             facecolor="white",
@@ -908,7 +997,14 @@ def render_figure(records: list[PointRecord], output_prefix: pathlib.Path) -> No
         )
         figure.savefig(output_prefix.with_suffix(".png"), dpi=300, facecolor="white")
     finally:
+        plt = _load_plotting_backend()
         plt.close(figure)
+
+
+def _normalize_svg_text(svg_path: pathlib.Path) -> None:
+    text = svg_path.read_text(encoding="utf-8")
+    normalized = re.sub(r"[ \t]+(?=\r?$)", "", text, flags=re.MULTILINE)
+    svg_path.write_text(normalized, encoding="utf-8", newline="\n")
 
 
 def main(

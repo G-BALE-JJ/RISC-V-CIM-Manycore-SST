@@ -32,7 +32,7 @@ The matrix contains 12 canonical unique `PASS/PASS` rows: four series (modeled-N
 
 - Golden verification: all 12 output tensors were independently checked over 8192 values; every point reported 0 mismatches.
 - Explicit transport events: 256, 512, and 1024 at 4, 8, and 16 workers, respectively, for each of VN0, VN1, and VN2.
-- Explicit VN equality: runtime, aggregate-average latency, maximum latency, inbox high-water, and NoC totals are equal among VN0/VN1/VN2 at each worker count.
+- Explicit VN equality: runtime, aggregate-average latency, maximum latency, inbox high-water, xbar stalls, and transport events are equal among VN0/VN1/VN2 at each worker count.
 - DMA gates: timeout retry, timeout exhaustion, and write-timeout retry are all zero for all 12 rows.
 - Queue/reject/stale gates: queued, rejected, and stale totals are all zero for all 12 rows.
 - Inbox high-water: 4 for every explicit-NoC point.
@@ -49,11 +49,11 @@ Two complete real-data regenerations produced the same SHA-256 values:
 | File | First pass | Second pass |
 | --- | --- | --- |
 | Source CSV | `91772b337c7f061936e3b1e1da5a74ce5c971e405578aae1cd0a1830f2a3a01e` | `91772b337c7f061936e3b1e1da5a74ce5c971e405578aae1cd0a1830f2a3a01e` |
-| SVG | `10f04e7536b11bcfb4548cb33558b74995a0f41f33b8e506ef1adb6c86810658` | `10f04e7536b11bcfb4548cb33558b74995a0f41f33b8e506ef1adb6c86810658` |
-| PNG | `ed4e782c2fc97005f6b6ae20daef1dfbf7c9676d35e5da883b88f24c8105b7f2` | `ed4e782c2fc97005f6b6ae20daef1dfbf7c9676d35e5da883b88f24c8105b7f2` |
-| PDF | `fc77aaefbf0bc48b2d5b9ccaca4062cb0651a88c61badb2ceb71a6b84d0a036b` | `fc77aaefbf0bc48b2d5b9ccaca4062cb0651a88c61badb2ceb71a6b84d0a036b` |
+| SVG | `b54d9954437e6459e27941750d3461e4650b612cfb89a1beaa3b63e7357d57d1` | `b54d9954437e6459e27941750d3461e4650b612cfb89a1beaa3b63e7357d57d1` |
+| PNG | `068d0daf1d5761ac7342d936b86587a89f34861079e21e94557f8dbdb940f6ce` | `068d0daf1d5761ac7342d936b86587a89f34861079e21e94557f8dbdb940f6ce` |
+| PDF | `a18218e550a6cdeba79f1cf869006e4adc686f199bd08f69a66ee2f10b8ca9b5` | `a18218e550a6cdeba79f1cf869006e4adc686f199bd08f69a66ee2f10b8ca9b5` |
 
-Matplotlib's default random SVG IDs and current-time SVG/PDF metadata initially prevented stable vector hashes. The renderer now uses a fixed SVG hash salt and omits volatile vector dates. The SVG remains direct Matplotlib output and is not post-processed.
+Matplotlib's default random SVG IDs and current-time SVG/PDF metadata initially prevented stable vector hashes. The renderer uses a fixed SVG hash salt and omits volatile vector dates. After SVG export, one deterministic text-only normalization removes horizontal whitespace at line endings; it does not parse or rewrite XML structure, path content, or live text.
 
 ## Raster and vector QA
 
@@ -61,8 +61,8 @@ Matplotlib's default random SVG IDs and current-time SVG/PDF metadata initially 
 - PNG: exactly 3999 x 2250 pixels. ImageMagick reports 118.11 pixels/cm, equivalent to 300 dpi; Pillow 12.3.0 independently confirms the dimensions and both dpi axes within 0.1 of 300.
 - PDF: page size 959.976 x 540 points, matching the fixed 13.333 x 7.5 inch canvas.
 - PDF fonts: embedded and subsetted CID TrueType `DejaVuSans-Bold` and `DejaVuSans`, with Unicode mappings; text is not path-only.
-- SVG text: live `<text>` nodes with `font-family: 'DejaVu Sans'` are present for titles, labels, ticks, annotations, and validation text.
-- SVG path data contains Matplotlib's valid trailing-space command separators. Consequently, an unfiltered whole-bundle `git diff --check` can flag generated SVG lines even though the SVG is valid and renders correctly. The SVG was not rewritten; whitespace checks are applied to handwritten source/test/QA files and non-SVG text deliverables.
+- SVG text: 67 live `<text>` nodes with `font-family: 'DejaVu Sans'` are present for titles, labels, ticks, annotations, and validation text.
+- SVG normalization: line-ending horizontal whitespace is stripped after Matplotlib save. The normalized output has zero trailing-whitespace lines, parses as valid XML, retains live text, renders identically, and permits whole-feature-range `git diff --check` without an SVG exception.
 
 ## Test evidence
 
@@ -75,9 +75,9 @@ MPLCONFIGDIR=/data4/jjgong/.cache/matplotlib-phase4e \
   -p 'test_*.py' -v
 ```
 
-Result: `Ran 214 tests in 18.397s` and `OK`.
+Result: `Ran 223 tests in 22.873s` and `OK`.
 
-The focused figure tests explicitly assert a three-panel 13.333 x 7.5 inch canvas, approved live SVG annotations, byte-identical repeated SVG/PDF/PNG rendering, and a 3999 x 2250 PNG with 300 dpi metadata.
+The focused figure tests explicitly assert a three-panel 13.333 x 7.5 inch canvas, all claim-bearing VN equality gates, mutation rejection before export, system-Python parse-only operation without Matplotlib, unique log/completion evidence, data-derived live SVG annotations, byte-identical repeated SVG/PDF/PNG rendering, normalized valid XML with no trailing whitespace, and a 3999 x 2250 PNG with 300 dpi metadata.
 
 ## Visual inspection
 
