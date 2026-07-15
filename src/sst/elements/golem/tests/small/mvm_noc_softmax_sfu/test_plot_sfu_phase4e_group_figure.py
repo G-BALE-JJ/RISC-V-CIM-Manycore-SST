@@ -293,6 +293,18 @@ class Phase4EParserTests(unittest.TestCase):
                 record = phase4e_figure.parse_point(root, row, "explicit-NoC", 0, self.fixture.verifier)
                 self.assertEqual(expected, record.simulated_time_us)
 
+    def test_parse_point_wraps_sst_log_decode_failure_with_context(self):
+        root = self.fixture.create_root(cached_rows=False)
+        row = self.fixture.manifest_rows(root)[0]
+        log = next((root / "logs").glob(f"*{row['run_id']}*.log"))
+        log.write_bytes(
+            b"\xffSimulation is complete, simulated time: 407.75 us\n"
+        )
+        with self.assertRaisesRegex(
+            ValueError, r"root=.*run_id=.* field=simulated_time"
+        ):
+            phase4e_figure.parse_point(root, row, "explicit-NoC", 0, self.fixture.verifier)
+
     def test_parse_point_aggregates_transport_statistics(self):
         root = self.fixture.create_root(cached_rows=False)
         row = self.fixture.manifest_rows(root)[0]

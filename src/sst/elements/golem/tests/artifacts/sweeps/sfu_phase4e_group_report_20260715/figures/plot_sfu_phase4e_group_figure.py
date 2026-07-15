@@ -213,8 +213,8 @@ def _metric_value(
 
 def _simulated_time_us(root: pathlib.Path, run_id: str, log: pathlib.Path) -> float:
     try:
-        text = log.read_text(encoding="utf-8", errors="replace")
-    except OSError as exc:
+        text = log.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
         raise _error(root, run_id, "simulated_time", str(exc)) from exc
     match = re.search(
         r"Simulation is complete, simulated time:\s*([0-9]+(?:\.[0-9]+)?)\s*(us|ms|s)\b",
