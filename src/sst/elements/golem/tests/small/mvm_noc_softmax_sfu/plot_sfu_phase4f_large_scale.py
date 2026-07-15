@@ -1015,6 +1015,7 @@ def _plot_series(axis, x, y, *, marker="o", color="#176B87", label=None):
 
 _publish_replace = os.replace
 _publish_unlink = pathlib.Path.unlink
+_publish_rmdir = pathlib.Path.rmdir
 
 
 class PublicationError(RuntimeError):
@@ -1025,15 +1026,17 @@ def _raise_publication_error(
     phase: str,
     original: Exception,
     rollback_errors: list[str],
-    backup_dir: pathlib.Path | None,
+    retained_paths: list[pathlib.Path],
 ) -> None:
     detail = f"{phase} failed: {type(original).__name__}: {original}"
     if rollback_errors:
         detail += "; rollback errors: " + " | ".join(rollback_errors)
     else:
         detail += "; rollback completed"
-    if backup_dir is not None:
-        detail += f"; recovery backup preserved at {backup_dir}"
+    if retained_paths:
+        detail += "; recovery paths preserved at " + ", ".join(
+            str(path) for path in retained_paths
+        )
     raise PublicationError(detail) from original
 
 
@@ -1086,10 +1089,18 @@ def _publish_transaction(files: list[tuple[pathlib.Path, pathlib.Path]]) -> None
                 rollback_errors.append(
                     f"restore {target}: {type(rollback_error).__name__}: {rollback_error}"
                 )
-        preserved = backup_dir if rollback_errors else None
-        if preserved is None:
-            backup_dir.rmdir()
-        _raise_publication_error("backup", original, rollback_errors, preserved)
+        if not rollback_errors:
+            try:
+                _publish_rmdir(backup_dir)
+            except Exception as cleanup_error:
+                rollback_errors.append(
+                    f"cleanup {backup_dir}: {type(cleanup_error).__name__}: "
+                    f"{cleanup_error}"
+                )
+        retained_paths = [backup_dir] if backup_dir.exists() else []
+        _raise_publication_error(
+            "backup", original, rollback_errors, retained_paths
+        )
 
     published = set()
     try:
@@ -1116,14 +1127,29 @@ def _publish_transaction(files: list[tuple[pathlib.Path, pathlib.Path]]) -> None
                         f"unlink {target}: {type(rollback_error).__name__}: "
                         f"{rollback_error}"
                     )
-        if rollback_errors:
-            preserved = backup_dir
-        else:
-            backup_dir.rmdir()
-            preserved = None
-            if not target_dir_existed:
-                target_dir.rmdir()
-        _raise_publication_error("publish", original, rollback_errors, preserved)
+        if not rollback_errors:
+            try:
+                _publish_rmdir(backup_dir)
+            except Exception as cleanup_error:
+                rollback_errors.append(
+                    f"cleanup {backup_dir}: {type(cleanup_error).__name__}: "
+                    f"{cleanup_error}"
+                )
+        if not target_dir_existed:
+            try:
+                _publish_rmdir(target_dir)
+            except Exception as cleanup_error:
+                rollback_errors.append(
+                    f"cleanup {target_dir}: {type(cleanup_error).__name__}: "
+                    f"{cleanup_error}"
+                )
+        retained_paths = [
+            path for path in (backup_dir, target_dir)
+            if path.exists() and (path == backup_dir or not target_dir_existed)
+        ]
+        _raise_publication_error(
+            "publish", original, rollback_errors, retained_paths
+        )
 
     shutil.rmtree(backup_dir)
 

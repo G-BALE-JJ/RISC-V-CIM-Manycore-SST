@@ -1815,6 +1815,83 @@ class Phase4FReportTest(unittest.TestCase):
         self.assertEqual(unrelated.read_bytes(), b"keep-me")
         self.assertFalse(list(root.glob(".output.rollback.*")))
 
+    def test_backup_cleanup_failure_preserves_original_error_and_locator(self):
+        root, _, output, unrelated, pairs = self.transaction_fixture(
+            "backup-cleanup-failure"
+        )
+        backup_count = 0
+
+        def replace(source, target):
+            nonlocal backup_count
+            target = pathlib.Path(target)
+            if target.parent.name.startswith(".output.rollback."):
+                backup_count += 1
+                if backup_count == 3:
+                    raise OSError("injected backup phase failure")
+            return os.replace(source, target)
+
+        def rmdir(path):
+            path = pathlib.Path(path)
+            if path.name.startswith(".output.rollback."):
+                raise OSError("injected backup cleanup rmdir failure")
+            return path.rmdir()
+
+        with mock.patch.object(
+            phase4f, "_publish_replace", side_effect=replace
+        ), mock.patch.object(
+            phase4f, "_publish_rmdir", side_effect=rmdir
+        ):
+            with self.assertRaises(RuntimeError) as caught:
+                phase4f._publish_transaction(pairs)
+        message = str(caught.exception)
+        self.assertIn("backup failed", message)
+        self.assertIn("backup phase failure", message)
+        self.assertIn("backup cleanup rmdir failure", message)
+        backups = list(root.glob(".output.rollback.*"))
+        self.assertEqual(len(backups), 1)
+        self.assertIn(str(backups[0]), message)
+        for index in range(1, 6):
+            self.assertEqual(
+                (output / f"file-{index}").read_bytes(), f"old-{index}".encode()
+            )
+        self.assertEqual(unrelated.read_bytes(), b"keep-me")
+
+    def test_target_cleanup_failure_preserves_publish_error_and_path(self):
+        root, _, output, unrelated, pairs = self.transaction_fixture(
+            "target-cleanup-failure", existing=False
+        )
+        publish_count = 0
+
+        def replace(source, target):
+            nonlocal publish_count
+            if pathlib.Path(source).parent.name == "staging":
+                publish_count += 1
+                if publish_count == 3:
+                    raise OSError("injected publish phase failure")
+            return os.replace(source, target)
+
+        def rmdir(path):
+            path = pathlib.Path(path)
+            if path == output:
+                raise OSError("injected target cleanup rmdir failure")
+            return path.rmdir()
+
+        with mock.patch.object(
+            phase4f, "_publish_replace", side_effect=replace
+        ), mock.patch.object(
+            phase4f, "_publish_rmdir", side_effect=rmdir
+        ):
+            with self.assertRaises(RuntimeError) as caught:
+                phase4f._publish_transaction(pairs)
+        message = str(caught.exception)
+        self.assertIn("publish failed", message)
+        self.assertIn("publish phase failure", message)
+        self.assertIn("target cleanup rmdir failure", message)
+        self.assertIn(str(output), message)
+        self.assertTrue(output.is_dir())
+        self.assertFalse(list(output.iterdir()))
+        self.assertEqual(unrelated.read_bytes(), b"keep-me")
+
 
 if __name__ == "__main__":
     unittest.main()
