@@ -1,4 +1,5 @@
 import csv
+import dataclasses
 import importlib.util
 import pathlib
 import stat
@@ -428,6 +429,198 @@ class Phase4EParserTests(unittest.TestCase):
             writer.writerows(dma_rows)
         with self.assertRaisesRegex(ValueError, "dma_timeout_retry"):
             phase4e_figure.load_and_validate_matrix(self.fixture.sweeps_root, self.fixture.verifier)
+
+
+class Phase4ESourceDataTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.base = pathlib.Path(self.temporary.name)
+        self.fixture = ArtifactFixture(self.base)
+        for vn in (2, 0, 1):
+            self.fixture.create_root(vn=vn)
+        self.fixture.create_root(transport="modeled-NoC", vn=None)
+        self._set_contract_latency_values()
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def load_records(self):
+        return phase4e_figure.load_and_validate_matrix(
+            self.fixture.sweeps_root, self.fixture.verifier
+        )
+
+    def _set_contract_latency_values(self):
+        averages = {4: 9440, 8: 12100, 16: 15583}
+        for vn in (0, 1, 2):
+            root = self.fixture.sweeps_root / self.fixture.root_name("explicit-NoC", vn)
+            for row in self.fixture.manifest_rows(root)[::2]:
+                workers = int(row["worker_cores"])
+                path = root / "stats" / "overlap0" / row["run_id"] / "stats_selfcom.txt"
+                with path.open(newline="", encoding="utf-8") as handle:
+                    stats_rows = list(csv.DictReader(handle))
+                for stats_row in stats_rows:
+                    if (
+                        stats_row["StatisticName"] == "sfu_reduction_transport_latency_cycles"
+                        and stats_row["Count.u64"] == "3"
+                    ):
+                        stats_row["Sum.u64"] = str(averages[workers] * 5 - 600)
+                with path.open("w", newline="", encoding="utf-8") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=stats_rows[0].keys())
+                    writer.writeheader()
+                    writer.writerows(stats_rows)
+
+    def test_parse_only_cli_writes_complete_deterministically_ordered_csv(self):
+        output_dir = self.base / "output"
+        result = phase4e_figure.main(
+            [
+                "--sweeps-root",
+                str(self.fixture.sweeps_root),
+                "--output-dir",
+                str(output_dir),
+                "--parse-only",
+            ],
+            verifier=self.fixture.verifier,
+        )
+        self.assertEqual(0, result)
+
+        csv_path = output_dir / "sfu_phase4e_group_figure_source_data.csv"
+        with csv_path.open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            rows = list(reader)
+        expected_fields = [field.name for field in dataclasses.fields(phase4e_figure.PointRecord)]
+        self.assertEqual(expected_fields + ["single_simulation_outcome"], reader.fieldnames)
+        self.assertTrue(all(row["single_simulation_outcome"] == "1" for row in rows))
+        self.assertEqual(
+            [
+                ("modeled-NoC", "", "4"),
+                ("modeled-NoC", "", "8"),
+                ("modeled-NoC", "", "16"),
+                ("explicit-NoC", "0", "4"),
+                ("explicit-NoC", "0", "8"),
+                ("explicit-NoC", "0", "16"),
+                ("explicit-NoC", "1", "4"),
+                ("explicit-NoC", "1", "8"),
+                ("explicit-NoC", "1", "16"),
+                ("explicit-NoC", "2", "4"),
+                ("explicit-NoC", "2", "8"),
+                ("explicit-NoC", "2", "16"),
+            ],
+            [(row["transport"], row["reduction_vn"], row["workers"]) for row in rows],
+        )
+        self.assertEqual([], list(output_dir.glob("*.png")))
+        self.assertEqual([], list(output_dir.glob("*.pdf")))
+        self.assertEqual([], list(output_dir.glob("*.svg")))
+
+    def test_source_csv_round_trips_every_point_record_field(self):
+        records = self.load_records()
+        csv_path = self.base / "source.csv"
+        phase4e_figure.write_source_csv(records, csv_path)
+        self.assertNotIn(b"\r\n", csv_path.read_bytes())
+        restored = phase4e_figure.load_source_csv(csv_path)
+        self.assertEqual(len(records), len(restored))
+        for original, actual in zip(records, restored):
+            for field in dataclasses.fields(phase4e_figure.PointRecord):
+                expected_value = getattr(original, field.name)
+                actual_value = getattr(actual, field.name)
+                if isinstance(expected_value, float):
+                    self.assertAlmostEqual(expected_value, actual_value, delta=1e-9)
+                else:
+                    self.assertEqual(expected_value, actual_value)
+
+    def test_derived_contracts_match_approved_runtime_and_latency_claims(self):
+        modeled_runtime = {4: 400.0, 8: 410.0, 16: 420.0}
+        explicit_runtime = {4: 400.24, 8: 410.20, 16: 420.10}
+        latency = {4: 9440.0, 8: 12100.0, 16: 15583.0}
+        records = [
+            dataclasses.replace(
+                record,
+                simulated_time_us=(
+                    modeled_runtime[record.workers]
+                    if record.transport == "modeled-NoC"
+                    else explicit_runtime[record.workers]
+                ),
+                latency_average_cycles=(
+                    0.0
+                    if record.transport == "modeled-NoC"
+                    else latency[record.workers]
+                ),
+            )
+            for record in self.load_records()
+        ]
+        derived = phase4e_figure.validate_derived_contracts(records)
+        self.assertEqual(0.0, derived.explicit_runtime_spread)
+        self.assertAlmostEqual(0.06, derived.max_explicit_modeled_pct, places=12)
+        self.assertLess(derived.max_explicit_modeled_pct, 0.061)
+        self.assertAlmostEqual(
+            (15583.0 / 9440.0 - 1.0) * 100.0,
+            derived.latency_growth_pct,
+            places=12,
+        )
+        self.assertEqual(65, round(derived.latency_growth_pct))
+
+    def test_derived_contracts_reject_nonidentical_vn_runtime(self):
+        records = self.load_records()
+        records[3] = dataclasses.replace(
+            records[3], simulated_time_us=records[3].simulated_time_us + 0.001
+        )
+        with self.assertRaisesRegex(ValueError, "VN runtime"):
+            phase4e_figure.validate_derived_contracts(records)
+
+    def test_derived_contracts_reject_each_numerical_gate_violation(self):
+        records = self.load_records()
+        modeled_four = next(
+            record.simulated_time_us
+            for record in records
+            if record.transport == "modeled-NoC" and record.workers == 4
+        )
+        excessive_delta = [
+            dataclasses.replace(record, simulated_time_us=modeled_four * 1.000611)
+            if record.transport == "explicit-NoC" and record.workers == 4
+            else record
+            for record in records
+        ]
+        with self.assertRaisesRegex(ValueError, "0.061"):
+            phase4e_figure.validate_derived_contracts(excessive_delta)
+
+        wrong_growth = [
+            dataclasses.replace(record, latency_average_cycles=9440.0)
+            if record.transport == "explicit-NoC" and record.workers == 16
+            else record
+            for record in records
+        ]
+        with self.assertRaisesRegex(ValueError, "latency growth"):
+            phase4e_figure.validate_derived_contracts(wrong_growth)
+
+        unequal_latency = list(records)
+        unequal_latency[3] = dataclasses.replace(
+            unequal_latency[3],
+            latency_average_cycles=unequal_latency[3].latency_average_cycles + 1.0,
+        )
+        with self.assertRaisesRegex(ValueError, "VN latency"):
+            phase4e_figure.validate_derived_contracts(unequal_latency)
+
+    def test_source_csv_loader_rejects_trailing_columns(self):
+        csv_path = self.base / "source.csv"
+        phase4e_figure.write_source_csv(self.load_records(), csv_path)
+        lines = csv_path.read_text(encoding="utf-8").splitlines()
+        lines[1] += ",extra"
+        csv_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "malformed"):
+            phase4e_figure.load_source_csv(csv_path)
+
+    def test_source_csv_loader_rejects_nonfinite_floats(self):
+        csv_path = self.base / "source.csv"
+        phase4e_figure.write_source_csv(self.load_records(), csv_path)
+        with csv_path.open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            rows = list(reader)
+        rows[0]["simulated_time_us"] = "nan"
+        with csv_path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=reader.fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+        with self.assertRaisesRegex(ValueError, "non-finite"):
+            phase4e_figure.load_source_csv(csv_path)
 
 
 if __name__ == "__main__":

@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 
+import argparse
 import csv
 import dataclasses
+import math
 import pathlib
 import re
 import subprocess
@@ -17,6 +19,7 @@ ROOT_SPECS = (
     ("sfu_phase4e_explicit_vn1_matrix_20260715", "explicit-NoC", 1),
     ("sfu_phase4e_explicit_vn2_matrix_20260715", "explicit-NoC", 2),
 )
+SOURCE_CSV_NAME = "sfu_phase4e_group_figure_source_data.csv"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -43,6 +46,13 @@ class PointRecord:
     golden_mismatches: int
     source_root: str
     run_id: str
+
+
+@dataclasses.dataclass(frozen=True)
+class DerivedContracts:
+    explicit_runtime_spread: float
+    max_explicit_modeled_pct: float
+    latency_growth_pct: float
 
 
 def _error(root: pathlib.Path, run_id: str, field: str, detail: str) -> ValueError:
@@ -443,9 +453,181 @@ def load_and_validate_matrix(
     return records
 
 
+def _ordered_records(records: list[PointRecord]) -> list[PointRecord]:
+    def key(record: PointRecord) -> tuple[int, int]:
+        series = 0 if record.transport == "modeled-NoC" else 1 + int(record.reduction_vn)
+        return series, record.workers
+
+    return sorted(records, key=key)
+
+
 def write_source_csv(records: list[PointRecord], output_csv: pathlib.Path) -> None:
-    raise NotImplementedError("source CSV generation is implemented in Task 2")
+    point_fields = [field.name for field in dataclasses.fields(PointRecord)]
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    with output_csv.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=point_fields + ["single_simulation_outcome"],
+            lineterminator="\n",
+        )
+        writer.writeheader()
+        for record in _ordered_records(records):
+            row = {}
+            for field in point_fields:
+                value = getattr(record, field)
+                if value is None:
+                    row[field] = ""
+                elif isinstance(value, float):
+                    row[field] = format(value, ".17g")
+                else:
+                    row[field] = str(value)
+            row["single_simulation_outcome"] = "1"
+            writer.writerow(row)
+
+
+def load_source_csv(source_csv: pathlib.Path) -> list[PointRecord]:
+    point_fields = [field.name for field in dataclasses.fields(PointRecord)]
+    expected_fields = point_fields + ["single_simulation_outcome"]
+    try:
+        with source_csv.open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle, strict=True)
+            rows = list(reader)
+    except (OSError, UnicodeError, csv.Error) as exc:
+        raise ValueError(f"source_csv={source_csv}: {exc}") from exc
+    if reader.fieldnames != expected_fields:
+        raise ValueError(
+            f"source_csv={source_csv}: expected columns {expected_fields}, got {reader.fieldnames}"
+        )
+
+    float_fields = {"simulated_time_us", "latency_average_cycles"}
+    string_fields = {"transport", "source_root", "run_id"}
+    restored = []
+    for row_number, row in enumerate(rows, start=2):
+        if None in row or any(value is None for value in row.values()):
+            raise ValueError(
+                f"source_csv={source_csv} row={row_number}: malformed CSV structure"
+            )
+        if row.get("single_simulation_outcome") != "1":
+            raise ValueError(
+                f"source_csv={source_csv} row={row_number}: single_simulation_outcome must be 1"
+            )
+        values = {}
+        try:
+            for field in point_fields:
+                value = row[field]
+                if field in float_fields:
+                    values[field] = float(value)
+                    if not math.isfinite(values[field]):
+                        raise ValueError(f"non-finite {field}")
+                elif field in string_fields:
+                    values[field] = value
+                elif field == "reduction_vn":
+                    values[field] = None if value == "" else int(value)
+                else:
+                    values[field] = int(value)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"source_csv={source_csv} row={row_number}: invalid PointRecord value: {exc}"
+            ) from exc
+        restored.append(PointRecord(**values))
+    return restored
+
+
+def validate_derived_contracts(records: list[PointRecord]) -> DerivedContracts:
+    modeled = {
+        record.workers: record.simulated_time_us
+        for record in records
+        if record.transport == "modeled-NoC"
+    }
+    explicit = [record for record in records if record.transport == "explicit-NoC"]
+    spreads = []
+    explicit_modeled_pct = []
+    latency_by_workers = {}
+    for workers in EXPECTED_WORKERS:
+        worker_records = [record for record in explicit if record.workers == workers]
+        if len(worker_records) != 3 or workers not in modeled:
+            raise ValueError(f"derived contracts: incomplete worker point {workers}")
+        runtimes = [record.simulated_time_us for record in worker_records]
+        spread = max(runtimes) - min(runtimes)
+        spreads.append(spread)
+        if spread != 0.0:
+            raise ValueError(
+                f"derived contracts: VN runtime mismatch at workers={workers}: spread={spread}"
+            )
+        latencies = [record.latency_average_cycles for record in worker_records]
+        if max(latencies) - min(latencies) != 0.0:
+            raise ValueError(
+                f"derived contracts: VN latency mismatch at workers={workers}"
+            )
+        if modeled[workers] <= 0.0:
+            raise ValueError(f"derived contracts: nonpositive modeled runtime at workers={workers}")
+        explicit_modeled_pct.extend(
+            abs(runtime - modeled[workers]) / modeled[workers] * 100.0
+            for runtime in runtimes
+        )
+        latency_by_workers[workers] = latencies[0]
+
+    max_pct = max(explicit_modeled_pct)
+    if max_pct >= 0.061:
+        raise ValueError(
+            f"derived contracts: max explicit/modeled difference {max_pct}% is not < 0.061%"
+        )
+    if latency_by_workers[4] <= 0.0:
+        raise ValueError("derived contracts: nonpositive four-worker latency")
+    latency_growth_pct = (
+        latency_by_workers[16] / latency_by_workers[4] - 1.0
+    ) * 100.0
+    if round(latency_growth_pct) != 65:
+        raise ValueError(
+            f"derived contracts: latency growth rounds to {round(latency_growth_pct)}%, expected 65%"
+        )
+    return DerivedContracts(
+        explicit_runtime_spread=max(spreads),
+        max_explicit_modeled_pct=max_pct,
+        latency_growth_pct=latency_growth_pct,
+    )
 
 
 def render_figure(records: list[PointRecord], output_prefix: pathlib.Path) -> None:
     raise NotImplementedError("figure rendering is implemented in Task 3")
+
+
+def main(
+    argv: list[str] | None = None, verifier: pathlib.Path | None = None
+) -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--sweeps-root", type=pathlib.Path, required=True)
+    parser.add_argument("--output-dir", type=pathlib.Path, required=True)
+    parser.add_argument("--parse-only", action="store_true")
+    args = parser.parse_args(argv)
+
+    if verifier is None:
+        verifier = (
+            pathlib.Path(__file__).resolve().parents[4]
+            / "small/mvm_noc_softmax_sfu/verify_softmax_sfu_against_golden.py"
+        )
+    records = load_and_validate_matrix(args.sweeps_root, verifier)
+    derived = validate_derived_contracts(records)
+    source_csv = args.output_dir / SOURCE_CSV_NAME
+    write_source_csv(records, source_csv)
+    for record in _ordered_records(records):
+        print(
+            f"validated transport={record.transport} vn={record.reduction_vn} "
+            f"workers={record.workers} events={record.transport_events} "
+            f"golden_checked={record.golden_checked} "
+            f"golden_mismatches={record.golden_mismatches}"
+        )
+    print(
+        f"validated_records={len(records)} "
+        f"explicit_runtime_spread={derived.explicit_runtime_spread:.17g} "
+        f"max_explicit_modeled_pct={derived.max_explicit_modeled_pct:.17g} "
+        f"latency_growth_pct={derived.latency_growth_pct:.17g}"
+    )
+    if args.parse_only:
+        return 0
+    render_figure(records, args.output_dir / "sfu_phase4e_group_figure")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
