@@ -719,6 +719,82 @@ class Phase4FParentRunnerTest(unittest.TestCase):
                 self.assertTrue(attempt2.is_dir())
                 self.assertIn(f"child_root={attempt2}", self.marker(root, spec).read_text(encoding="utf-8"))
 
+    @staticmethod
+    def _tree_snapshot(root):
+        return [
+            (
+                str(path.relative_to(root)),
+                "symlink" if path.is_symlink() else "dir" if path.is_dir() else "file",
+                path.read_bytes() if path.is_file() and not path.is_symlink() else b"",
+            )
+            for path in sorted(root.rglob("*"))
+        ]
+
+    def test_symlinked_attempt_ancestors_are_rejected_before_external_access(self):
+        target = phase4f.DEFAULT_POINTS[0]
+
+        root = self.base / "symlink-new"
+        initialized = self.run_parent(
+            root,
+            self.env(
+                root,
+                GOLEM_PHASE4F_LARGE_SCALE_POINT_LIST="16:1024:16:16",
+            ),
+        )
+        self.assertEqual(initialized.returncode, 0, initialized.stderr)
+        external = self.base / "external-new"
+        external.mkdir()
+        self.child_base(root, target).symlink_to(external, target_is_directory=True)
+        external_before = self._tree_snapshot(external)
+        rejected = self.run_parent(
+            root,
+            self.env(
+                root,
+                GOLEM_PHASE4F_LARGE_SCALE_POINT_LIST="16:512:16:16",
+            ),
+        )
+        self.assertIn(rejected.returncode, (2, 3), rejected.stderr)
+        self.assertIn("symlink", rejected.stderr)
+        self.assertEqual(self._tree_snapshot(external), external_before)
+
+        resume_root = self.base / "symlink-resume"
+        child_log = self.base / "symlink-resume.log"
+        pass_env = self.env(
+            resume_root,
+            GOLEM_PHASE4F_LARGE_SCALE_DRY_RUN="0",
+            GOLEM_PHASE4F_LARGE_SCALE_POINT_LIST="16:512:16:16",
+            FAKE_CHILD_LOG=child_log,
+        )
+        pass_env["PATH"] = f"{self._fake_child_bash('PASS')}:{pass_env['PATH']}"
+        passed = self.run_parent(resume_root, pass_env)
+        self.assertEqual(passed.returncode, 0, passed.stderr)
+
+        attempt_base = self.child_base(resume_root, target)
+        external_resume = self.base / "external-resume"
+        external_resume.mkdir()
+        linked_base = external_resume / "linked-base"
+        attempt_base.rename(linked_base)
+        attempt_base.symlink_to(linked_base, target_is_directory=True)
+        external_resume_before = self._tree_snapshot(external_resume)
+
+        manifest = resume_root / "large_scale_manifest.csv"
+        with manifest.open(newline="", encoding="utf-8") as handle:
+            manifest_rows = list(csv.DictReader(handle))
+        manifest_rows[0]["wall_time_sec"] = "999.0"
+        SyntheticChild.write_csv(manifest, phase4f.PARENT_MANIFEST_FIELDS, manifest_rows)
+        manifest_before = manifest.read_bytes()
+
+        cached_env = self.env(
+            resume_root,
+            GOLEM_PHASE4F_LARGE_SCALE_DRY_RUN="0",
+            GOLEM_PHASE4F_LARGE_SCALE_POINT_LIST="16:512:16:16",
+        )
+        rejected = self.run_parent(resume_root, cached_env)
+        self.assertIn(rejected.returncode, (2, 3), rejected.stderr)
+        self.assertIn("symlink", rejected.stderr)
+        self.assertEqual(self._tree_snapshot(external_resume), external_resume_before)
+        self.assertEqual(manifest.read_bytes(), manifest_before)
+
     def test_damaged_marker_and_signature_hash_drift_fail_closed(self):
         spec = phase4f.DEFAULT_POINTS[0]
         for index, replacement in enumerate(("garbage\n", None)):

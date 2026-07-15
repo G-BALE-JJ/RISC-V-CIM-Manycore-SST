@@ -137,7 +137,13 @@ else
 	printf '%s\n' "$SCHEMA" > "$SCHEMA_FILE"
 fi
 
+if [[ -L "$ROOT/children" || -L "$ROOT/completed" ]]; then
+	error "controlled parent directory must not be a symlink under root=$ROOT"
+	exit 2
+fi
 mkdir -p "$ROOT/children" "$ROOT/completed"
+CHILDREN_ROOT="$ROOT/children"
+CHILDREN_ROOT_REAL="$(realpath -e -- "$CHILDREN_ROOT")"
 PARENT_MANIFEST="$ROOT/large_scale_manifest.csv"
 PARENT_HEADER="run_id,stage,rows,dim,chunk_elems,worker_cores,band_cores,transport,reduction_vn,num_vns,dma_response_vn,noc_link_bw,noc_xbar_bw,dirctrl_highlink_bw,noc_input_buffer,noc_output_buffer,gm_buffer,flit_size,mem_node_size,retry_ticks,max_retries,timeout_sec,status,exit_code,artifact_validation,golden_checked,golden_mismatches,transport_events,transport_immediate,transport_queued,transport_rejected,transport_stale,inbox_high_water,latency_avg_cycles,latency_max_cycles,total_send_packets,total_send_bits,total_xbar_stalls,simulated_time_us,wall_time_sec,dma_timeout_retry,dma_timeout_exhausted,dma_write_timeout_retry,output_sha256,child_root"
 if [[ -f "$PARENT_MANIFEST" ]]; then
@@ -172,6 +178,28 @@ marker_value() {
 	local matches
 	matches="$(awk -F= -v key="$key" '$1 == key { count++; sub(/^[^=]*=/, ""); print } END { if (count != 1) exit 1 }' "$marker")" || return 1
 	printf '%s' "$matches"
+}
+
+path_is_within_children() {
+	local candidate="$1"
+	local current_children_real candidate_real
+	[[ ! -L "$CHILDREN_ROOT" && -d "$CHILDREN_ROOT" ]] || return 1
+	current_children_real="$(realpath -e -- "$CHILDREN_ROOT")" || return 1
+	[[ "$current_children_real" == "$CHILDREN_ROOT_REAL" ]] || return 1
+	candidate_real="$(realpath -m -- "$candidate")" || return 1
+	[[ "$candidate_real" == "$CHILDREN_ROOT_REAL/"* ]]
+}
+
+prepare_attempt_base() {
+	local attempt_base="$1"
+	path_is_within_children "$attempt_base" || return 1
+	[[ ! -L "$attempt_base" ]] || return 1
+	if [[ -e "$attempt_base" ]]; then
+		[[ -d "$attempt_base" ]] || return 1
+	else
+		mkdir "$attempt_base" || return 1
+	fi
+	path_is_within_children "$attempt_base" || return 1
 }
 
 write_marker() {
@@ -220,6 +248,11 @@ validate_marker() {
 	[[ "$marker_child_parent" == "$attempt_base" ]] || return 1
 	[[ "$marker_child_name" =~ ^attempt-[0-9]{4,}$ ]] || return 1
 	[[ -d "$marker_child_root" && ! -L "$marker_child_root" ]] || return 1
+	path_is_within_children "$marker_child_root" || return 1
+	local marker_child_real attempt_base_real
+	marker_child_real="$(realpath -e -- "$marker_child_root")" || return 1
+	attempt_base_real="$(realpath -e -- "$attempt_base")" || return 1
+	[[ "$(dirname "$marker_child_real")" == "$attempt_base_real" ]] || return 1
 	case "$(marker_value "$marker" state)" in
 		DRYRUN|FAIL|TIMEOUT|ARTIFACT_FAIL) ;;
 		PASS)
@@ -232,7 +265,6 @@ validate_marker() {
 next_attempt_root() {
 	local attempt_base="$1"
 	local index=1 candidate
-	mkdir -p "$attempt_base"
 	while :; do
 		printf -v candidate '%s/attempt-%04d' "$attempt_base" "$index"
 		if [[ ! -e "$candidate" ]]; then
@@ -274,6 +306,10 @@ for point_data in "${points[@]}"; do
 	pipeline_sha="$({ printf '%s\0' "$pipeline_args"; } | sha256sum | awk '{print $1}')"
 	signature="schema=$SCHEMA;stage=$stage;rows=$rows;dim=$dim;workers=$workers;bands=$bands;cooperative_groups=1;transport=explicit_noc;request_vn=0;ordinary_response_vn=1;reduction_vn=0;num_vns=3;dma_response_vn=0;noc_link_bw=1200GB/s;noc_xbar_bw=1200GB/s;dirctrl_highlink_bw=1200GB/s;noc_input_buffer=512KB;noc_output_buffer=512KB;gm_buffer=1024KB;flit_size=128B;inter_router_no_cut=0;local_no_cut=0;mem_node_size=$mem_node_size;timeout_sec=$timeout_sec;chunk=256;staging_rows=4;job_rows=4;retry_ticks=1024;max_retries=8;child_runner_sha256=$CHILD_RUNNER_SHA;pipeline_args_sha256=$pipeline_sha"
 	signature_sha="$({ printf '%s' "$signature"; } | sha256sum | awk '{print $1}')"
+	if ! prepare_attempt_base "$attempt_base"; then
+		error "symlink or containment violation for point=$rows:$dim:$workers:$bands attempt_base=$attempt_base children_root=$CHILDREN_ROOT_REAL"
+		exit 2
+	fi
 
 	if [[ -f "$marker" ]]; then
 		if ! validate_marker "$marker" "$signature" "$signature_sha" "$pipeline_sha" "$attempt_base"; then
