@@ -1,12 +1,10 @@
 import dataclasses
 import csv
 import fcntl
-import hashlib
 import importlib.util
 import os
 import pathlib
 import re
-import struct
 import subprocess
 import sys
 import tempfile
@@ -412,12 +410,16 @@ class Phase4FParentRunnerTest(unittest.TestCase):
         )
 
     @staticmethod
-    def child_root(root, spec):
+    def child_base(root, spec):
         identity = (
             f"stage_{spec.stage}_r{spec.rows}_d{spec.dim}_"
             f"w{spec.worker_cores}_b{spec.band_cores}"
         )
         return pathlib.Path(root) / "children" / identity
+
+    @classmethod
+    def child_root(cls, root, spec, attempt=1):
+        return cls.child_base(root, spec) / f"attempt-{attempt:04d}"
 
     @staticmethod
     def marker(root, spec):
@@ -438,7 +440,7 @@ class Phase4FParentRunnerTest(unittest.TestCase):
         self.assertEqual(len(lines), 8, result.stdout)
         for spec, line in zip(phase4f.DEFAULT_POINTS, lines):
             identity = f"{spec.rows}:{spec.dim}:{spec.worker_cores}:{spec.band_cores}"
-            child_root = self.child_root(root, spec)
+            child_root = self.child_root(root, spec, 1)
             self.assertIn(f"point={identity}", line)
             self.assertIn(f"stage={spec.stage}", line)
             self.assertIn(f"mem_node_size={spec.mem_node_size}", line)
@@ -545,6 +547,56 @@ class Phase4FParentRunnerTest(unittest.TestCase):
         fake.chmod(0o755)
         return fake_bin
 
+    def _fake_child_bash(self, outcome):
+        helper = self.base / "fake_child.py"
+        helper.write_text(
+            "import csv, importlib.util, os, pathlib, struct, sys\n"
+            f"test_file = pathlib.Path({str(pathlib.Path(__file__).resolve())!r})\n"
+            "module_spec = importlib.util.spec_from_file_location('phase4f_test_fixture', test_file)\n"
+            "module = importlib.util.module_from_spec(module_spec)\n"
+            "module_spec.loader.exec_module(module)\n"
+            "root = pathlib.Path(os.environ['GOLEM_SWEEP_ROOT'])\n"
+            "rows, dim, workers, bands = map(int, os.environ['GOLEM_SFU_DISTRIBUTED_POINT_LIST'].split(':'))\n"
+            "point = module.phase4f.resolve_point(rows, dim, workers, bands)\n"
+            "outcome = os.environ['FAKE_CHILD_OUTCOME']\n"
+            "if outcome == 'PASS':\n"
+            "    child = module.SyntheticChild(root, point)\n"
+            "    zero = struct.pack('<f', 0.0)\n"
+            "    uniform = struct.pack('<f', 1.0 / point.dim)\n"
+            "    (root / 'inputs' / 'a.bin').write_bytes(zero * (point.rows * point.dim))\n"
+            "    (root / 'inputs' / 'b.bin').write_bytes(zero * (point.dim * point.dim))\n"
+            "    (root / 'inputs' / f'softmax_logits_{point.rows}x{point.dim}.bin').write_bytes(zero * (point.rows * point.dim))\n"
+            "    (root / 'outputs' / f'{child.run_id}.bin').write_bytes(uniform * (point.rows * point.dim))\n"
+            "else:\n"
+            "    run_id = f'sfu_job_dist_r{rows}_d{dim}_w{workers}_bc{bands}_g1_vn0'\n"
+            "    row = {\n"
+            "        'run_id': run_id, 'rows': rows, 'dim': dim, 'chunk_elems': 256,\n"
+            "        'worker_cores': workers, 'band_cores': bands, 'cooperative_groups': 1,\n"
+            "        'reduction_vn': 0, 'num_vns': 3, 'dma_response_vn': 0,\n"
+            "        'staging_rows': 4, 'job_rows': 4, 'retry_ticks': 1024,\n"
+            "        'max_retries': 8, 'status': outcome,\n"
+            "        'exit_code': 124 if outcome == 'TIMEOUT' else 9,\n"
+            "        'timeout_sec': point.timeout_sec, 'artifact_validation': 'NOT_RUN',\n"
+            "    }\n"
+            "    module.SyntheticChild.write_csv(root / 'sweep_manifest.csv', module.SyntheticChild.MANIFEST_FIELDS, [row])\n",
+            encoding="utf-8",
+        )
+        fake_bin = self.base / f"fake-child-{outcome.lower()}"
+        fake_bin.mkdir(exist_ok=True)
+        fake = fake_bin / "bash"
+        exit_code = {"PASS": 0, "TIMEOUT": 124, "FAIL": 9}[outcome]
+        fake.write_text(
+            "#!/bin/sh\n"
+            "printf '%s|%s\\n' \"${GOLEM_SFU_DISTRIBUTED_POINT_LIST}\" \"${GOLEM_SWEEP_ROOT}\" >> \"${FAKE_CHILD_LOG}\"\n"
+            f"FAKE_CHILD_OUTCOME={outcome} {sys.executable} {helper}\n"
+            "helper_rc=$?\n"
+            "[ \"${helper_rc}\" -eq 0 ] || exit \"${helper_rc}\"\n"
+            f"exit {exit_code}\n",
+            encoding="utf-8",
+        )
+        fake.chmod(0o755)
+        return fake_bin
+
     def test_stop_on_fail_and_stage_c_always_stop_without_downgrade(self):
         cases = (
             ("A", "16:512:16:16 16:1024:16:16", "1"),
@@ -570,7 +622,7 @@ class Phase4FParentRunnerTest(unittest.TestCase):
                 self.assertIn("1200GB/s", status)
                 self.assertIn("1024,8", status)
 
-    def test_resume_revalidates_complete_child_artifact_and_rejects_corruption(self):
+    def test_dryrun_to_real_pass_uses_new_attempt_and_cached_pass_revalidates_it(self):
         spec = phase4f.DEFAULT_POINTS[0]
         root = self.base / "resume"
         env = self.env(
@@ -585,49 +637,87 @@ class Phase4FParentRunnerTest(unittest.TestCase):
         self.assertIn("schema=phase4f-parent-v1", marker_text)
         self.assertIn("child_runner_sha256=", marker_text)
         self.assertIn("pipeline_args_sha256=", marker_text)
+        attempt1 = self.child_root(root, spec, 1)
+        self.assertIn(f"child_root={attempt1}", marker_text)
+        with (attempt1 / "sweep_manifest.csv").open(newline="", encoding="utf-8") as handle:
+            self.assertEqual([row["status"] for row in csv.DictReader(handle)], ["DRYRUN"])
 
-        child = SyntheticChild(self.child_root(root, spec), spec)
-        zero = struct.pack("<f", 0.0)
-        uniform = struct.pack("<f", 1.0 / spec.dim)
-        (child.root / "inputs" / "a.bin").write_bytes(zero * (spec.rows * spec.dim))
-        (child.root / "inputs" / "b.bin").write_bytes(zero * (spec.dim * spec.dim))
-        (child.root / "inputs" / f"softmax_logits_{spec.rows}x{spec.dim}.bin").write_bytes(
-            zero * (spec.rows * spec.dim)
+        child_log = self.base / "resume-child.log"
+        real_env = dict(
+            env,
+            GOLEM_PHASE4F_LARGE_SCALE_DRY_RUN="0",
+            FAKE_CHILD_LOG=str(child_log),
         )
-        output = child.root / "outputs" / f"{child.run_id}.bin"
-        output.write_bytes(
-            uniform * (spec.rows * spec.dim)
-        )
-        output_sha = hashlib.sha256(output.read_bytes()).hexdigest()
-        marker.write_text(
-            marker_text.replace("state=DRYRUN", "state=PASS").replace(
-                "output_sha256=\n",
-                f"output_sha256={output_sha}\n",
-            ),
-            encoding="utf-8",
-        )
-        real_env = dict(env, GOLEM_PHASE4F_LARGE_SCALE_DRY_RUN="0")
-        cached = self.run_parent(root, real_env)
-        self.assertEqual(cached.returncode, 0, cached.stderr)
-        self.assertIn("validated cached PASS", cached.stdout)
+        real_env["PATH"] = f"{self._fake_child_bash('PASS')}:{real_env['PATH']}"
+        passed = self.run_parent(root, real_env)
+        self.assertEqual(passed.returncode, 0, passed.stderr)
+        attempt2 = self.child_root(root, spec, 2)
+        self.assertTrue(attempt1.is_dir())
+        self.assertTrue(attempt2.is_dir())
+        self.assertIn(f"child_root={attempt2}", marker.read_text(encoding="utf-8"))
+        self.assertEqual(child_log.read_text(encoding="utf-8").splitlines(), [f"16:512:16:16|{attempt2}"])
         records = phase4f.load_parent_manifest(root / "large_scale_manifest.csv")
         self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].child_root, str(attempt2))
+
+        cached_env = dict(env, GOLEM_PHASE4F_LARGE_SCALE_DRY_RUN="0")
+        cached = self.run_parent(root, cached_env)
+        self.assertEqual(cached.returncode, 0, cached.stderr)
+        self.assertIn("validated cached PASS", cached.stdout)
+        self.assertEqual(child_log.read_text(encoding="utf-8").splitlines(), [f"16:512:16:16|{attempt2}"])
 
         valid_marker = marker.read_text(encoding="utf-8")
+        manifest = root / "large_scale_manifest.csv"
+        with manifest.open(newline="", encoding="utf-8") as handle:
+            rows = list(csv.DictReader(handle))
+        rows[0]["wall_time_sec"] = "999.0"
+        SyntheticChild.write_csv(manifest, phase4f.PARENT_MANIFEST_FIELDS, rows)
+        manifest_before = manifest.read_bytes()
         marker.write_text(
             re.sub(r"output_sha256=[0-9a-f]{64}", f"output_sha256={'0' * 64}", valid_marker),
             encoding="utf-8",
         )
-        hash_drift = self.run_parent(root, real_env)
+        hash_drift = self.run_parent(root, cached_env)
         self.assertEqual(hash_drift.returncode, 3, hash_drift.stderr)
         self.assertIn("hash drift", hash_drift.stderr)
+        self.assertEqual(manifest.read_bytes(), manifest_before)
         marker.write_text(valid_marker, encoding="utf-8")
 
+        child = SyntheticChild(attempt2, spec)
+        output = attempt2 / "outputs" / f"{child.run_id}.bin"
         output.write_bytes(b"bad")
-        rejected = self.run_parent(root, real_env)
+        rejected = self.run_parent(root, cached_env)
         self.assertNotEqual(rejected.returncode, 0)
-        self.assertIn(str(child.root), rejected.stderr)
+        self.assertIn(str(attempt2), rejected.stderr)
         self.assertNotIn("validated cached PASS", rejected.stdout)
+
+    def test_timeout_and_fail_recovery_allocate_fresh_attempts(self):
+        spec = phase4f.DEFAULT_POINTS[0]
+        for outcome in ("TIMEOUT", "FAIL"):
+            with self.subTest(outcome=outcome):
+                root = self.base / f"recover-{outcome.lower()}"
+                child_log = self.base / f"recover-{outcome.lower()}.log"
+                env = self.env(
+                    root,
+                    GOLEM_PHASE4F_LARGE_SCALE_DRY_RUN="0",
+                    GOLEM_PHASE4F_LARGE_SCALE_POINT_LIST="16:512:16:16",
+                    FAKE_CHILD_LOG=child_log,
+                )
+                env["PATH"] = f"{self._fake_child_bash(outcome)}:{env['PATH']}"
+                failed = self.run_parent(root, env)
+                self.assertEqual(failed.returncode, 124 if outcome == "TIMEOUT" else 9)
+                attempt1 = self.child_root(root, spec, 1)
+                with (attempt1 / "sweep_manifest.csv").open(newline="", encoding="utf-8") as handle:
+                    self.assertEqual([row["status"] for row in csv.DictReader(handle)], [outcome])
+
+                pass_env = dict(env)
+                pass_env["PATH"] = f"{self._fake_child_bash('PASS')}:{os.environ['PATH']}"
+                passed = self.run_parent(root, pass_env)
+                self.assertEqual(passed.returncode, 0, passed.stderr)
+                attempt2 = self.child_root(root, spec, 2)
+                self.assertTrue(attempt1.is_dir())
+                self.assertTrue(attempt2.is_dir())
+                self.assertIn(f"child_root={attempt2}", self.marker(root, spec).read_text(encoding="utf-8"))
 
     def test_damaged_marker_and_signature_hash_drift_fail_closed(self):
         spec = phase4f.DEFAULT_POINTS[0]
@@ -648,6 +738,27 @@ class Phase4FParentRunnerTest(unittest.TestCase):
             result = self.run_parent(root, env)
             self.assertEqual(result.returncode, 2, result.stderr)
             self.assertIn("marker", result.stderr)
+
+        root = self.base / "marker-child-root"
+        env = self.env(
+            root,
+            GOLEM_PHASE4F_LARGE_SCALE_POINT_LIST="16:512:16:16",
+        )
+        first = self.run_parent(root, env)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        marker = self.marker(root, spec)
+        marker.write_text(
+            re.sub(
+                r"^child_root=.*$",
+                f"child_root={root / 'outside' / 'attempt-0001'}",
+                marker.read_text(encoding="utf-8"),
+                flags=re.MULTILINE,
+            ),
+            encoding="utf-8",
+        )
+        rejected = self.run_parent(root, env)
+        self.assertEqual(rejected.returncode, 2, rejected.stderr)
+        self.assertIn("marker", rejected.stderr)
 
 
 class Phase4FArtifactParserTest(unittest.TestCase):

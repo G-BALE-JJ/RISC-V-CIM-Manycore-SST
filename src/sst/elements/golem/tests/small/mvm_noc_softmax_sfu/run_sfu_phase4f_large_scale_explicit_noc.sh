@@ -180,7 +180,8 @@ write_marker() {
 	local signature="$3"
 	local signature_sha="$4"
 	local pipeline_sha="$5"
-	local output_sha="${6:-}"
+	local child_root="$6"
+	local output_sha="${7:-}"
 	local temp="${marker}.tmp.$$"
 	{
 		printf 'schema=%s\n' "$SCHEMA"
@@ -189,6 +190,7 @@ write_marker() {
 		printf 'signature=%s\n' "$signature"
 		printf 'child_runner_sha256=%s\n' "$CHILD_RUNNER_SHA"
 		printf 'pipeline_args_sha256=%s\n' "$pipeline_sha"
+		printf 'child_root=%s\n' "$child_root"
 		printf 'output_sha256=%s\n' "$output_sha"
 	} > "$temp"
 	mv "$temp" "$marker"
@@ -199,17 +201,25 @@ validate_marker() {
 	local signature="$2"
 	local signature_sha="$3"
 	local pipeline_sha="$4"
+	local attempt_base="$5"
 	local key value
 	[[ -f "$marker" ]] || return 1
-	for key in schema state signature_sha256 signature child_runner_sha256 pipeline_args_sha256 output_sha256; do
+	for key in schema state signature_sha256 signature child_runner_sha256 pipeline_args_sha256 child_root output_sha256; do
 		value="$(marker_value "$marker" "$key")" || return 1
 	done
-	[[ "$(wc -l < "$marker")" -eq 7 ]] || return 1
+	[[ "$(wc -l < "$marker")" -eq 8 ]] || return 1
 	[[ "$(marker_value "$marker" schema)" == "$SCHEMA" ]] || return 1
 	[[ "$(marker_value "$marker" signature)" == "$signature" ]] || return 1
 	[[ "$(marker_value "$marker" signature_sha256)" == "$signature_sha" ]] || return 1
 	[[ "$(marker_value "$marker" child_runner_sha256)" == "$CHILD_RUNNER_SHA" ]] || return 1
 	[[ "$(marker_value "$marker" pipeline_args_sha256)" == "$pipeline_sha" ]] || return 1
+	local marker_child_root marker_child_parent marker_child_name
+	marker_child_root="$(marker_value "$marker" child_root)"
+	marker_child_parent="$(dirname "$marker_child_root")"
+	marker_child_name="$(basename "$marker_child_root")"
+	[[ "$marker_child_parent" == "$attempt_base" ]] || return 1
+	[[ "$marker_child_name" =~ ^attempt-[0-9]{4,}$ ]] || return 1
+	[[ -d "$marker_child_root" && ! -L "$marker_child_root" ]] || return 1
 	case "$(marker_value "$marker" state)" in
 		DRYRUN|FAIL|TIMEOUT|ARTIFACT_FAIL) ;;
 		PASS)
@@ -217,6 +227,20 @@ validate_marker() {
 			;;
 		*) return 1 ;;
 	esac
+}
+
+next_attempt_root() {
+	local attempt_base="$1"
+	local index=1 candidate
+	mkdir -p "$attempt_base"
+	while :; do
+		printf -v candidate '%s/attempt-%04d' "$attempt_base" "$index"
+		if [[ ! -e "$candidate" ]]; then
+			printf '%s' "$candidate"
+			return 0
+		fi
+		index=$((index + 1))
+	done
 }
 
 record_status() {
@@ -244,7 +268,7 @@ overall_rc=0
 for point_data in "${points[@]}"; do
 	IFS=: read -r stage rows dim workers bands mem_node_size timeout_sec <<< "$point_data"
 	identity="stage_${stage}_r${rows}_d${dim}_w${workers}_b${bands}"
-	child_root="$ROOT/children/$identity"
+	attempt_base="$ROOT/children/$identity"
 	marker="$ROOT/completed/${identity}.marker"
 	pipeline_args="--noc-in-buf 512KB --noc-out-buf 512KB --noc-link-bw 1200GB/s --noc-xbar-bw 1200GB/s --noc-flit-size 128B --gm-buf 1024KB --mem-node-size $mem_node_size"
 	pipeline_sha="$({ printf '%s\0' "$pipeline_args"; } | sha256sum | awk '{print $1}')"
@@ -252,25 +276,42 @@ for point_data in "${points[@]}"; do
 	signature_sha="$({ printf '%s' "$signature"; } | sha256sum | awk '{print $1}')"
 
 	if [[ -f "$marker" ]]; then
-		if ! validate_marker "$marker" "$signature" "$signature_sha" "$pipeline_sha"; then
-			error "invalid or drifted marker for point=$rows:$dim:$workers:$bands marker=$marker child_root=$child_root"
+		if ! validate_marker "$marker" "$signature" "$signature_sha" "$pipeline_sha" "$attempt_base"; then
+			error "invalid or drifted marker for point=$rows:$dim:$workers:$bands marker=$marker attempt_base=$attempt_base"
 			exit 2
 		fi
 		marker_state="$(marker_value "$marker" state)"
+		marker_child_root="$(marker_value "$marker" child_root)"
 		if [[ "$marker_state" == PASS ]]; then
-			if collect_output="$(collect_point "$stage" "$rows" "$dim" "$workers" "$bands" "$child_root" 2>&1)"; then
+			run_id="sfu_job_dist_r${rows}_d${dim}_w${workers}_bc${bands}_g1_vn0"
+			cached_output="$marker_child_root/outputs/${run_id}.bin"
+			if [[ ! -f "$cached_output" ]]; then
+				error "cached output hash drift point=$rows:$dim:$workers:$bands child_root=$marker_child_root missing=$cached_output"
+				exit 3
+			fi
+			actual_output_sha="$(sha256sum "$cached_output" | awk '{print $1}')"
+			if [[ "$actual_output_sha" != "$(marker_value "$marker" output_sha256)" ]]; then
+				error "cached output hash drift point=$rows:$dim:$workers:$bands child_root=$marker_child_root marker=$marker"
+				exit 3
+			fi
+			if collect_output="$(collect_point "$stage" "$rows" "$dim" "$workers" "$bands" "$marker_child_root" 2>&1)"; then
 				collect_sha="${collect_output##*output_sha256=}"
-				if [[ "$collect_sha" != "$(marker_value "$marker" output_sha256)" ]]; then
-					error "cached output hash drift point=$rows:$dim:$workers:$bands child_root=$child_root marker=$marker"
+				if [[ "$collect_sha" != "$actual_output_sha" ]]; then
+					error "collector output hash drift point=$rows:$dim:$workers:$bands child_root=$marker_child_root marker=$marker"
 					exit 3
 				fi
-				echo "[PHASE4F] validated cached PASS point=$rows:$dim:$workers:$bands child_root=$child_root $collect_output"
-				record_status "$stage" "$rows" "$dim" "$workers" "$bands" PASS 0 "$mem_node_size" "$timeout_sec" "$child_root"
+				echo "[PHASE4F] validated cached PASS point=$rows:$dim:$workers:$bands child_root=$marker_child_root $collect_output"
+				record_status "$stage" "$rows" "$dim" "$workers" "$bands" PASS 0 "$mem_node_size" "$timeout_sec" "$marker_child_root"
 				continue
 			fi
-			error "cached artifact validation failed point=$rows:$dim:$workers:$bands child_root=$child_root: $collect_output"
+			error "cached artifact validation failed point=$rows:$dim:$workers:$bands child_root=$marker_child_root: $collect_output"
 			exit 3
 		fi
+	fi
+	child_root="$(next_attempt_root "$attempt_base")"
+	if ! mkdir "$child_root"; then
+		error "failed to allocate fresh attempt root point=$rows:$dim:$workers:$bands child_root=$child_root"
+		exit 2
 	fi
 
 	if [[ "$DRY_RUN" == 1 ]]; then
@@ -314,7 +355,7 @@ for point_data in "${points[@]}"; do
 		fi
 	fi
 
-	write_marker "$marker" "$status" "$signature" "$signature_sha" "$pipeline_sha" "$output_sha"
+	write_marker "$marker" "$status" "$signature" "$signature_sha" "$pipeline_sha" "$child_root" "$output_sha"
 	record_status "$stage" "$rows" "$dim" "$workers" "$bands" "$status" "$exit_code" "$mem_node_size" "$timeout_sec" "$child_root"
 	if [[ "$status" != PASS && "$status" != DRYRUN ]]; then
 		error "point=$rows:$dim:$workers:$bands stage=$stage status=$status exit_code=$exit_code child_root=$child_root"
