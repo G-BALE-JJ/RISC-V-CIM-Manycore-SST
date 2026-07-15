@@ -1585,7 +1585,7 @@ class Phase4FReportTest(unittest.TestCase):
                 ), mock.patch.object(
                     phase4f, "_publish_replace",
                     side_effect=self.fail_nth_replace(call_number),
-                ), self.assertRaises(OSError):
+                ), self.assertRaises(RuntimeError):
                     phase4f._report(self.root, output, self.root / "verifier.py")
                 self.assertEqual(
                     {name: (output / name).read_bytes() for name in names}, before
@@ -1598,7 +1598,7 @@ class Phase4FReportTest(unittest.TestCase):
             phase4f, "render_figure", side_effect=fake_render
         ), mock.patch.object(
             phase4f, "_publish_replace", side_effect=self.fail_nth_replace(2)
-        ), self.assertRaises(OSError):
+        ), self.assertRaises(RuntimeError):
             phase4f._report(self.root, output, self.root / "verifier.py")
         self.assertFalse(output.exists())
 
@@ -1613,7 +1613,7 @@ class Phase4FReportTest(unittest.TestCase):
             with self.subTest(existing=True, call_number=call_number), mock.patch.object(
                 phase4f, "_publish_replace",
                 side_effect=self.fail_nth_replace(call_number),
-            ), self.assertRaises(OSError):
+            ), self.assertRaises(RuntimeError):
                 phase4f.render_figure(self.records, prefix)
             self.assertEqual(
                 {
@@ -1626,9 +1626,194 @@ class Phase4FReportTest(unittest.TestCase):
         new_prefix = self.root / "render-first" / "figure"
         with mock.patch.object(
             phase4f, "_publish_replace", side_effect=self.fail_nth_replace(2)
-        ), self.assertRaises(OSError):
+        ), self.assertRaises(RuntimeError):
             phase4f.render_figure(self.records, new_prefix)
         self.assertFalse(new_prefix.parent.exists())
+
+    def transaction_fixture(self, name, *, existing=True):
+        root = self.root / name
+        staging = root / "staging"
+        output = root / "output"
+        staging.mkdir(parents=True)
+        if existing:
+            output.mkdir()
+        pairs = []
+        for index in range(1, 6):
+            staged = staging / f"file-{index}"
+            target = output / f"file-{index}"
+            staged.write_bytes(f"new-{index}".encode())
+            if existing:
+                target.write_bytes(f"old-{index}".encode())
+            pairs.append((staged, target))
+        unrelated = root / "unrelated"
+        unrelated.write_bytes(b"keep-me")
+        return root, staging, output, unrelated, pairs
+
+    @staticmethod
+    def staged_failure_with_restore_failure(restore_failure):
+        publish_count = 0
+        restore_count = 0
+
+        def replace(source, target):
+            nonlocal publish_count, restore_count
+            source = pathlib.Path(source)
+            target = pathlib.Path(target)
+            if source.parent.name == "staging":
+                publish_count += 1
+                if publish_count == 3:
+                    raise OSError("injected publish failure at item 3")
+            elif source.parent.name.startswith(".output.rollback."):
+                restore_count += 1
+                if restore_count == restore_failure:
+                    raise OSError(
+                        f"injected rollback restore failure at item {restore_failure}"
+                    )
+            return os.replace(source, target)
+
+        return replace
+
+    def test_rollback_continues_and_preserves_backup_after_restore_failure(self):
+        for restore_failure in (1, 3):
+            with self.subTest(restore_failure=restore_failure):
+                root, _, output, unrelated, pairs = self.transaction_fixture(
+                    f"restore-failure-{restore_failure}"
+                )
+                with mock.patch.object(
+                    phase4f, "_publish_replace",
+                    side_effect=self.staged_failure_with_restore_failure(
+                        restore_failure
+                    ),
+                ):
+                    with self.assertRaises(RuntimeError) as caught:
+                        phase4f._publish_transaction(pairs)
+                message = str(caught.exception)
+                self.assertIn("publish failure at item 3", message)
+                self.assertIn("rollback restore failure", message)
+                backups = list(root.glob(".output.rollback.*"))
+                self.assertEqual(len(backups), 1)
+                failed_name = f"file-{restore_failure}"
+                self.assertEqual(
+                    (backups[0] / failed_name).read_bytes(),
+                    f"old-{restore_failure}".encode(),
+                )
+                for index in range(1, 6):
+                    target = output / f"file-{index}"
+                    if index == restore_failure:
+                        if index <= 2:
+                            self.assertEqual(target.read_bytes(), f"new-{index}".encode())
+                        else:
+                            self.assertFalse(target.exists())
+                    else:
+                        self.assertEqual(target.read_bytes(), f"old-{index}".encode())
+                self.assertEqual(unrelated.read_bytes(), b"keep-me")
+
+    def test_backup_stage_failure_also_rolls_back_best_effort(self):
+        root, _, output, unrelated, pairs = self.transaction_fixture(
+            "backup-stage-failure"
+        )
+        backup_count = 0
+        restore_count = 0
+
+        def replace(source, target):
+            nonlocal backup_count, restore_count
+            source = pathlib.Path(source)
+            target = pathlib.Path(target)
+            if target.parent.name.startswith(".output.rollback."):
+                backup_count += 1
+                if backup_count == 3:
+                    raise OSError("injected backup failure at item 3")
+            elif source.parent.name.startswith(".output.rollback."):
+                restore_count += 1
+                if restore_count == 1:
+                    raise OSError("injected backup rollback restore failure")
+            return os.replace(source, target)
+
+        with mock.patch.object(phase4f, "_publish_replace", side_effect=replace):
+            with self.assertRaises(RuntimeError) as caught:
+                phase4f._publish_transaction(pairs)
+        self.assertIn("backup failure at item 3", str(caught.exception))
+        self.assertIn("backup rollback restore failure", str(caught.exception))
+        backups = list(root.glob(".output.rollback.*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual((backups[0] / "file-1").read_bytes(), b"old-1")
+        self.assertFalse((output / "file-1").exists())
+        for index in range(2, 6):
+            self.assertEqual(
+                (output / f"file-{index}").read_bytes(), f"old-{index}".encode()
+            )
+        self.assertEqual(unrelated.read_bytes(), b"keep-me")
+
+    def test_first_publish_unlink_failure_continues_and_preserves_locator(self):
+        root, _, output, unrelated, pairs = self.transaction_fixture(
+            "first-unlink-failure", existing=False
+        )
+        publish_count = 0
+        unlink_count = 0
+
+        def replace(source, target):
+            nonlocal publish_count
+            if pathlib.Path(source).parent.name == "staging":
+                publish_count += 1
+                if publish_count == 3:
+                    raise OSError("injected first publish failure")
+            return os.replace(source, target)
+
+        def unlink(path):
+            nonlocal unlink_count
+            unlink_count += 1
+            if unlink_count == 1:
+                raise OSError("injected rollback unlink failure")
+            return pathlib.Path(path).unlink()
+
+        with mock.patch.object(
+            phase4f, "_publish_replace", side_effect=replace
+        ), mock.patch.object(
+            phase4f, "_publish_unlink", side_effect=unlink
+        ):
+            with self.assertRaises(RuntimeError) as caught:
+                phase4f._publish_transaction(pairs)
+        self.assertIn("first publish failure", str(caught.exception))
+        self.assertIn("rollback unlink failure", str(caught.exception))
+        self.assertEqual((output / "file-1").read_bytes(), b"new-1")
+        for index in range(2, 6):
+            self.assertFalse((output / f"file-{index}").exists())
+        self.assertEqual(len(list(root.glob(".output.rollback.*"))), 1)
+        self.assertEqual(unrelated.read_bytes(), b"keep-me")
+
+    def test_target_symlink_is_rejected_before_any_mutation(self):
+        root, staging, output, unrelated, pairs = self.transaction_fixture(
+            "target-symlink"
+        )
+        external = root / "external"
+        external.write_bytes(b"external-old")
+        target = output / "file-3"
+        target.unlink()
+        target.symlink_to(external)
+        before_targets = {
+            path.name: (
+                "symlink", os.readlink(path)
+            ) if path.is_symlink() else ("file", path.read_bytes())
+            for path in output.iterdir()
+        }
+        before_staged = {
+            path.name: path.read_bytes() for path in staging.iterdir()
+        }
+        with self.assertRaisesRegex(ValueError, "symlink"):
+            phase4f._publish_transaction(pairs)
+        after_targets = {
+            path.name: (
+                "symlink", os.readlink(path)
+            ) if path.is_symlink() else ("file", path.read_bytes())
+            for path in output.iterdir()
+        }
+        self.assertEqual(after_targets, before_targets)
+        self.assertEqual(
+            {path.name: path.read_bytes() for path in staging.iterdir()},
+            before_staged,
+        )
+        self.assertEqual(external.read_bytes(), b"external-old")
+        self.assertEqual(unrelated.read_bytes(), b"keep-me")
+        self.assertFalse(list(root.glob(".output.rollback.*")))
 
 
 if __name__ == "__main__":

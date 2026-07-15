@@ -1014,6 +1014,27 @@ def _plot_series(axis, x, y, *, marker="o", color="#176B87", label=None):
 
 
 _publish_replace = os.replace
+_publish_unlink = pathlib.Path.unlink
+
+
+class PublicationError(RuntimeError):
+    pass
+
+
+def _raise_publication_error(
+    phase: str,
+    original: Exception,
+    rollback_errors: list[str],
+    backup_dir: pathlib.Path | None,
+) -> None:
+    detail = f"{phase} failed: {type(original).__name__}: {original}"
+    if rollback_errors:
+        detail += "; rollback errors: " + " | ".join(rollback_errors)
+    else:
+        detail += "; rollback completed"
+    if backup_dir is not None:
+        detail += f"; recovery backup preserved at {backup_dir}"
+    raise PublicationError(detail) from original
 
 
 def _publish_transaction(files: list[tuple[pathlib.Path, pathlib.Path]]) -> None:
@@ -1023,37 +1044,88 @@ def _publish_transaction(files: list[tuple[pathlib.Path, pathlib.Path]]) -> None
     if len(target_dirs) != 1:
         raise ValueError("transactional publication requires one target directory")
     target_dir = next(iter(target_dirs))
+    if target_dir.is_symlink():
+        raise ValueError(f"publication target directory is a symlink: {target_dir}")
     target_dir_existed = target_dir.is_dir()
     if target_dir.exists() and not target_dir_existed:
         raise ValueError(f"publication target is not a directory: {target_dir}")
+    seen_staged = set()
+    seen_targets = set()
+    existed = {}
+    for staged, target in files:
+        if staged in seen_staged or target in seen_targets:
+            raise ValueError("transactional publication paths must be unique")
+        seen_staged.add(staged)
+        seen_targets.add(target)
+        if staged.is_symlink() or not staged.is_file():
+            raise ValueError(f"publication source is symlink or non-regular: {staged}")
+        if target.is_symlink():
+            raise ValueError(f"publication target is a symlink: {target}")
+        existed[target] = target.exists()
+        if existed[target] and not target.is_file():
+            raise ValueError(f"publication target is not a regular file: {target}")
+
     target_dir.parent.mkdir(parents=True, exist_ok=True)
     target_dir.mkdir(exist_ok=True)
-    with tempfile.TemporaryDirectory(
+    backup_dir = pathlib.Path(tempfile.mkdtemp(
         dir=target_dir.parent, prefix=f".{target_dir.name}.rollback."
-    ) as backup_name:
-        backup_dir = pathlib.Path(backup_name)
-        existed = {}
+    ))
+    backups: dict[pathlib.Path, pathlib.Path] = {}
+    try:
         for _, target in files:
-            existed[target] = target.is_file()
-            if target.exists() and not existed[target]:
-                raise ValueError(f"publication target is not a regular file: {target}")
             if existed[target]:
-                shutil.copy2(target, backup_dir / target.name)
-        try:
-            for staged, target in files:
-                _publish_replace(staged, target)
-        except BaseException:
-            for _, target in files:
-                if existed[target]:
-                    shutil.copy2(backup_dir / target.name, target)
-                else:
-                    target.unlink(missing_ok=True)
-            if not target_dir_existed:
+                backup = backup_dir / target.name
+                _publish_replace(target, backup)
+                backups[target] = backup
+    except Exception as original:
+        rollback_errors = []
+        for target, backup in backups.items():
+            try:
+                _publish_replace(backup, target)
+            except Exception as rollback_error:
+                rollback_errors.append(
+                    f"restore {target}: {type(rollback_error).__name__}: {rollback_error}"
+                )
+        preserved = backup_dir if rollback_errors else None
+        if preserved is None:
+            backup_dir.rmdir()
+        _raise_publication_error("backup", original, rollback_errors, preserved)
+
+    published = set()
+    try:
+        for staged, target in files:
+            _publish_replace(staged, target)
+            published.add(target)
+    except Exception as original:
+        rollback_errors = []
+        for _, target in files:
+            backup = backups.get(target)
+            if backup is not None:
                 try:
-                    target_dir.rmdir()
-                except OSError:
-                    pass
-            raise
+                    _publish_replace(backup, target)
+                except Exception as rollback_error:
+                    rollback_errors.append(
+                        f"restore {target}: {type(rollback_error).__name__}: "
+                        f"{rollback_error}"
+                    )
+            elif target in published:
+                try:
+                    _publish_unlink(target)
+                except Exception as rollback_error:
+                    rollback_errors.append(
+                        f"unlink {target}: {type(rollback_error).__name__}: "
+                        f"{rollback_error}"
+                    )
+        if rollback_errors:
+            preserved = backup_dir
+        else:
+            backup_dir.rmdir()
+            preserved = None
+            if not target_dir_existed:
+                target_dir.rmdir()
+        _raise_publication_error("publish", original, rollback_errors, preserved)
+
+    shutil.rmtree(backup_dir)
 
 
 def render_figure(records: list[PointRecord], output_prefix: pathlib.Path) -> None:
