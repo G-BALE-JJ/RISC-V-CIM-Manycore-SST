@@ -30,11 +30,13 @@
 
 ~~~bash
 TMPDIR=/data4/jjgong/.tmp \
+GOLEM_ARTIFACT_ROOT=/data4/jjgong/RISC-V-CIM-Manycore-SST/src/sst/elements/golem/tests/artifacts/sweeps/sfu_multi_vn_baseline_20260715 \
 env -u GOLEM_SFU_ENABLE -u GOLEM_SFU_STANDALONE_SOFTMAX \
   -u GOLEM_SFU_JOB_SOFTMAX -u GOLEM_SFU_PRIMITIVE_SOFTMAX \
   -u GOLEM_SFU_REDUCTION_VN -u GOLEM_DMA_RESPONSE_VN \
   -u GOLEM_ARCH_SCRIPT -u GOLEM_GROUP_MANAGER_ENABLE \
   -u GOLEM_CTRL_LINK_ENABLE -u GOLEM_WORKER_COMMAND_PROCESSOR_ENABLE \
+  -u GOLEM_WCP_PREFETCH_WINDOWS -u GOLEM_WCP_RESIDENT_K_TILES \
   bash src/sst/elements/golem/tests/run_noc_dma_pipeline.sh \
   --gemm-m 64 --gemm-n 64 --gemm-k 64 \
   --gemm-block-m 64 --gemm-block-n 64 --gemm-block-k 64 \
@@ -65,10 +67,22 @@ git commit -m "Record pre-change multi-VN baselines"
 
 **Interface:** absent golem_dma_response_vn derives num_vns >= 2 ? 1 : 0; explicit value is used; value >= num_vns is fatal.
 
-- [ ] Add failing tests requiring the ELI parameter, explicit Params lookup, default derivation, range check, and trace diagnostic.
+- [ ] Add failing tests requiring the ELI parameter, explicit Params lookup with a
+  found/not-found distinction, default derivation, range check, and trace diagnostic.
 - [ ] Run the new test and confirm RED.
 - [ ] Add the ELI parameter and implement the minimal Params lookup/range check in MemNICBase::build. Keep ordinary MemNIC response behavior unchanged.
 - [ ] Run the focused test and git diff --check; expect PASS.
+- [ ] Run a minimal real SST initialization with num_vns=3 and
+  GOLEM_DMA_RESPONSE_VN=3; expect MemNIC initialization fatal before guest execution:
+
+~~~bash
+TMPDIR=/data4/jjgong/.tmp GOLEM_DMA_RESPONSE_VN=3 \
+GOLEM_ARCH_SCRIPT=architecture/archive/ncores_selfcom_dma.py \
+bash src/sst/elements/golem/tests/run_noc_dma_pipeline.sh \
+  --gemm-m 64 --gemm-n 64 --gemm-k 64 \
+  --gemm-block-m 64 --gemm-block-n 64 --gemm-block-k 64 \
+  --dtype fp32 --tensor-source sample
+~~~
 - [ ] Commit only memNICBase.h and its focused test.
 
 ### Task 3: Preserve Archive Legacy VN and Restore Softmax to Three VNs
@@ -159,8 +173,19 @@ GOLEM_SFU_DISTRIBUTED_POINT_LIST='16:512:4:4' GOLEM_STOP_ON_FAIL=1 \
 GOLEM_SWEEP_ROOT=/data4/jjgong/RISC-V-CIM-Manycore-SST/src/sst/elements/golem/tests/artifacts/sweeps/sfu_multi_vn_vn0_20260715 \
 bash src/sst/elements/golem/tests/small/mvm_noc_softmax_sfu/run_sfu_unified_job_distributed_scaling.sh
 ~~~
-- [ ] Repeat the exact command for VN1 and VN2, changing only VN and root. Do not run them concurrently.
-- [ ] Require each point: golden 8192/0; each request/response counter 64; transport receive 256; DMA issue/completion 64; zero retries/exhaustion; resolved topology 3/N/0/1.
+- [ ] Repeat the anchor serially for VN1 and VN2, changing only VN and root; do not run them concurrently:
+
+~~~bash
+for vn in 1 2; do
+  root=/data4/jjgong/RISC-V-CIM-Manycore-SST/src/sst/elements/golem/tests/artifacts/sweeps/sfu_multi_vn_vn${vn}_20260715
+  TMPDIR=/data4/jjgong/.tmp GOLEM_SFU_VN_SWEEP=1 GOLEM_SFU_REDUCTION_VN=$vn \
+    GOLEM_SFU_DISTRIBUTED_REDUCTION_TRANSPORT=explicit_noc \
+    GOLEM_SFU_DISTRIBUTED_POINT_LIST='16:512:4:4' GOLEM_STOP_ON_FAIL=1 \
+    GOLEM_SWEEP_ROOT=$root \
+    bash src/sst/elements/golem/tests/small/mvm_noc_softmax_sfu/run_sfu_unified_job_distributed_scaling.sh || exit $?
+done
+~~~
+- [ ] Require each point: golden 8192/0; each request/response counter 64; transport receive 256; DMA issue/completion 64; zero retries/exhaustion; resolved topology `num_vns=3,reduction_vn=<requested VN>,dma_response_vn=0,globalmemory_response_vn=1`.
 - [ ] Record input/HBM SHA-256, guest SHA-256, library SHA-256, simulated time, transport latency, inbox high-water, queued-send totals, and runtime mapping evidence.
 - [ ] Re-enter each root through cache validation; expect skip validated PASS and no SST process.
 
@@ -171,7 +196,21 @@ bash src/sst/elements/golem/tests/small/mvm_noc_softmax_sfu/run_sfu_unified_job_
 `src/sst/elements/golem/tests/artifacts/sweeps/sfu_multi_vn_gemm_regression_20260715/`.
 
 - [ ] Re-run the clean default ctrl-link GEMM from Task 1. Require VERIFY-C PASS, simulation completion, unchanged DMA lifecycle, and zero reduction activity.
-- [ ] Run an explicit archive/no-ctrl GEMM smoke with GOLEM_DMA_RESPONSE_VN unset. Require legacy response VN1, successful verification, complete DMA lifecycle, and zero retries. Label it archive compatibility, not default GEMM.
+- [ ] Run an explicit archive/no-ctrl GEMM smoke with GOLEM_DMA_RESPONSE_VN unset. Require legacy response VN1, successful verification, complete DMA lifecycle, and zero retries. Label it archive compatibility, not default GEMM:
+
+~~~bash
+TMPDIR=/data4/jjgong/.tmp \
+GOLEM_ARTIFACT_ROOT=/data4/jjgong/RISC-V-CIM-Manycore-SST/src/sst/elements/golem/tests/artifacts/sweeps/sfu_multi_vn_archive_gemm_20260715 \
+GOLEM_ARCH_SCRIPT=architecture/archive/ncores_selfcom_dma.py \
+GOLEM_GM_VERBOSE=2 GOLEM_DMA_TRACE=1 \
+env -u GOLEM_SFU_ENABLE -u GOLEM_SFU_STANDALONE_SOFTMAX \
+  -u GOLEM_SFU_JOB_SOFTMAX -u GOLEM_SFU_PRIMITIVE_SOFTMAX \
+  -u GOLEM_SFU_REDUCTION_VN -u GOLEM_DMA_RESPONSE_VN \
+  bash src/sst/elements/golem/tests/run_noc_dma_pipeline.sh \
+  --gemm-m 64 --gemm-n 64 --gemm-k 64 \
+  --gemm-block-m 64 --gemm-block-n 64 --gemm-block-k 64 \
+  --dtype fp32 --tensor-source sample --verify-c
+~~~
 - [ ] Compare correctness, DMA counts/bytes/retries, simulated time, guest hash, and library identities against Task 1. Any nonzero reduction event blocks completion.
 - [ ] Record both regression outcomes.
 
