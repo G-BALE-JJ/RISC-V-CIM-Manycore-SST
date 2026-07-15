@@ -1,8 +1,12 @@
 import dataclasses
 import csv
+import fcntl
+import hashlib
 import importlib.util
+import os
 import pathlib
 import re
+import struct
 import subprocess
 import sys
 import tempfile
@@ -10,6 +14,9 @@ import unittest
 
 
 SCRIPT = pathlib.Path(__file__).with_name("plot_sfu_phase4f_large_scale.py")
+RUNNER = pathlib.Path(__file__).with_name(
+    "run_sfu_phase4f_large_scale_explicit_noc.sh"
+)
 SPEC = importlib.util.spec_from_file_location("phase4f_large_scale", SCRIPT)
 phase4f = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
@@ -372,6 +379,275 @@ class SyntheticChild:
             ["metric", value_field],
             [{"metric": metric, value_field: value} for metric, value in values.items()],
         )
+
+
+class Phase4FParentRunnerTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.base = pathlib.Path(self.temp.name)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def env(self, root, **updates):
+        env = {
+            key: value for key, value in os.environ.items()
+            if not key.startswith("GOLEM_")
+        }
+        env.update({
+            "GOLEM_PHASE4F_LARGE_SCALE_ROOT": str(root),
+            "GOLEM_PHASE4F_LARGE_SCALE_DRY_RUN": "1",
+        })
+        env.update({key: str(value) for key, value in updates.items()})
+        return env
+
+    def run_parent(self, root, env=None):
+        return subprocess.run(
+            ["/bin/bash", str(RUNNER)],
+            cwd=RUNNER.parent,
+            env=env or self.env(root),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+    @staticmethod
+    def child_root(root, spec):
+        identity = (
+            f"stage_{spec.stage}_r{spec.rows}_d{spec.dim}_"
+            f"w{spec.worker_cores}_b{spec.band_cores}"
+        )
+        return pathlib.Path(root) / "children" / identity
+
+    @staticmethod
+    def marker(root, spec):
+        identity = (
+            f"stage_{spec.stage}_r{spec.rows}_d{spec.dim}_"
+            f"w{spec.worker_cores}_b{spec.band_cores}"
+        )
+        return pathlib.Path(root) / "completed" / f"{identity}.marker"
+
+    def test_default_dry_run_orchestrates_exact_canonical_matrix(self):
+        root = self.base / "default"
+        result = self.run_parent(root)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = [
+            line for line in result.stdout.splitlines()
+            if line.startswith("[PHASE4F][DRY-RUN] ")
+        ]
+        self.assertEqual(len(lines), 8, result.stdout)
+        for spec, line in zip(phase4f.DEFAULT_POINTS, lines):
+            identity = f"{spec.rows}:{spec.dim}:{spec.worker_cores}:{spec.band_cores}"
+            child_root = self.child_root(root, spec)
+            self.assertIn(f"point={identity}", line)
+            self.assertIn(f"stage={spec.stage}", line)
+            self.assertIn(f"mem_node_size={spec.mem_node_size}", line)
+            self.assertIn(f"timeout_sec={spec.timeout_sec}", line)
+            self.assertIn(f"child_root={child_root}", line)
+            manifest = child_root / "sweep_manifest.csv"
+            self.assertTrue(manifest.is_file(), line)
+            with manifest.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["status"], "DRYRUN")
+            self.assertEqual(rows[0]["timeout_sec"], str(spec.timeout_sec))
+        self.assertEqual(len({line.split(" point=", 1)[1] for line in lines}), 8)
+
+    def test_conflicting_fixed_environment_is_rejected_before_child_artifact(self):
+        conflicts = {
+            "GOLEM_SFU_DISTRIBUTED_REDUCTION_TRANSPORT": "modeled_noc",
+            "GOLEM_SFU_VN_SWEEP": "0",
+            "GOLEM_SFU_REDUCTION_VN": "1",
+            "GOLEM_DMA_RESPONSE_VN": "1",
+            "GOLEM_NOC_LINK_BW": "25GB/s",
+            "GOLEM_NOC_XBAR_BW": "25GB/s",
+            "GOLEM_DIRCTRL_HIGHLINK_BW": "25GB/s",
+            "GOLEM_NOC_INPUT_BUF_SIZE": "8KB",
+            "GOLEM_NOC_OUTPUT_BUF_SIZE": "8KB",
+            "GOLEM_NOC_FLIT_SIZE": "64B",
+            "GOLEM_GM_BUFFER_LENGTH": "512KB",
+            "GOLEM_NOC_INTER_ROUTER_NO_CUT": "1",
+            "GOLEM_NOC_LOCAL_NO_CUT": "1",
+            "GOLEM_SFU_DISTRIBUTED_CHUNK_ELEMS": "128",
+            "GOLEM_SFU_DISTRIBUTED_STAGING_ROWS": "8",
+            "GOLEM_SFU_DISTRIBUTED_JOB_ROWS": "8",
+            "GOLEM_SFU_DISTRIBUTED_RETRY_TICKS": "2048",
+            "GOLEM_SFU_DISTRIBUTED_MAX_RETRIES": "9",
+            "GOLEM_SFU_DISTRIBUTED_PIPELINE_ARGS": "--dry-run",
+        }
+        for index, (name, value) in enumerate(conflicts.items()):
+            with self.subTest(name=name):
+                root = self.base / f"conflict-{index}"
+                result = self.run_parent(root, self.env(root, **{name: value}))
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(name, result.stderr)
+                self.assertFalse((root / "children").exists())
+
+    def test_root_point_schema_and_lock_guards(self):
+        relative = self.run_parent(
+            self.base / "unused",
+            self.env("relative-root"),
+        )
+        self.assertEqual(relative.returncode, 2)
+        self.assertIn("absolute", relative.stderr)
+
+        for index, points in enumerate((
+            "",
+            "16:512:16:16 16:512:16:16",
+            "16:512:16",
+            "16:4096:1:1",
+        )):
+            root = self.base / f"points-{index}"
+            result = self.run_parent(root, self.env(
+                root, GOLEM_PHASE4F_LARGE_SCALE_POINT_LIST=points,
+            ))
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertFalse((root / "children").exists())
+
+        old = self.base / "old-schema"
+        old.mkdir()
+        (old / "parent_schema").write_text("phase4f-parent-v0\n", encoding="utf-8")
+        result = self.run_parent(old)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("schema", result.stderr)
+
+        old_manifest = self.base / "old-manifest"
+        old_manifest.mkdir()
+        (old_manifest / "parent_schema").write_text(
+            "phase4f-parent-v1\n", encoding="utf-8"
+        )
+        (old_manifest / "large_scale_manifest.csv").write_text(
+            "old,header\n1,2\n", encoding="utf-8"
+        )
+        result = self.run_parent(old_manifest)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("manifest schema", result.stderr)
+
+        locked = self.base / "locked"
+        locked.mkdir()
+        lock_path = locked / ".phase4f.lock"
+        with lock_path.open("w", encoding="utf-8") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            result = self.run_parent(locked)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("locked", result.stderr)
+
+    def _fake_bash(self, exit_code):
+        fake_bin = self.base / f"fake-bin-{exit_code}"
+        fake_bin.mkdir(exist_ok=True)
+        fake = fake_bin / "bash"
+        fake.write_text(
+            "#!/bin/sh\n"
+            "printf '%s\\n' \"${GOLEM_SFU_DISTRIBUTED_POINT_LIST}\" >> \"${FAKE_CHILD_LOG}\"\n"
+            f"exit {exit_code}\n",
+            encoding="utf-8",
+        )
+        fake.chmod(0o755)
+        return fake_bin
+
+    def test_stop_on_fail_and_stage_c_always_stop_without_downgrade(self):
+        cases = (
+            ("A", "16:512:16:16 16:1024:16:16", "1"),
+            ("C", "64:4096:16:16 256:4096:16:16", "0"),
+        )
+        for index, (stage, points, stop_on_fail) in enumerate(cases):
+            with self.subTest(stage=stage):
+                root = self.base / f"stop-{index}"
+                child_log = self.base / f"child-{index}.log"
+                env = self.env(
+                    root,
+                    GOLEM_PHASE4F_LARGE_SCALE_DRY_RUN="0",
+                    GOLEM_PHASE4F_LARGE_SCALE_STOP_ON_FAIL=stop_on_fail,
+                    GOLEM_PHASE4F_LARGE_SCALE_POINT_LIST=points,
+                    FAKE_CHILD_LOG=child_log,
+                )
+                env["PATH"] = f"{self._fake_bash(124)}:{env['PATH']}"
+                result = self.run_parent(root, env)
+                self.assertEqual(result.returncode, 124, result.stderr)
+                self.assertEqual(child_log.read_text(encoding="utf-8").splitlines(), [points.split()[0]])
+                status = (root / "point_status.csv").read_text(encoding="utf-8")
+                self.assertIn("TIMEOUT,124", status)
+                self.assertIn("1200GB/s", status)
+                self.assertIn("1024,8", status)
+
+    def test_resume_revalidates_complete_child_artifact_and_rejects_corruption(self):
+        spec = phase4f.DEFAULT_POINTS[0]
+        root = self.base / "resume"
+        env = self.env(
+            root,
+            GOLEM_PHASE4F_LARGE_SCALE_POINT_LIST="16:512:16:16",
+        )
+        dry = self.run_parent(root, env)
+        self.assertEqual(dry.returncode, 0, dry.stderr)
+        marker = self.marker(root, spec)
+        marker_text = marker.read_text(encoding="utf-8")
+        self.assertIn("state=DRYRUN", marker_text)
+        self.assertIn("schema=phase4f-parent-v1", marker_text)
+        self.assertIn("child_runner_sha256=", marker_text)
+        self.assertIn("pipeline_args_sha256=", marker_text)
+
+        child = SyntheticChild(self.child_root(root, spec), spec)
+        zero = struct.pack("<f", 0.0)
+        uniform = struct.pack("<f", 1.0 / spec.dim)
+        (child.root / "inputs" / "a.bin").write_bytes(zero * (spec.rows * spec.dim))
+        (child.root / "inputs" / "b.bin").write_bytes(zero * (spec.dim * spec.dim))
+        (child.root / "inputs" / f"softmax_logits_{spec.rows}x{spec.dim}.bin").write_bytes(
+            zero * (spec.rows * spec.dim)
+        )
+        output = child.root / "outputs" / f"{child.run_id}.bin"
+        output.write_bytes(
+            uniform * (spec.rows * spec.dim)
+        )
+        output_sha = hashlib.sha256(output.read_bytes()).hexdigest()
+        marker.write_text(
+            marker_text.replace("state=DRYRUN", "state=PASS").replace(
+                "output_sha256=\n",
+                f"output_sha256={output_sha}\n",
+            ),
+            encoding="utf-8",
+        )
+        real_env = dict(env, GOLEM_PHASE4F_LARGE_SCALE_DRY_RUN="0")
+        cached = self.run_parent(root, real_env)
+        self.assertEqual(cached.returncode, 0, cached.stderr)
+        self.assertIn("validated cached PASS", cached.stdout)
+        records = phase4f.load_parent_manifest(root / "large_scale_manifest.csv")
+        self.assertEqual(len(records), 1)
+
+        valid_marker = marker.read_text(encoding="utf-8")
+        marker.write_text(
+            re.sub(r"output_sha256=[0-9a-f]{64}", f"output_sha256={'0' * 64}", valid_marker),
+            encoding="utf-8",
+        )
+        hash_drift = self.run_parent(root, real_env)
+        self.assertEqual(hash_drift.returncode, 3, hash_drift.stderr)
+        self.assertIn("hash drift", hash_drift.stderr)
+        marker.write_text(valid_marker, encoding="utf-8")
+
+        output.write_bytes(b"bad")
+        rejected = self.run_parent(root, real_env)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn(str(child.root), rejected.stderr)
+        self.assertNotIn("validated cached PASS", rejected.stdout)
+
+    def test_damaged_marker_and_signature_hash_drift_fail_closed(self):
+        spec = phase4f.DEFAULT_POINTS[0]
+        for index, replacement in enumerate(("garbage\n", None)):
+            root = self.base / f"marker-{index}"
+            env = self.env(
+                root,
+                GOLEM_PHASE4F_LARGE_SCALE_POINT_LIST="16:512:16:16",
+            )
+            first = self.run_parent(root, env)
+            self.assertEqual(first.returncode, 0, first.stderr)
+            marker = self.marker(root, spec)
+            if replacement is None:
+                replacement = marker.read_text(encoding="utf-8").replace(
+                    "noc_link_bw=1200GB/s", "noc_link_bw=25GB/s"
+                )
+            marker.write_text(replacement, encoding="utf-8")
+            result = self.run_parent(root, env)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("marker", result.stderr)
 
 
 class Phase4FArtifactParserTest(unittest.TestCase):
