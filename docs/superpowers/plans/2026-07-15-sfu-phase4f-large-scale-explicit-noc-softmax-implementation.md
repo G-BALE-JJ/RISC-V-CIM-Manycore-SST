@@ -28,6 +28,8 @@ GOLEM_NOC_LOCAL_NO_CUT=0
 
 - softmax 参数固定为 `chunk=256`、`staging_rows=4`、`job_rows=4`、`retry_ticks=1024`、`max_retries=8`。
 - 默认矩阵严格为：`16:512:16:16 16:1024:16:16 16:2048:16:16 16:4096:16:16 16:4096:4:4 16:4096:8:8 64:4096:16:16 256:4096:16:16`。
+- 阶段 B 用于验证 `dim=4096` 下 4/8/16 workers 的加速、并行效率和收益递减，
+  不测试单 worker；只新增 `4/4`、`8/8`，`16/16` 必须复用阶段 A anchor。
 - `dim<=1024` 使用 `134217728` bytes/node；`dim>=2048` 使用 `268435456` bytes/node。
 - timeout 为：`16x512=900s`、`16x1024=1800s`、`16x2048=2400s`、`16x4096=3600s`、`64x4096=7200s`、`256x4096=14400s`。
 - 每个 PASS 点必须通过 full-row golden、SFU worker/band、四类 reduction counter、explicit transport、GlobalMemory lifecycle、DMA lifecycle、output size/hash 和运行时网络配置 gate。
@@ -99,7 +101,7 @@ class PointRecord:
     child_root: str
 ```
 
-- [ ] **步骤 1：写 RED 测试。** 精确断言 9 个 canonical network 值、8 点顺序、唯一 anchor、stage `A/A/A/A/B/B/C/C`、memory 和 timeout 映射；拒绝矩阵外 shape、重复点和非法整数。
+- [ ] **步骤 1：写 RED 测试。** 精确断言 9 个 canonical network 值、8 点顺序、唯一 anchor、stage `A/A/A/A/B/B/C/C`、memory 和 timeout 映射；阶段 B 必须拒绝单 worker，且只执行 `4/4`、`8/8` 两个新增点并复用 `16/16` anchor；拒绝矩阵外 shape、重复点和非法整数。
 - [ ] **步骤 2：运行 RED。**
 
 ```bash
@@ -228,10 +230,10 @@ git commit -m "feat: orchestrate Phase 4F large-scale runs"
 - `render_figure(records: list[PointRecord], output_prefix: pathlib.Path) -> None`
 - `write_qa(records: list[PointRecord], output_path: pathlib.Path) -> None`
 
-- [ ] **步骤 1：写 RED 测试。** 报告必须识别 8 个唯一 outcome；PASS 点检查 time/row、time/element、以 workers=4 为基准的 speedup/efficiency；TIMEOUT/FAIL 点保留在 source CSV 和 QA，但不进入趋势连线。缺失 identity、重复点、PASS 点网络漂移或 lifecycle error 必须失败。
+- [ ] **步骤 1：写 RED 测试。** 报告必须识别 8 个唯一 outcome；PASS 点检查 time/row、time/element，以及 `dim=4096` 下以 workers=4 为基准的 4/8/16 speedup、并行效率和收益递减；不得生成单-worker 数据或结论。TIMEOUT/FAIL 点保留在 source CSV 和 QA，但不进入趋势连线。缺失 identity、重复点、PASS 点网络漂移或 lifecycle error 必须失败。
 - [ ] **步骤 2：写 CSV round-trip 和 export RED 测试。** CSV 逐字段可逆且确定性排序；SVG 保留 text，PDF TrueType，PNG 300 dpi、16:9；重复生成的 source CSV 和 SVG 字节一致。
 - [ ] **步骤 3：实现 CLI。** 必须先重新解析 child evidence，再写 source CSV 和图；任一 gate 失败时不得 export。
-- [ ] **步骤 4：实现英文四面板图。** `figsize=(13.333,7.5)`、`svg.fonttype=none`、`pdf.fonttype=42`；展示 dimension runtime/latency、worker speedup/efficiency、row total/normalized time、NoC pressure 与 correctness/lifecycle，并标注 fixed GEMM network profile。
+- [ ] **步骤 4：实现英文四面板图。** `figsize=(13.333,7.5)`、`svg.fonttype=none`、`pdf.fonttype=42`；展示 dimension runtime/latency、4/8/16-worker speedup/efficiency 与收益递减、row total/normalized time、NoC pressure 与 correctness/lifecycle，并标注 fixed GEMM network profile。图中不得出现单-worker baseline。
 - [ ] **步骤 5：实现 QA Markdown。** 列出 8 点 identity、固定网络、每点状态、golden/transport/DMA gate 和输出 hash；TIMEOUT/FAIL 必须注明停止原因和最后有效 shape。不得出现 modeled-NoC、bandwidth comparison 或 fusion roadmap。
 - [ ] **步骤 6：使用 `/data4/jjgong/.venvs/golem-plot/bin/python` 运行测试并提交。**
 
@@ -271,7 +273,7 @@ git diff --check
 **artifact root：** `src/sst/elements/golem/tests/artifacts/sweeps/sfu_phase4f_large_scale_explicit_noc_20260715`。
 
 - [ ] **步骤 1：Stage A。** point list=`16:512:16:16 16:1024:16:16 16:2048:16:16 16:4096:16:16`。
-- [ ] **步骤 2：Stage B。** 同一 root，point list=`16:4096:4:4 16:4096:8:8`；16-worker anchor 只验证复用。
+- [ ] **步骤 2：阶段 B 并行效率验证。** 同一 root，point list=`16:4096:4:4 16:4096:8:8`；不得加入单-worker 点；`16:4096:16:16` 只验证并复用阶段 A anchor。完成后以 4 workers 为基准计算 4/8/16 speedup 和效率，并记录收益递减。
 - [ ] **步骤 3：Stage C。** 同一 root，point list=`64:4096:16:16 256:4096:16:16`；首个 TIMEOUT/FAIL 后停止，不调整参数。
 - [ ] **步骤 4：每点检查。** manifest PASS、golden=`rows*dim/0`、四类 reduction=`rows*workers`、transport=`4*rows*workers`、DMA retry=0、runtime network 精确匹配。
 - [ ] **步骤 5：重新运行完整默认矩阵验证 resume。** 不得启动新 SST，父 manifest 仍只有 8 个 identity。
@@ -300,6 +302,7 @@ git diff --check
 
 - parent runner、parser/report 和 focused tests 全部通过。
 - 8 个默认 identity 均有明确 PASS/TIMEOUT/FAIL，不存在重复 anchor 或参数静默回退。
+- 阶段 B 只新增 4/8-worker 点并复用 16-worker anchor，报告三点加速、效率和收益递减，不包含单 worker。
 - 每个可用点的运行时网络配置与实际 GEMM 参数完全一致。
 - 每个 PASS 点通过 golden、reduction、explicit transport、DMA、output hash 和 artifact gate。
 - source CSV 可重建英文 16:9 SVG/PDF/PNG，QA 明确列出证据和限制。

@@ -68,7 +68,7 @@ Phase 4F 不修改 SFU 数学、reduction message、GlobalMemory、SimpleNetwork
 
 该阶段在最大 column cooperation 下测量每行列方向工作量增加的影响。
 
-### 阶段 B：大维度下的 worker 扩展
+### 阶段 B：大维度下的并行度收益与效率验证
 
 固定 `rows=16` 和 `dim=4096`：
 
@@ -78,7 +78,14 @@ worker_cores/band_cores = 8/8
 worker_cores/band_cores = 16/16
 ```
 
-`16/16` 点与 Stage A 的 `16x4096` anchor 相同。当 signature 和 artifact 仍然有效时，不得重复执行。
+该阶段不测试单 worker，也不再论证“大维度是否应该使用多 worker”。多 worker
+column cooperation 已经是目标架构；这里要量化的是 4、8、16 workers 之间的实际
+加速、并行效率和收益递减，并确认旧 primitive 路径中观察到的 16-worker 优势在
+unified-job + explicit-NoC reduction 路径下是否仍然成立。
+
+`16/16` 点与阶段 A 的 `16x4096` anchor 相同。当 signature 和 artifact 仍然有效时
+不得重复执行。因此阶段 B 只新增 `4/4` 和 `8/8` 两次真实 SST 运行，再与复用的
+`16/16` anchor 组成三点并行度曲线。
 
 ### 阶段 C：大维度下的行数扩展
 
@@ -201,7 +208,7 @@ dma_timeout_exhausted,dma_write_timeout_retry,output_sha256,child_root
 - transport event 和 queued send；
 - total packet、bit 和 xbar stall；
 - 每行和每元素归一化时间；
-- `dim=4096` 下的 worker scaling speedup 和 efficiency；
+- `dim=4096` 下 4/8/16 workers 的加速、并行效率和收益递减；
 - DMA issue/completion、bytes、retry 和 round-trip 指标。
 
 这些数据是单次确定性 SST 结果，不允许添加误差棒、置信区间或统计显著性结论。
@@ -229,7 +236,7 @@ tests/artifacts/sweeps/sfu_phase4f_large_scale_explicit_noc_20260715/report/
 英文 16:9 结果图包含：
 
 - dimension scaling 的 runtime 和 reduction latency；
-- `dim=4096` 下的 worker scaling speedup/efficiency；
+- `dim=4096` 下 4/8/16 workers 的 speedup/efficiency 和收益递减；
 - row scaling 的 total time 和 normalized time per row；
 - NoC pressure 指标和紧凑的 correctness/lifecycle 区域。
 
@@ -248,6 +255,7 @@ focused tests 必须覆盖：
 
 - 标准 GEMM 网络值及其 preset 来源；
 - 8 点默认矩阵和 duplicate-anchor elimination；
+- 阶段 B 不包含单 worker，只新增 `4/4`、`8/8` 并复用 `16/16` anchor；
 - 按维度解析 memory/timeout；
 - explicit-NoC/VN0-only 环境和 inherited-conflict rejection；
 - signature、manifest、child environment 和 runtime log 中的 network profile；
@@ -273,7 +281,8 @@ synthetic fixture 和 dry-run 用于验证 runner/analyzer 行为。只有 focus
 3. 在 focused TDD 下实现报告生成器。
 4. 执行完整 8 点 dry-run，检查解析后的 signature。
 5. 串行执行 Stage A，在首个无效点停止。
-6. 复用有效 `16x4096` anchor，再串行执行 Stage B。
+6. 复用有效 `16x4096` anchor，再执行阶段 B 的 `4/4` 和 `8/8` 两个新增点，
+   计算三点并行加速与效率。
 7. 再次复用同一 anchor，然后串行执行 Stage C。
 8. 生成并视觉检查确定性报告产物。
 9. 运行完整 softmax focused suite 和 GEMM isolation gate。
@@ -286,6 +295,7 @@ Phase 4F 完成必须满足：
 - 每个可用点均通过 golden、transport、DMA、topology 和 artifact gate；
 - invalid 或 timeout 点被明确报告，且没有改变 network 或 correctness contract；
 - source CSV 和可编辑确定性图表能够重建所有报告数值；
+- 阶段 B 明确报告 4/8/16 workers 的加速、效率和收益递减，不包含单 worker；
 - 主矩阵不包含 modeled-NoC 或 bandwidth sweep；
 - 固定 network 值与标准 GEMM preset 和 runtime log 一致；
 - GEMM 路径未改变；如果不可避免修改 shared 文件，则现有 GEMM 回归重新 PASS。
