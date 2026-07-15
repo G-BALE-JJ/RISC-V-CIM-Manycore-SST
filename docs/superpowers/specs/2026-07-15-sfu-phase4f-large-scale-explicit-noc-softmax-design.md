@@ -1,25 +1,16 @@
-# SFU Phase 4F Large-Scale Explicit-NoC Softmax Design
+# SFU Phase 4F 大规模 Explicit-NoC Softmax 设计
 
-## Purpose
+## 目的
 
-Characterize unified-job softmax performance as matrix dimensions, worker
-count, and row count scale under the same canonical NoC configuration already
-used by the mature GEMM tests. Phase 4F uses only the completed
-`explicit_noc` reduction transport and does not sweep bandwidth or VN.
+在成熟 GEMM 测试已经使用的同一套标准 NoC 配置下，评估 unified-job softmax 随矩阵维度、worker 数量和行数扩展时的性能。Phase 4F 只使用已经完成的 `explicit_noc` reduction transport，不扫描带宽或 VN。
 
-The bandwidth-pressure experiment is deferred as an optional diagnostic. It is
-not required to establish normal-operation softmax performance because Phase
-4E already validates real reduction request/response traffic under the same
-network profile as canonical GEMM.
+带宽压力实验降级为可选诊断，不再属于下一阶段 softmax 主线。Phase 4E 已经在与标准 GEMM 相同的网络配置下验证了真实 reduction request/response 流量，因此正常运行性能评估不依赖带宽扫描。
 
-## Canonical GEMM Network Profile
+## 标准 GEMM 网络配置
 
-The source of truth is
-`src/sst/elements/golem/tests/configs/30_network.env`, which is automatically
-loaded by `run_noc_dma_pipeline.sh` through `configs/default.env` before the
-script applies fallback values.
+网络配置的权威来源是 `src/sst/elements/golem/tests/configs/30_network.env`。`run_noc_dma_pipeline.sh` 启动时先通过 `configs/default.env` 自动加载该文件，然后才应用脚本内部的兜底值。
 
-Phase 4F pins the resolved canonical values explicitly:
+Phase 4F 必须显式固定以下实际生效值：
 
 ```text
 GOLEM_NOC_LINK_BW=1200GB/s
@@ -33,19 +24,13 @@ GOLEM_NOC_INTER_ROUTER_NO_CUT=0
 GOLEM_NOC_LOCAL_NO_CUT=0
 ```
 
-These are not the emergency fallback literals inside
-`run_noc_dma_pipeline.sh`; those fallbacks are `25GB/s` and `8KB` and apply
-only when the preset values are absent. Explicit environment or CLI values can
-override both the preset and the fallbacks. The canonical network preset and
-completed default GEMM regression resolve link, xbar, and directory highlink
-to `1200GB/s`, router input/output buffers to `512KB`, and flit size to `128B`.
-The existing 4096-shaped SST artifact records the same resolved network
-profile; it is supporting configuration evidence, not a substitute for
-identifying the workload mode of a pure GEMM run.
+这些值不是 `run_noc_dma_pipeline.sh` 中的紧急兜底值。脚本里的 `25GB/s` 和 `8KB` 只在 preset 缺失时使用；显式环境变量或 CLI 参数仍可覆盖 preset 和兜底值。
 
-## Softmax Architecture Contract
+标准网络 preset 和已完成的默认 GEMM 回归均解析为：link、xbar 和 directory highlink 为 `1200GB/s`，router 输入/输出 buffer 为 `512KB`，flit 为 `128B`。现有 4096-shaped SST artifact 也记录了相同网络配置，但它只作为配置证据，不能代替对纯 GEMM workload mode 的识别。
 
-Every Phase 4F point uses:
+## Softmax 架构约束
+
+每个 Phase 4F 实验点必须使用：
 
 ```text
 distributed_reduction_transport=explicit_noc
@@ -62,22 +47,17 @@ retry_ticks=1024
 max_retries=8
 ```
 
-VN0/VN1/VN2 compatibility is complete in Phase 4E. `modeled_noc` is not part
-of the Phase 4F matrix. No bandwidth, xbar, flit, buffer, topology, retry, or
-VN parameter may vary across performance points except memory-node capacity
-when required to hold a larger tensor shape.
+VN0/VN1/VN2 兼容性已经在 Phase 4E 完成。`modeled_noc` 不进入 Phase 4F 实验矩阵。除容纳更大 tensor 所必需的 memory-node capacity 外，不允许在性能点之间改变 bandwidth、xbar、flit、buffer、topology、retry 或 VN 参数。
 
-Phase 4F does not modify SFU math, reduction messages, GlobalMemory,
-SimpleNetwork, GEMM, guest ABI, or primitive/batch softmax.
+Phase 4F 不修改 SFU 数学、reduction message、GlobalMemory、SimpleNetwork、GEMM、guest ABI 或 primitive/batch softmax。
 
-## Experiment Matrix
+## 实验矩阵
 
-The matrix is staged so only one scale axis changes at a time. Duplicate
-anchor identities are executed once.
+实验按阶段组织，每个阶段只改变一个规模轴。重复 anchor identity 只执行一次。
 
-### Stage A: Dimension Scaling
+### 阶段 A：维度扩展
 
-Fix `rows=16`, `worker_cores=16`, and `band_cores=16`:
+固定 `rows=16`、`worker_cores=16` 和 `band_cores=16`：
 
 ```text
 16x512
@@ -86,12 +66,11 @@ Fix `rows=16`, `worker_cores=16`, and `band_cores=16`:
 16x4096
 ```
 
-This stage measures increasing per-row column work with maximum available
-column cooperation.
+该阶段在最大 column cooperation 下测量每行列方向工作量增加的影响。
 
-### Stage B: Worker Scaling at Large Dimension
+### 阶段 B：大维度下的 worker 扩展
 
-Fix `rows=16` and `dim=4096`:
+固定 `rows=16` 和 `dim=4096`：
 
 ```text
 worker_cores/band_cores = 4/4
@@ -99,12 +78,11 @@ worker_cores/band_cores = 8/8
 worker_cores/band_cores = 16/16
 ```
 
-The `16/16` point is the Stage A `16x4096` anchor and is not rerun when its
-signature and artifacts remain valid.
+`16/16` 点与 Stage A 的 `16x4096` anchor 相同。当 signature 和 artifact 仍然有效时，不得重复执行。
 
-### Stage C: Row Scaling at Large Dimension
+### 阶段 C：大维度下的行数扩展
 
-Fix `dim=4096`, `worker_cores=16`, and `band_cores=16`:
+固定 `dim=4096`、`worker_cores=16` 和 `band_cores=16`：
 
 ```text
 rows=16
@@ -112,11 +90,9 @@ rows=64
 rows=256
 ```
 
-The `rows=16` point is the shared Stage A/B anchor. Stage C runs serially and
-stops on the first invalid or timed-out point; it does not silently reduce rows
-or change retry/network parameters.
+`rows=16` 是 Stage A/B 共用的 anchor。Stage C 串行执行，在首个无效或超时点停止；不得静默减少 rows，也不得修改 retry 或网络参数。
 
-The resulting default matrix has eight unique real SST points:
+默认矩阵最终包含 8 个唯一真实 SST 点：
 
 ```text
 16:512:16:16
@@ -129,17 +105,16 @@ The resulting default matrix has eight unique real SST points:
 256:4096:16:16
 ```
 
-## Memory Capacity and Timeout Policy
+## 内存容量和超时策略
 
-Memory capacity is a feasibility setting, not a performance-search axis. The
-runner records the resolved value and uses:
+内存容量只用于保证实验可执行，不作为性能搜索轴。runner 必须记录解析后的值，并使用：
 
 ```text
 dim <= 1024: mem_node_size=134217728 bytes
 dim >= 2048: mem_node_size=268435456 bytes
 ```
 
-Timeouts are shape classes and must be recorded:
+timeout 按 shape 固定，并写入 artifact：
 
 ```text
 16x512: 900 seconds
@@ -150,73 +125,62 @@ Timeouts are shape classes and must be recorded:
 256x4096: 14400 seconds
 ```
 
-A timeout is an experiment result with status `TIMEOUT`, not permission to
-alter the network or correctness contract. Recovery may resume from completed
-markers in the same root only when the complete point signature matches.
+超时是状态为 `TIMEOUT` 的正式实验结果，不代表可以改变网络或正确性约束。只有完整 point signature 与已有 marker 一致时，才允许在同一个 root 中恢复并复用已完成点。
 
-## Runner Architecture
+## 运行器架构
 
-Create a dedicated orchestrator:
+新增专用 parent runner：
 
 ```text
 src/sst/elements/golem/tests/small/mvm_noc_softmax_sfu/
   run_sfu_phase4f_large_scale_explicit_noc.sh
 ```
 
-It invokes the existing
-`run_sfu_unified_job_distributed_scaling.sh` one point at a time in child roots.
-The generic GEMM runner and architecture files remain unchanged.
+parent runner 每次在独立 child root 中调用现有 `run_sfu_unified_job_distributed_scaling.sh` 执行一个点。通用 GEMM runner 和 architecture 文件保持不变。
 
-The orchestrator must:
+parent runner 必须：
 
-- pin the canonical GEMM network profile and explicit-NoC/VN0 contract;
-- reject conflicting inherited transport, VN, network, buffer, retry, chunk,
-  staging, or job-row values;
-- use a collision-safe parent root lock;
-- include stage and full point identity in child root names and signatures;
-- skip an already valid duplicate anchor instead of rerunning it;
-- reject stale manifest schemas, stale markers, hash mismatches, and incomplete
-  child artifacts;
-- support dry-run, focused point-list override, resume, and stop-on-fail;
-- execute real points serially.
+- 固定标准 GEMM 网络配置和 explicit-NoC/VN0 约束；
+- 拒绝继承环境中冲突的 transport、VN、network、buffer、retry、chunk、staging 或 job-row 值；
+- 使用防并发冲突的 parent root lock；
+- 在 child root 名称和 signature 中包含 stage 与完整 point identity；
+- 对已经验证有效的重复 anchor 直接复用，不重新执行；
+- 拒绝旧 manifest schema、旧 marker、hash 不一致和不完整 child artifact；
+- 支持 dry-run、focused point-list override、resume 和 stop-on-fail；
+- 串行执行真实实验点。
 
-Supported controls are:
+支持以下公开控制：
 
 ```text
 GOLEM_PHASE4F_LARGE_SCALE_ROOT=<fresh absolute root>
 GOLEM_PHASE4F_LARGE_SCALE_DRY_RUN=1
 GOLEM_PHASE4F_LARGE_SCALE_STOP_ON_FAIL=1
-GOLEM_PHASE4F_LARGE_SCALE_POINT_LIST="rows:dim:workers:bands ..."
+GOLEM_PHASE4F_LARGE_SCALE_POINT_LIST="rows:dim:workers:bands [more-points]"
 ```
 
-The default point list is exactly the eight-point matrix above. Overrides are
-for focused recovery and tests; resolved points remain fully signed.
+默认 point list 必须严格等于上述 8 点矩阵。override 只用于 focused recovery 和测试；解析后的点仍必须完整签名。
 
-## Artifact and Correctness Gates
+## 产物和正确性检查
 
-Every usable point requires:
+每个可用点必须满足：
 
-- child manifest `PASS/PASS` with exit code zero;
-- independent full-row logits golden with `checked = rows * dim` and zero
-  mismatches;
-- correct active SFU worker/band counts;
-- Max/Sum request and response totals each equal `rows * worker_cores`;
-- explicit transport receives equal `4 * rows * worker_cores`;
-- GlobalMemory immediate plus queued sends equal the same transport total;
-- rejected and stale reduction messages equal zero;
-- resolved VN and network profile exactly match the fixed contracts;
-- DMA issue/completion and bytes match `rows`, `dim`, and worker partitioning;
-- DMA retry, exhaustion, and write-timeout retry equal zero;
-- output size, output hash, signature, log, stats, NoC summary, and DMA summary
-  are present and mutually consistent.
+- child manifest 为 `PASS/PASS` 且 exit code 为 0；
+- 独立 full-row logits golden 的 `checked = rows * dim`，mismatches 为 0；
+- active SFU worker/band 数量正确；
+- Max/Sum request 和 response 四类总数各等于 `rows * worker_cores`；
+- explicit transport receive 等于 `4 * rows * worker_cores`；
+- GlobalMemory immediate 与 queued send 之和等于同一个 transport total；
+- rejected 和 stale reduction message 均为 0；
+- 运行时 VN 和 network profile 与固定约束完全一致；
+- DMA issue/completion 和 bytes 与 rows、dim、worker partition 一致；
+- DMA retry、exhaustion 和 write-timeout retry 均为 0；
+- output size、output hash、signature、log、stats、NoC summary 和 DMA summary 全部存在且相互一致。
 
-Reduction queueing is recorded but is not a failure when all other transport
-and lifecycle gates pass. The fixed 1200GB/s profile remains unchanged even if
-a large-scale point queues.
+当其他 transport 和 lifecycle gate 均通过时，reduction queueing 只作为观测结果，不判定为失败。即使大规模点出现 queueing，也不得改变固定的 `1200GB/s` 网络配置。
 
-## Parent Manifest and Metrics
+## 父级 Manifest 和指标
 
-The parent `large_scale_manifest.csv` stores one canonical row per unique point:
+父 `large_scale_manifest.csv` 对每个唯一 point 保存一行 canonical record：
 
 ```text
 run_id,stage,rows,dim,chunk_elems,worker_cores,band_cores,
@@ -230,29 +194,28 @@ total_send_bits,total_xbar_stalls,simulated_time_us,wall_time_sec,dma_timeout_re
 dma_timeout_exhausted,dma_write_timeout_retry,output_sha256,child_root
 ```
 
-Primary performance metrics are:
+主要性能指标包括：
 
-- simulated time and wall time;
-- average and maximum reduction transport latency;
-- transport events and queued sends;
-- total packets, bits, and xbar stalls;
-- normalized time per row and per element;
-- worker scaling speedup and efficiency at `dim=4096`;
-- DMA issue/completion, bytes, retry, and round-trip metrics.
+- simulated time 和 wall time；
+- reduction transport 平均/最大 latency；
+- transport event 和 queued send；
+- total packet、bit 和 xbar stall；
+- 每行和每元素归一化时间；
+- `dim=4096` 下的 worker scaling speedup 和 efficiency；
+- DMA issue/completion、bytes、retry 和 round-trip 指标。
 
-These are deterministic single SST outcomes. No error bars, confidence
-intervals, or statistical significance claims are permitted.
+这些数据是单次确定性 SST 结果，不允许添加误差棒、置信区间或统计显著性结论。
 
-## Analysis and Figure Bundle
+## 分析和图表产物
 
-Create:
+新增：
 
 ```text
 src/sst/elements/golem/tests/small/mvm_noc_softmax_sfu/
   plot_sfu_phase4f_large_scale.py
 ```
 
-It reparses the parent and child evidence, reruns all gates, and generates:
+该脚本重新解析父/子证据、再次执行全部 gate，并生成：
 
 ```text
 tests/artifacts/sweeps/sfu_phase4f_large_scale_explicit_noc_20260715/report/
@@ -263,87 +226,70 @@ tests/artifacts/sweeps/sfu_phase4f_large_scale_explicit_noc_20260715/report/
   sfu_phase4f_large_scale_qa.md
 ```
 
-The English 16:9 figure contains:
+英文 16:9 结果图包含：
 
-- dimension scaling of runtime and reduction latency;
-- worker scaling speedup/efficiency at `dim=4096`;
-- row scaling of total time and normalized time per row;
-- NoC pressure metrics and a compact correctness/lifecycle block.
+- dimension scaling 的 runtime 和 reduction latency；
+- `dim=4096` 下的 worker scaling speedup/efficiency；
+- row scaling 的 total time 和 normalized time per row；
+- NoC pressure 指标和紧凑的 correctness/lifecycle 区域。
 
-It uses explicit-NoC only and labels the fixed canonical GEMM network profile.
-It does not include modeled-NoC, bandwidth comparisons, future fusion plans,
-or inferential statistics.
+图中只使用 explicit-NoC，并标注固定的标准 GEMM network profile。不得加入 modeled-NoC、bandwidth comparison、未来 fusion 计划或推断统计。
 
-## Test Strategy
+## 测试策略
 
-Add:
+新增：
 
 ```text
 src/sst/elements/golem/tests/small/mvm_noc_softmax_sfu/
   test_sfu_phase4f_large_scale.py
 ```
 
-Focused tests cover:
+focused tests 必须覆盖：
 
-- exact canonical GEMM network values and their preset source;
-- exact eight-point default matrix and duplicate-anchor elimination;
-- dimension-specific memory/timeout resolution;
-- explicit-NoC/VN0-only environment and inherited-conflict rejection;
-- network profile in signature, manifest, child environment, and runtime log;
-- root locking, dry-run, resume, stale schema, stale marker, and corrupted
-  output behavior;
-- shape-derived golden, transport, DMA, byte, and output-size gates;
-- parsing latency, queueing, packet/bit, xbar, runtime, and DMA metrics;
-- invalid/timeout stop behavior without parameter mutation;
-- deterministic CSV/SVG/PDF/PNG generation and complete source reconstruction;
-- editable SVG text, TrueType PDF text, 300 dpi PNG, and visual non-overlap.
+- 标准 GEMM 网络值及其 preset 来源；
+- 8 点默认矩阵和 duplicate-anchor elimination；
+- 按维度解析 memory/timeout；
+- explicit-NoC/VN0-only 环境和 inherited-conflict rejection；
+- signature、manifest、child environment 和 runtime log 中的 network profile；
+- root lock、dry-run、resume、旧 schema、旧 marker 和损坏 output；
+- 按 shape 推导的 golden、transport、DMA、byte 和 output-size gate；
+- latency、queueing、packet/bit、xbar、runtime 和 DMA 指标解析；
+- invalid/timeout 时停止且不修改参数；
+- CSV/SVG/PDF/PNG 的确定性生成和完整 source reconstruction；
+- SVG editable text、PDF TrueType text、300 dpi PNG 和视觉无重叠。
 
-Synthetic fixtures and dry-runs cover runner/analyzer behavior. Real SST points
-start only after focused tests pass.
+synthetic fixture 和 dry-run 用于验证 runner/analyzer 行为。只有 focused tests 通过后才能启动真实 SST 点。
 
-## GEMM Isolation
+## GEMM 隔离约束
 
-The dedicated Phase 4F runner must not modify
-`src/sst/elements/golem/tests/run_noc_dma_pipeline.sh`, GEMM architecture files,
-or GEMM guest binaries.
+专用 Phase 4F runner 不得修改 `src/sst/elements/golem/tests/run_noc_dma_pipeline.sh`、GEMM architecture 文件或 GEMM guest binary。
 
-If implementation remains confined to new softmax runner/analyzer/tests, the
-existing canonical GEMM artifacts and focused isolation tests are sufficient.
-If any shared runner, preset, architecture, or production component changes,
-the implementation must rerun the existing default GEMM regression before
-Phase 4F is accepted.
+如果实现只新增 softmax runner、analyzer 和 tests，则现有标准 GEMM artifact 与 focused isolation test 足够。如果不得不修改 shared runner、preset、architecture 或 production component，则 Phase 4F 验收前必须重新运行现有默认 GEMM 回归。
 
-## Execution Order
+## 执行顺序
 
-1. Record the canonical GEMM network evidence and Phase 4E explicit-NoC anchor.
-2. Implement the dedicated runner contracts under focused TDD.
-3. Implement the artifact parser and report generator under focused TDD.
-4. Run the complete eight-point dry-run and inspect resolved signatures.
-5. Run Stage A serially and stop on the first invalid point.
-6. Reuse the valid 16x4096 anchor, then run Stage B serially.
-7. Reuse the same anchor, then run Stage C serially.
-8. Generate and visually inspect the deterministic report bundle.
-9. Run the complete focused softmax suite and the GEMM isolation gate.
+1. 记录标准 GEMM 网络证据和 Phase 4E explicit-NoC anchor。
+2. 在 focused TDD 下实现 artifact parser 和专用 parent runner 约束。
+3. 在 focused TDD 下实现报告生成器。
+4. 执行完整 8 点 dry-run，检查解析后的 signature。
+5. 串行执行 Stage A，在首个无效点停止。
+6. 复用有效 `16x4096` anchor，再串行执行 Stage B。
+7. 再次复用同一 anchor，然后串行执行 Stage C。
+8. 生成并视觉检查确定性报告产物。
+9. 运行完整 softmax focused suite 和 GEMM isolation gate。
 
-## Success Criteria
+## 完成判据
 
-Phase 4F is complete when:
+Phase 4F 完成必须满足：
 
-- all executable points are represented by canonical parent/child artifacts;
-- every usable point passes golden, transport, DMA, topology, and artifact
-  gates;
-- any invalid or timeout point is reported without changing the network or
-  correctness contract;
-- source CSV and editable deterministic figures reconstruct every reported
-  number;
-- no modeled-NoC or bandwidth sweep appears in the main matrix;
-- the fixed network values match the canonical GEMM preset and runtime logs;
-- no GEMM path is changed, or the existing GEMM regression passes if a shared
-  file change becomes unavoidable.
+- 所有可执行点均有 canonical parent/child artifact；
+- 每个可用点均通过 golden、transport、DMA、topology 和 artifact gate；
+- invalid 或 timeout 点被明确报告，且没有改变 network 或 correctness contract；
+- source CSV 和可编辑确定性图表能够重建所有报告数值；
+- 主矩阵不包含 modeled-NoC 或 bandwidth sweep；
+- 固定 network 值与标准 GEMM preset 和 runtime log 一致；
+- GEMM 路径未改变；如果不可避免修改 shared 文件，则现有 GEMM 回归重新 PASS。
 
-## Scope After Phase 4F
+## Phase 4F 后续范围
 
-After large-scale softmax behavior is characterized, the next decision is
-whether to optimize the dominant softmax bottleneck or begin GEMM+softmax
-fusion. Bandwidth-pressure experiments remain optional diagnostics and are not
-part of the default roadmap.
+完成大规模 softmax 特征分析后，再根据主要瓶颈决定是优化 softmax，还是开始 GEMM+softmax fusion。带宽压力实验继续作为可选诊断，不进入默认路线图。
