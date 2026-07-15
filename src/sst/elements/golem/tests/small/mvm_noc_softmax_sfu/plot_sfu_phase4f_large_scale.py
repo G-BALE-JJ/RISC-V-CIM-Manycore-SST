@@ -219,9 +219,25 @@ def _integer(root: pathlib.Path, run_id: str, field: str, value: str) -> int:
         raise _error(root, run_id, field, f"expected integer, got {value!r}") from exc
 
 
+def _nonnegative_integer(
+    root: pathlib.Path, run_id: str, field: str, value: str
+) -> int:
+    result = _integer(root, run_id, field, value)
+    if result < 0:
+        raise _error(root, run_id, field, f"expected nonnegative integer, got {result}")
+    return result
+
+
 def _require_equal(root, run_id, field, actual, expected):
     if actual != expected:
         raise _error(root, run_id, field, f"expected {expected!r}, got {actual!r}")
+
+
+def _canonical_run_id(spec: PointSpec) -> str:
+    return (
+        f"sfu_unified_job_r{spec.rows}_d{spec.dim}_c256_w{spec.worker_cores}"
+        f"_b{spec.band_cores}_g1_vn0"
+    )
 
 
 def select_child_manifest_row(
@@ -242,7 +258,7 @@ def select_child_manifest_row(
         "chunk_elems": 256,
         "worker_cores": spec.worker_cores,
         "band_cores": spec.band_cores,
-        "cooperative_groups": spec.rows // 4,
+        "cooperative_groups": 1,
         "reduction_vn": REDUCTION_VN,
         "num_vns": NUM_VNS,
         "dma_response_vn": DMA_RESPONSE_VN,
@@ -256,8 +272,12 @@ def select_child_manifest_row(
     if "" in run_ids or len(run_ids) != 1:
         raise _error(child_root, next(iter(run_ids), ""), "run_id", "expected one run ID")
     run_id = next(iter(run_ids))
-    if not run_id.endswith("_vn0"):
-        raise _error(child_root, run_id, "transport", "canonical explicit_noc run must end in _vn0")
+    expected_run_id = _canonical_run_id(spec)
+    if run_id != expected_run_id:
+        raise _error(
+            child_root, run_id, "run_id",
+            f"expected canonical {expected_run_id!r}, got {run_id!r}",
+        )
     canonical = []
     for row in rows:
         for field, expected in expected_ints.items():
@@ -295,7 +315,10 @@ def _stat_values(root, run_id, rows, statistic, field="Sum.u64") -> list[int]:
     matches = [row for row in rows if row["StatisticName"] == statistic]
     if not matches:
         raise _error(root, run_id, statistic, "statistic is missing")
-    return [_integer(root, run_id, f"{statistic}.{field}", row[field]) for row in matches]
+    return [
+        _nonnegative_integer(root, run_id, f"{statistic}.{field}", row[field])
+        for row in matches
+    ]
 
 
 def _stat_sum(root, run_id, rows, statistic) -> int:
@@ -307,7 +330,7 @@ def _metric(root, run_id, path, metric, value_field) -> int:
     matches = [row for row in rows if row["metric"] == metric]
     if len(matches) != 1:
         raise _error(root, run_id, metric, f"expected one row, got {len(matches)}")
-    return _integer(root, run_id, metric, matches[0][value_field])
+    return _nonnegative_integer(root, run_id, metric, matches[0][value_field])
 
 
 def _check_log(root: pathlib.Path, run_id: str, log: pathlib.Path) -> float:
@@ -323,10 +346,9 @@ def _check_log(root: pathlib.Path, run_id: str, log: pathlib.Path) -> float:
         "GlobalMemory VN mapping: request_vn=0 response_vn=1 reduction_vn=0 (num_vns=3)",
         "resolved golem_dma_response_vn=0 num_vns=3 explicit=1",
     )
-    log_lines = text.splitlines()
-    missing = [line for line in required if log_lines.count(line) != 1]
+    missing = [evidence for evidence in required if evidence not in text]
     if missing:
-        raise _error(root, run_id, "noc_profile", f"missing or duplicate exact evidence: {missing!r}")
+        raise _error(root, run_id, "noc_profile", f"missing exact evidence: {missing!r}")
     matches = re.findall(
         r"Simulation is complete, simulated time:\s*([0-9]+(?:\.[0-9]+)?)\s*(us|ms|s)\b",
         text,
@@ -405,7 +427,10 @@ def parse_child_point(
     stats = _read_csv(stats_dir / "stats_selfcom.txt", root, run_id, "stats_selfcom.txt", _STAT_FIELDS)
     for row_value in stats:
         for field in _STAT_FIELDS[1:]:
-            _integer(root, run_id, f"stats_selfcom.txt.{field}", row_value[field])
+            _nonnegative_integer(
+                root, run_id,
+                f"{row_value['StatisticName']}.{field}", row_value[field],
+            )
     for statistic in (
         "sfu_ops_issued", "sfu_job_softmax_max_chunks",
         "sfu_job_softmax_sum_chunks", "sfu_job_softmax_norm_chunks",
@@ -480,10 +505,12 @@ def parse_child_point(
         raise _error(root, run_id, "wall_time_sec", f"invalid {summary['wall_time_sec']!r}") from exc
     if not math.isfinite(wall_time_sec):
         raise _error(root, run_id, "wall_time_sec", f"non-finite {summary['wall_time_sec']!r}")
+    if wall_time_sec < 0:
+        raise _error(root, run_id, "wall_time_sec", f"negative {wall_time_sec}")
     golden_checked, golden_mismatches = _golden(root, run_id, spec, output, pathlib.Path(verifier))
     return PointRecord(
         spec=spec, run_id=run_id, chunk_elems=256,
-        cooperative_groups=spec.rows // 4, transport=TRANSPORT,
+        cooperative_groups=1, transport=TRANSPORT,
         reduction_vn=REDUCTION_VN, num_vns=NUM_VNS,
         dma_response_vn=DMA_RESPONSE_VN,
         noc_link_bw=CANONICAL_NETWORK["GOLEM_NOC_LINK_BW"],
@@ -569,9 +596,12 @@ def _manifest_int(path, row, field, optional=False):
     if optional and value == "":
         return None
     try:
-        return int(value)
+        result = int(value)
     except ValueError as exc:
         raise ValueError(f"manifest={path} field={field}: invalid integer {value!r}") from exc
+    if result < 0:
+        raise ValueError(f"manifest={path} field={field}: negative integer {result}")
+    return result
 
 
 def _manifest_float(path, row, field, optional=False):
@@ -584,6 +614,8 @@ def _manifest_float(path, row, field, optional=False):
         raise ValueError(f"manifest={path} field={field}: invalid float {value!r}") from exc
     if not (-float("inf") < result < float("inf")):
         raise ValueError(f"manifest={path} field={field}: non-finite float {value!r}")
+    if result < 0:
+        raise ValueError(f"manifest={path} field={field}: negative float {result}")
     return result
 
 
@@ -609,7 +641,7 @@ def _row_to_record(path: pathlib.Path, row: dict[str, str]) -> PointRecord:
     return PointRecord(
         spec=spec, run_id=row["run_id"],
         chunk_elems=_manifest_int(path, row, "chunk_elems"),
-        cooperative_groups=spec.rows // 4, transport=row["transport"],
+        cooperative_groups=1, transport=row["transport"],
         reduction_vn=_manifest_int(path, row, "reduction_vn"),
         num_vns=_manifest_int(path, row, "num_vns"),
         dma_response_vn=_manifest_int(path, row, "dma_response_vn"),

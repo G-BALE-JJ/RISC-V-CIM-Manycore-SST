@@ -192,8 +192,8 @@ class SyntheticChild:
         self.root = root
         self.spec = spec
         self.run_id = (
-            f"sfu_job_dist_r{spec.rows}_d{spec.dim}_w{spec.worker_cores}"
-            f"_bc{spec.band_cores}_g4_vn0"
+            f"sfu_unified_job_r{spec.rows}_d{spec.dim}_c256_w{spec.worker_cores}"
+            f"_b{spec.band_cores}_g1_vn0"
         )
         self.stats_dir = root / "stats" / "overlap0" / self.run_id
         self.stdout_dir = root / "stdout" / "overlap0" / self.run_id
@@ -206,7 +206,7 @@ class SyntheticChild:
             "chunk_elems": "256",
             "worker_cores": str(spec.worker_cores),
             "band_cores": str(spec.band_cores),
-            "cooperative_groups": "4",
+            "cooperative_groups": "1",
             "reduction_vn": "0",
             "num_vns": "3",
             "dma_response_vn": "0",
@@ -265,14 +265,18 @@ class SyntheticChild:
         (self.root / "outputs" / f"{self.run_id}.bin").write_bytes(
             b"\0" * (self.spec.rows * self.spec.dim * 4)
         )
-        self.log.write_text(
+        topology = (
             "[NoC] input_buf_size=512KB, output_buf_size=512KB, "
             "link_bw=1200GB/s, xbar_bw=1200GB/s, flit_size=128B\n"
             "[NoC] inter_router_no_cut=0, local_no_cut=0\n"
             "[GOLEM] GlobalMemory link buffer_length=1024KB\n"
             "GlobalMemory VN mapping: request_vn=0 response_vn=1 reduction_vn=0 (num_vns=3)\n"
             "resolved golem_dma_response_vn=0 num_vns=3 explicit=1\n"
-            "Simulation is complete, simulated time: 2.5 ms\n",
+        )
+        self.log.write_text(
+            "".join(f"[component0] {line}\n" for line in topology.splitlines())
+            + "".join(f"[component1] {line}\n" for line in topology.splitlines())
+            + "Simulation is complete, simulated time: 2.5 ms\n",
             encoding="utf-8",
         )
         pass_line = (
@@ -409,9 +413,18 @@ class Phase4FArtifactParserTest(unittest.TestCase):
                     lambda: phase4f.select_child_manifest_row(self.root, self.spec),
                 )
 
+    def test_manifest_rejects_noncanonical_run_id_even_with_vn_suffix(self):
+        self.child.write_manifest([dict(self.child.manifest_row, run_id="foo_vn0")])
+        with self.assertRaisesRegex(
+            ValueError,
+            rf"child_root={re.escape(str(self.root))} run_id=foo_vn0 field=run_id",
+        ):
+            phase4f.select_child_manifest_row(self.root, self.spec)
+
     def test_parse_canonical_child_point_aggregates_all_evidence(self):
         record = phase4f.parse_child_point(self.root, self.spec, self.child.verifier)
         self.assertEqual(record.run_id, self.child.run_id)
+        self.assertEqual(record.cooperative_groups, 1)
         self.assertEqual(record.golden_checked, self.spec.rows * self.spec.dim)
         self.assertEqual(record.transport_events, 4 * self.spec.rows * self.spec.worker_cores)
         self.assertEqual(record.transport_immediate, record.transport_events - 7)
@@ -521,6 +534,49 @@ class Phase4FArtifactParserTest(unittest.TestCase):
             lambda: phase4f.parse_child_point(self.root, self.spec, self.child.verifier),
         )
 
+    def test_negative_u64_noc_and_time_values_are_rejected(self):
+        stats = self.child.read_stats()
+        target = next(
+            row for row in stats
+            if row["StatisticName"] == "sfu_reduction_max_requests"
+        )
+        target["Sum.u64"] = str(self.spec.rows * self.spec.worker_cores + 1)
+        stats.append(dict(target, ComponentName="negative", **{"Sum.u64": "-1"}))
+        self.child.write_stats(stats)
+        self.assert_context_error(
+            "sfu_reduction_max_requests.Sum.u64",
+            lambda: phase4f.parse_child_point(self.root, self.spec, self.child.verifier),
+        )
+        self.child._build()
+        self.child.write_metrics("noc_summary.csv", "value", {
+            "total_send_packets": 1234,
+            "total_send_bits": 98765,
+            "total_xbar_stalls": -1,
+        })
+        self.assert_context_error(
+            "total_xbar_stalls",
+            lambda: phase4f.parse_child_point(self.root, self.spec, self.child.verifier),
+        )
+        self.child._build()
+        summary = self.root / "stats" / "run_summary.csv"
+        summary.write_text(
+            summary.read_text(encoding="utf-8").replace("12.75", "-12.75"),
+            encoding="utf-8",
+        )
+        self.assert_context_error(
+            "wall_time_sec",
+            lambda: phase4f.parse_child_point(self.root, self.spec, self.child.verifier),
+        )
+        self.child._build()
+        self.child.log.write_text(
+            self.child.log.read_text(encoding="utf-8").replace("2.5 ms", "-2.5 ms"),
+            encoding="utf-8",
+        )
+        self.assert_context_error(
+            "simulated_time_us",
+            lambda: phase4f.parse_child_point(self.root, self.spec, self.child.verifier),
+        )
+
     def test_completion_time_supports_us_ms_and_s(self):
         for unit, expected in (("us", 2.5), ("ms", 2500.0), ("s", 2500000.0)):
             with self.subTest(unit=unit):
@@ -561,6 +617,21 @@ class Phase4FArtifactParserTest(unittest.TestCase):
         manifest.write_bytes(b"\xff\xfe")
         with self.assertRaises(ValueError):
             phase4f.load_parent_manifest(manifest)
+
+    def test_parent_manifest_rejects_negative_counter_and_time_values(self):
+        manifest = pathlib.Path(self.temp.name) / "large_scale_manifest.csv"
+        record = phase4f.parse_child_point(self.root, self.spec, self.child.verifier)
+        phase4f.upsert_parent_manifest(manifest, record)
+        with manifest.open(newline="", encoding="utf-8") as handle:
+            canonical = list(csv.DictReader(handle))[0]
+        for field in ("total_send_packets", "simulated_time_us", "wall_time_sec"):
+            with self.subTest(field=field):
+                bad = dict(canonical, **{field: "-1"})
+                SyntheticChild.write_csv(
+                    manifest, phase4f.PARENT_MANIFEST_FIELDS, [bad]
+                )
+                with self.assertRaisesRegex(ValueError, rf"field={field}"):
+                    phase4f.load_parent_manifest(manifest)
 
     def test_collect_cli_uses_parser_and_upserts_manifest(self):
         manifest = pathlib.Path(self.temp.name) / "parent.csv"
