@@ -192,8 +192,8 @@ class SyntheticChild:
         self.root = root
         self.spec = spec
         self.run_id = (
-            f"sfu_unified_job_r{spec.rows}_d{spec.dim}_c256_w{spec.worker_cores}"
-            f"_b{spec.band_cores}_g1_vn0"
+            f"sfu_job_dist_r{spec.rows}_d{spec.dim}_c256_w{spec.worker_cores}"
+            f"_bc{spec.band_cores}_g1_vn0"
         )
         self.stats_dir = root / "stats" / "overlap0" / self.run_id
         self.stdout_dir = root / "stdout" / "overlap0" / self.run_id
@@ -421,6 +421,15 @@ class Phase4FArtifactParserTest(unittest.TestCase):
         ):
             phase4f.select_child_manifest_row(self.root, self.spec)
 
+    def test_manifest_rejects_previous_incorrect_run_id_template(self):
+        old_run_id = (
+            f"sfu_unified_job_r{self.spec.rows}_d{self.spec.dim}_c256_"
+            f"w{self.spec.worker_cores}_b{self.spec.band_cores}_g1_vn0"
+        )
+        self.child.write_manifest([dict(self.child.manifest_row, run_id=old_run_id)])
+        with self.assertRaisesRegex(ValueError, r"field=run_id"):
+            phase4f.select_child_manifest_row(self.root, self.spec)
+
     def test_parse_canonical_child_point_aggregates_all_evidence(self):
         record = phase4f.parse_child_point(self.root, self.spec, self.child.verifier)
         self.assertEqual(record.run_id, self.child.run_id)
@@ -454,6 +463,27 @@ class Phase4FArtifactParserTest(unittest.TestCase):
         self.assert_context_error(
             "golden_mismatches", lambda: phase4f.parse_child_point(self.root, self.spec, self.child.verifier)
         )
+
+    def test_log_evidence_requires_legal_value_boundaries(self):
+        replacements = (
+            ("flit_size=128B", "flit_size=128BAD"),
+            ("local_no_cut=0", "local_no_cut=01"),
+            ("buffer_length=1024KB", "buffer_length=1024KB_bad"),
+            ("explicit=1", "explicit=10"),
+        )
+        for valid, invalid in replacements:
+            with self.subTest(invalid=invalid):
+                self.child._build()
+                self.child.log.write_text(
+                    self.child.log.read_text(encoding="utf-8").replace(valid, invalid),
+                    encoding="utf-8",
+                )
+                self.assert_context_error(
+                    "noc_profile",
+                    lambda: phase4f.parse_child_point(
+                        self.root, self.spec, self.child.verifier
+                    ),
+                )
 
     def test_parse_rejects_reduction_dma_and_physical_core_failures(self):
         stats = self.child.read_stats()

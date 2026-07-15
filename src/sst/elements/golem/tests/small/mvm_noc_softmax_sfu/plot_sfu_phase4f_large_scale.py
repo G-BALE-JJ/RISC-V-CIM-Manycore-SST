@@ -235,8 +235,8 @@ def _require_equal(root, run_id, field, actual, expected):
 
 def _canonical_run_id(spec: PointSpec) -> str:
     return (
-        f"sfu_unified_job_r{spec.rows}_d{spec.dim}_c256_w{spec.worker_cores}"
-        f"_b{spec.band_cores}_g1_vn0"
+        f"sfu_job_dist_r{spec.rows}_d{spec.dim}_c256_w{spec.worker_cores}"
+        f"_bc{spec.band_cores}_g1_vn0"
     )
 
 
@@ -346,7 +346,15 @@ def _check_log(root: pathlib.Path, run_id: str, log: pathlib.Path) -> float:
         "GlobalMemory VN mapping: request_vn=0 response_vn=1 reduction_vn=0 (num_vns=3)",
         "resolved golem_dma_response_vn=0 num_vns=3 explicit=1",
     )
-    missing = [evidence for evidence in required if evidence not in text]
+    lines = text.splitlines()
+    missing = [
+        evidence
+        for evidence in required
+        if not any(
+            re.search(rf"{re.escape(evidence)}(?=$|[\s,;])", line)
+            for line in lines
+        )
+    ]
     if missing:
         raise _error(root, run_id, "noc_profile", f"missing exact evidence: {missing!r}")
     matches = re.findall(
