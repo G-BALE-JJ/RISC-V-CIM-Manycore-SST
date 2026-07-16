@@ -409,13 +409,14 @@ class CapacityParentRunnerTest(unittest.TestCase):
             "    (root / 'outputs' / f'{child.run_id}.bin').write_bytes(uniform * (point.rows * point.dim))\n"
             "else:\n"
             "    (root / 'logs').mkdir(parents=True, exist_ok=True)\n"
-            "    (root / 'logs' / 'timeout.log').write_text('watchdog timeout\\n')\n",
+            "    message = 'No network interfaces were found for out-of-band communications\\nMPI_Init failed\\n' if outcome == 'ENVIRONMENT_FAIL' else 'watchdog timeout\\n'\n"
+            "    (root / 'logs' / 'timeout.log').write_text(message)\n",
             encoding="utf-8",
         )
         fake_bin = self.base / f"fake-bin-{outcome.lower()}"
         fake_bin.mkdir()
         fake_bash = fake_bin / "bash"
-        exit_code = {"PASS": 0, "TIMEOUT": 124}[outcome]
+        exit_code = {"PASS": 0, "TIMEOUT": 124, "ENVIRONMENT_FAIL": 1}[outcome]
         fake_bash.write_text(
             "#!/bin/sh\n"
             "printf '%s|%s\\n' \"${GOLEM_SFU_DISTRIBUTED_POINT_LIST}\" \"${GOLEM_SWEEP_ROOT}\" >> \"${FAKE_CHILD_LOG}\"\n"
@@ -482,6 +483,31 @@ class CapacityParentRunnerTest(unittest.TestCase):
         self.assertEqual(cached.returncode, 0, cached.stderr)
         self.assertIn("validated cached PASS", cached.stdout)
         self.assertEqual(len(child_log.read_text().splitlines()), 1)
+
+    def test_mpi_environment_failure_is_archived_before_explicit_rerun(self):
+        point = capacity.DEFAULT_POINTS[0]
+        root = self.base / "environment-fail"
+        child_log = self.base / "environment-child.log"
+        env = self.env(
+            root,
+            GOLEM_SFU_CAPACITY_DRY_RUN="0",
+            GOLEM_SFU_CAPACITY_POINT_LIST="512:4096:16:16",
+            FAKE_CHILD_LOG=child_log,
+        )
+        env["PATH"] = f"{self.fake_child_bin('ENVIRONMENT_FAIL')}:{env['PATH']}"
+        failed = self.run_parent(root, env)
+        self.assertEqual(failed.returncode, 1, failed.stderr)
+        marker = self.marker(root, point)
+        self.assertIn("state=ENVIRONMENT_FAIL", marker.read_text(encoding="utf-8"))
+
+        retry_env = dict(env)
+        retry_env["PATH"] = f"{self.fake_child_bin('PASS')}:{os.environ['PATH']}"
+        passed = self.run_parent(root, retry_env)
+        self.assertEqual(passed.returncode, 0, passed.stderr)
+        self.assertTrue(self.attempt(root, point, 2).is_dir())
+        archives = list((root / "completed").glob("*.environment-fail.marker"))
+        self.assertEqual(len(archives), 1)
+        self.assertIn("state=ENVIRONMENT_FAIL", archives[0].read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

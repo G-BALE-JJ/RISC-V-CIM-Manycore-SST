@@ -222,6 +222,24 @@ next_attempt_root() {
 	done
 }
 
+is_mpi_environment_failure() {
+	local log_path="$1"
+	[[ -f "$log_path" ]] || return 1
+	rg -q "No network interfaces were found for out-of-band communications" "$log_path" && \
+		rg -q "MPI_Init|MPI_INIT" "$log_path"
+}
+
+archive_environment_failure() {
+	local marker="$1" identity="$2" child_root="$3"
+	local attempt archive
+	attempt="$(basename "$child_root")"
+	archive="$ROOT/completed/${identity}.${attempt}.environment-fail.marker"
+	if [[ ! -e "$archive" ]]; then
+		cp "$marker" "$archive"
+	fi
+	echo "$archive"
+}
+
 collect_point() {
 	local rows="$1" child_root="$2"
 	python3 "$CAPACITY_TOOL" collect \
@@ -278,8 +296,22 @@ for point in "${points[@]}"; do
 				error "recorded TIMEOUT requires later analysis; point=$point child_root=$marker_child"
 				exit 124
 				;;
-			FAIL|ARTIFACT_FAIL)
-				error "recorded $marker_state blocks automatic retry; point=$point child_root=$marker_child"
+			ENVIRONMENT_FAIL)
+				archive="$(archive_environment_failure "$marker" "$identity" "$marker_child")"
+				echo "[SFU-CAPACITY] archived environment failure point=$point marker=$archive"
+				;;
+			FAIL)
+				marker_log="$(marker_value "$marker" log_path)"
+				if is_mpi_environment_failure "$marker_log"; then
+					archive="$(archive_environment_failure "$marker" "$identity" "$marker_child")"
+					echo "[SFU-CAPACITY] reclassified and archived MPI environment failure point=$point marker=$archive"
+				else
+					error "recorded FAIL blocks automatic retry; point=$point child_root=$marker_child"
+					exit "$marker_exit"
+				fi
+				;;
+			ARTIFACT_FAIL)
+				error "recorded ARTIFACT_FAIL blocks automatic retry; point=$point child_root=$marker_child"
 				exit "$marker_exit"
 				;;
 			DRYRUN) ;;
@@ -338,6 +370,8 @@ for point in "${points[@]}"; do
 			exit_code=3
 			error "artifact validation failed: point=$point child_root=$child_root"
 		fi
+	elif is_mpi_environment_failure "$log_path"; then
+		state=ENVIRONMENT_FAIL
 	fi
 
 	write_marker "$marker" "$state" "$exit_code" "$signature" "$signature_sha" \
