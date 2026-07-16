@@ -2,8 +2,11 @@
 
 import csv
 import dataclasses
+import fcntl
 import hashlib
+import os
 import pathlib
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -16,6 +19,9 @@ if str(SCRIPT_DIR) not in sys.path:
 
 import sfu_4096x4096_capacity as capacity
 import test_sfu_phase4f_large_scale as phase4f_test_support
+
+
+RUNNER = SCRIPT_DIR / "run_sfu_4096x4096_capacity.sh"
 
 
 class CapacityContractTest(unittest.TestCase):
@@ -253,6 +259,229 @@ class CapacityResourceAndEvidenceTest(unittest.TestCase):
                 capacity.write_capacity_report(
                     root, root / "report", pathlib.Path("verifier.py")
                 )
+
+
+class CapacityParentRunnerTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir="/data4/jjgong/tmp")
+        self.base = pathlib.Path(self.temp.name)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def env(self, root, **updates):
+        env = {
+            key: value for key, value in os.environ.items()
+            if not key.startswith("GOLEM_") and key != "TMPDIR"
+        }
+        env.update(
+            {
+                "TMPDIR": "/data4/jjgong/tmp",
+                "GOLEM_SFU_CAPACITY_ROOT": str(root),
+                "GOLEM_SFU_CAPACITY_DRY_RUN": "1",
+            }
+        )
+        env.update({key: str(value) for key, value in updates.items()})
+        return env
+
+    def run_parent(self, root, env=None):
+        return subprocess.run(
+            ["/bin/bash", str(RUNNER)],
+            cwd=RUNNER.parent,
+            env=env or self.env(root),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+    @staticmethod
+    def attempt(root, point, number=1):
+        return (
+            pathlib.Path(root)
+            / "children"
+            / f"r{point.rows}_d4096_w16_b16"
+            / f"attempt-{number:04d}"
+        )
+
+    @staticmethod
+    def marker(root, point):
+        return pathlib.Path(root) / "completed" / f"r{point.rows}_d4096_w16_b16.marker"
+
+    def test_default_dry_run_expands_exact_ladder_and_watchdogs(self):
+        root = self.base / "dry-run"
+        result = self.run_parent(root)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = [
+            line for line in result.stdout.splitlines()
+            if line.startswith("[SFU-CAPACITY][DRY-RUN]")
+        ]
+        self.assertEqual(len(lines), 4, result.stdout)
+        for point, line in zip(capacity.DEFAULT_POINTS, lines):
+            self.assertIn(f"point={point.rows}:4096:16:16", line)
+            self.assertIn(f"timeout_sec={point.timeout_sec}", line)
+            self.assertIn("mem_node_size=268435456", line)
+            child_root = self.attempt(root, point)
+            self.assertIn(f"child_root={child_root}", line)
+            with (child_root / "sweep_manifest.csv").open(
+                newline="", encoding="utf-8"
+            ) as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["status"], "DRYRUN")
+            self.assertEqual(rows[0]["timeout_sec"], str(point.timeout_sec))
+
+    def test_conflicts_invalid_prefix_schema_and_lock_fail_closed(self):
+        conflicts = {
+            "GOLEM_SFU_DISTRIBUTED_REDUCTION_TRANSPORT": "modeled_noc",
+            "GOLEM_SFU_VN_SWEEP": "0",
+            "GOLEM_SFU_REDUCTION_VN": "1",
+            "GOLEM_DMA_RESPONSE_VN": "1",
+            "GOLEM_NOC_LINK_BW": "25GB/s",
+            "GOLEM_NOC_XBAR_BW": "25GB/s",
+            "GOLEM_DIRCTRL_HIGHLINK_BW": "25GB/s",
+            "GOLEM_NOC_INPUT_BUF_SIZE": "8KB",
+            "GOLEM_NOC_OUTPUT_BUF_SIZE": "8KB",
+            "GOLEM_NOC_FLIT_SIZE": "64B",
+            "GOLEM_GM_BUFFER_LENGTH": "512KB",
+            "GOLEM_SFU_DISTRIBUTED_CHUNK_ELEMS": "128",
+            "GOLEM_SFU_DISTRIBUTED_STAGING_ROWS": "8",
+            "GOLEM_SFU_DISTRIBUTED_JOB_ROWS": "8",
+            "GOLEM_SFU_DISTRIBUTED_RETRY_TICKS": "2048",
+            "GOLEM_SFU_DISTRIBUTED_MAX_RETRIES": "9",
+            "GOLEM_SFU_CAPACITY_STOP_ON_FAIL": "0",
+            "TMPDIR": "/tmp",
+        }
+        for index, (name, value) in enumerate(conflicts.items()):
+            with self.subTest(name=name):
+                root = self.base / f"conflict-{index}"
+                result = self.run_parent(root, self.env(root, **{name: value}))
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(name, result.stderr)
+                self.assertFalse((root / "children").exists())
+
+        for index, points in enumerate(
+            (
+                "",
+                "1024:4096:16:16",
+                "512:4096:16:16 2048:4096:16:16",
+                "512:8192:16:16",
+            )
+        ):
+            root = self.base / f"invalid-points-{index}"
+            result = self.run_parent(
+                root, self.env(root, GOLEM_SFU_CAPACITY_POINT_LIST=points)
+            )
+            self.assertEqual(result.returncode, 2, result.stderr)
+
+        old = self.base / "old-schema"
+        old.mkdir()
+        (old / "parent_schema").write_text("old\n", encoding="utf-8")
+        result = self.run_parent(old)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("schema", result.stderr)
+
+        locked = self.base / "locked"
+        locked.mkdir()
+        with (locked / ".capacity.lock").open("w") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            result = self.run_parent(locked)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("locked", result.stderr)
+
+    def fake_child_bin(self, outcome):
+        helper = self.base / f"fake_child_{outcome.lower()}.py"
+        helper.write_text(
+            "import importlib.util, os, pathlib, struct\n"
+            f"test_file = pathlib.Path({str(pathlib.Path(__file__).resolve())!r})\n"
+            "spec = importlib.util.spec_from_file_location('capacity_test_fixture', test_file)\n"
+            "module = importlib.util.module_from_spec(spec)\n"
+            "spec.loader.exec_module(module)\n"
+            "root = pathlib.Path(os.environ['GOLEM_SWEEP_ROOT'])\n"
+            "rows, dim, workers, bands = map(int, os.environ['GOLEM_SFU_DISTRIBUTED_POINT_LIST'].split(':'))\n"
+            "point = module.capacity.resolve_point(rows, dim, workers, bands)\n"
+            "phase_spec = module.capacity.to_phase4f_spec(point)\n"
+            f"outcome = {outcome!r}\n"
+            "if outcome == 'PASS':\n"
+            "    child = module.phase4f_test_support.SyntheticChild(root, phase_spec)\n"
+            "    zero = struct.pack('<f', 0.0)\n"
+            "    uniform = struct.pack('<f', 1.0 / point.dim)\n"
+            "    (root / 'inputs' / f'softmax_logits_{point.rows}x{point.dim}.bin').write_bytes(zero * (point.rows * point.dim))\n"
+            "    (root / 'outputs' / f'{child.run_id}.bin').write_bytes(uniform * (point.rows * point.dim))\n"
+            "else:\n"
+            "    (root / 'logs').mkdir(parents=True, exist_ok=True)\n"
+            "    (root / 'logs' / 'timeout.log').write_text('watchdog timeout\\n')\n",
+            encoding="utf-8",
+        )
+        fake_bin = self.base / f"fake-bin-{outcome.lower()}"
+        fake_bin.mkdir()
+        fake_bash = fake_bin / "bash"
+        exit_code = {"PASS": 0, "TIMEOUT": 124}[outcome]
+        fake_bash.write_text(
+            "#!/bin/sh\n"
+            "printf '%s|%s\\n' \"${GOLEM_SFU_DISTRIBUTED_POINT_LIST}\" \"${GOLEM_SWEEP_ROOT}\" >> \"${FAKE_CHILD_LOG}\"\n"
+            f"{sys.executable} {helper}\n"
+            "helper_rc=$?\n"
+            "[ \"${helper_rc}\" -eq 0 ] || exit \"${helper_rc}\"\n"
+            f"exit {exit_code}\n",
+            encoding="utf-8",
+        )
+        fake_bash.chmod(0o755)
+        return fake_bin
+
+    def test_watchdog_timeout_is_recorded_and_never_auto_retried(self):
+        root = self.base / "timeout"
+        child_log = self.base / "timeout-child.log"
+        env = self.env(
+            root,
+            GOLEM_SFU_CAPACITY_DRY_RUN="0",
+            GOLEM_SFU_CAPACITY_POINT_LIST="512:4096:16:16 1024:4096:16:16",
+            FAKE_CHILD_LOG=child_log,
+        )
+        env["PATH"] = f"{self.fake_child_bin('TIMEOUT')}:{env['PATH']}"
+        first = self.run_parent(root, env)
+        self.assertEqual(first.returncode, 124, first.stderr)
+        self.assertEqual(len(child_log.read_text().splitlines()), 1)
+        status = (root / "capacity_status.csv").read_text(encoding="utf-8")
+        self.assertIn("TIMEOUT,124", status)
+        self.assertIn("timeout.log", status)
+        marker = self.marker(root, capacity.DEFAULT_POINTS[0]).read_text(encoding="utf-8")
+        self.assertIn("state=TIMEOUT", marker)
+        self.assertIn("exit_code=124", marker)
+        self.assertIn("wall_time_sec=", marker)
+        self.assertIn("log_path=", marker)
+
+        second = self.run_parent(root, env)
+        self.assertEqual(second.returncode, 124, second.stderr)
+        self.assertEqual(len(child_log.read_text().splitlines()), 1)
+        self.assertIn("recorded TIMEOUT", second.stderr)
+
+    def test_dryrun_then_pass_uses_new_attempt_and_cached_pass_revalidates(self):
+        point = capacity.DEFAULT_POINTS[0]
+        root = self.base / "resume"
+        dry_env = self.env(
+            root, GOLEM_SFU_CAPACITY_POINT_LIST="512:4096:16:16"
+        )
+        dry = self.run_parent(root, dry_env)
+        self.assertEqual(dry.returncode, 0, dry.stderr)
+        self.assertTrue(self.attempt(root, point, 1).is_dir())
+
+        child_log = self.base / "pass-child.log"
+        real_env = self.env(
+            root,
+            GOLEM_SFU_CAPACITY_DRY_RUN="0",
+            GOLEM_SFU_CAPACITY_POINT_LIST="512:4096:16:16",
+            FAKE_CHILD_LOG=child_log,
+        )
+        real_env["PATH"] = f"{self.fake_child_bin('PASS')}:{real_env['PATH']}"
+        passed = self.run_parent(root, real_env)
+        self.assertEqual(passed.returncode, 0, passed.stderr)
+        self.assertTrue(self.attempt(root, point, 2).is_dir())
+        self.assertEqual(len(child_log.read_text().splitlines()), 1)
+
+        cached = self.run_parent(root, real_env)
+        self.assertEqual(cached.returncode, 0, cached.stderr)
+        self.assertIn("validated cached PASS", cached.stdout)
+        self.assertEqual(len(child_log.read_text().splitlines()), 1)
 
 
 if __name__ == "__main__":
