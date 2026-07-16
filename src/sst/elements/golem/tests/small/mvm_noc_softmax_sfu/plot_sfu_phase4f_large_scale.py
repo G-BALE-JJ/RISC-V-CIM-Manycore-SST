@@ -1215,6 +1215,7 @@ def render_figure(records: list[PointRecord], output_prefix: pathlib.Path) -> No
     latency_ax.plot([r.spec.dim for r in dimension], [r.latency_avg_cycles for r in dimension],
                     marker="s", linewidth=1.8, color="#C2410C", label="Avg. reduction latency")
     latency_ax.set_ylabel("Reduction latency (cycles)", color="#C2410C")
+    latency_ax.ticklabel_format(axis="y", style="plain", useOffset=False)
 
     ax = axes[0, 1]
     ax.set_title("Worker scaling (4-worker baseline)")
@@ -1491,6 +1492,10 @@ def _validate_marker_signature(
 
 
 def _validate_child_attempt(root: pathlib.Path, spec: PointSpec, value: str) -> pathlib.Path:
+    try:
+        root = pathlib.Path(root).resolve(strict=True)
+    except OSError as exc:
+        raise ValueError(f"root={root}: cannot resolve report root: {exc}") from exc
     children = root / "children"
     identity = children / (
         f"stage_{spec.stage}_r{spec.rows}_d{spec.dim}_"

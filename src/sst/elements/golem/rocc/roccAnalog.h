@@ -61,6 +61,7 @@ constexpr uint8_t GOLEM_ROCC_FUNC7_SFU_PRIMITIVE = 0x19;
 constexpr uint8_t GOLEM_ROCC_FUNC7_SFU_PRIMITIVE_WAIT = 0x1a;
 constexpr uint8_t GOLEM_ROCC_FUNC7_SFU_PRIMITIVE_BATCH = 0x1b;
 constexpr uint8_t GOLEM_ROCC_FUNC7_SFU_PRIMITIVE_BATCH_WAIT = 0x1c;
+constexpr uint8_t GOLEM_ROCC_FUNC7_SFU_JOB = 0x1d;
 
 template <typename T>
 class RoCCAnalog : public SST::Vanadis::VanadisRoCCInterface {
@@ -563,6 +564,13 @@ public:
             if (next_cmd != nullptr && next_cmd->inst != nullptr && next_cmd->inst->func7 == GOLEM_ROCC_FUNC7_SFU_PRIMITIVE_BATCH_WAIT) {
                 roccCmd_q.pop_front();
                 if (!tryWaitSfuPrimitiveBatchCommand(next_cmd)) {
+                    roccCmd_q.push_front(next_cmd);
+                }
+                return;
+            }
+            if (next_cmd != nullptr && next_cmd->inst != nullptr && next_cmd->inst->func7 == GOLEM_ROCC_FUNC7_SFU_JOB) {
+                roccCmd_q.pop_front();
+                if (!tryIssueSfuJobCommand(next_cmd)) {
                     roccCmd_q.push_front(next_cmd);
                 }
                 return;
@@ -1088,6 +1096,25 @@ public:
 
     bool tryWaitSfuPrimitiveBatchCommand(SST::Vanadis::RoCCCommand* cmd) {
         return tryWaitSfuCommand(cmd);
+    }
+
+    bool tryIssueSfuJobCommand(SST::Vanadis::RoCCCommand* cmd) {
+        if (cmd == nullptr || cmd->inst == nullptr) {
+            return true;
+        }
+        if (sfu == nullptr) {
+            enqueueResponse(new SST::Vanadis::RoCCResponse(
+                cmd->inst->rd, 1, cmd->cmd_id, cmd->hw_thread));
+            delete cmd;
+            return true;
+        }
+        if (!sfu->issueJob(cmd->rs1, cmd->rs2)) {
+            return false;
+        }
+        enqueueResponse(new SST::Vanadis::RoCCResponse(
+            cmd->inst->rd, 0, cmd->cmd_id, cmd->hw_thread));
+        delete cmd;
+        return true;
     }
 
     bool isArrayComputeInflight(uint32_t array_id) const {

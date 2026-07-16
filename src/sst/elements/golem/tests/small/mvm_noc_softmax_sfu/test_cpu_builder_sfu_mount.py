@@ -58,6 +58,9 @@ class CpuBuilderSfuMountTest(unittest.TestCase):
         self.assertIn('gm_params["reduction_vn"] = sfu_reduction_vn', self.text)
         self.assertNotIn('"reduction_vn": sfu_reduction_vn', self.text)
 
+    def test_enables_global_memory_statistics_when_full_stats_are_requested(self):
+        self.assertIn("if enable_all_stats:\n                GlobalMemory.enableAllStatistics()", self.text)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -94,6 +94,14 @@ void write_sfu_desc_to_gm(int core_id, uint64_t desc_gm_addr, const SFUSoftmaxTi
     }
 }
 
+void write_sfu_job_desc_to_gm(int core_id, uint64_t desc_gm_addr, const SFUJobDesc& desc) {
+    const uint64_t* words = reinterpret_cast<const uint64_t*>(&desc);
+    constexpr size_t kWords = sizeof(SFUJobDesc) / sizeof(uint64_t);
+    for (size_t i = 0; i < kWords; ++i) {
+        reg2gm(words[i], desc_gm_addr + static_cast<uint64_t>(i) * sizeof(uint64_t));
+    }
+}
+
 int task_id_for_tile(int n_tiles, int m_tile, int n_tile) {
     return m_tile * n_tiles + n_tile;
 }
@@ -295,6 +303,59 @@ extern "C" golem_status_t golemRunStandaloneSoftmaxSfuForCore(
     const MatmulRuntimeConfig* cfg,
     uint64_t job_id) {
     return golemRunSoftmaxSfuForCore(op_desc, executor_core_id, worker_core_id, cfg, job_id);
+}
+
+extern "C" golem_status_t golemRunStandaloneSoftmaxSfuJobForCore(
+    const golem_softmax_op_desc_t* op_desc,
+    int executor_core_id,
+    const MatmulRuntimeConfig* cfg,
+    uint64_t input_gm,
+    uint64_t output_gm,
+    uint64_t desc_gm,
+    uint32_t chunk_elems,
+    uint32_t worker_cores,
+    uint32_t worker_slot,
+    uint32_t owner_core,
+    uint32_t flags,
+    uint64_t job_id,
+    uint64_t tag) {
+    const golem_status_t status =
+        validate_sfu_softmax_request(op_desc, executor_core_id, executor_core_id, cfg);
+    if (status != GOLEM_STATUS_OK) {
+        return status;
+    }
+    if (input_gm == 0 || output_gm == 0 || desc_gm == 0 || chunk_elems == 0 ||
+        worker_cores == 0 || worker_slot >= worker_cores) {
+        set_sfu_softmax_last_error("softmax SFU job helper received invalid GM addresses or config");
+        return GOLEM_STATUS_INVALID_ARGUMENT;
+    }
+
+    SFUJobDesc desc = {};
+    desc.job_id = job_id;
+    desc.input0_addr = input_gm;
+    desc.output_addr = output_gm;
+    desc.op_type = static_cast<uint32_t>(SFUJobOp::SOFTMAX_ROW);
+    desc.sub_op = static_cast<uint32_t>(SFUJobSubOp::NONE);
+    desc.dtype = static_cast<uint32_t>(GOLEM_DTYPE_FP32);
+    desc.layout = static_cast<uint32_t>(GOLEM_LAYOUT_ROW_MAJOR);
+    desc.rows = static_cast<uint32_t>(op_desc->outer);
+    desc.cols = static_cast<uint32_t>(op_desc->dim);
+    desc.elem_count = static_cast<uint32_t>(op_desc->outer * op_desc->dim);
+    desc.chunk_elems = chunk_elems;
+    desc.worker_cores = worker_cores;
+    desc.owner_core = owner_core;
+    desc.flags = flags;
+    desc.reserved0 = worker_slot;
+
+    write_sfu_job_desc_to_gm(executor_core_id, desc_gm, desc);
+    sfu_job(desc_gm, tag);
+    const uint64_t sfu_status = sfu_job_wait(tag);
+    if (sfu_status != SFU_STATUS_SUCCESS) {
+        set_sfu_softmax_last_error("softmax SFU job wait failed with status=%llu",
+                                   static_cast<unsigned long long>(sfu_status));
+        return GOLEM_STATUS_RUNTIME_ERROR;
+    }
+    return GOLEM_STATUS_OK;
 }
 
 extern "C" const char* golemSoftmaxSfuGetLastErrorString(void) {

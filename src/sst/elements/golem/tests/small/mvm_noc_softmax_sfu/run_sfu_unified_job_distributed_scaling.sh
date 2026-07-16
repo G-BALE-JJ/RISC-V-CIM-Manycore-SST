@@ -6,8 +6,14 @@ TESTS_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 STAMP="${GOLEM_SWEEP_STAMP:-$(date +%Y%m%d_%H%M%S_%N)_$$}"
 SWEEP_ROOT="${GOLEM_SWEEP_ROOT:-$TESTS_DIR/artifacts/sweeps/sfu_unified_job_distributed_scaling_$STAMP}"
-mkdir -p "$SWEEP_ROOT" "$SWEEP_ROOT/completed" "$SWEEP_ROOT/inputs" "$SWEEP_ROOT/outputs"
+mkdir -p "$SWEEP_ROOT"
 SWEEP_ROOT="$(cd "$SWEEP_ROOT" && pwd)"
+exec 9>"$SWEEP_ROOT/.sweep.lock"
+if ! flock -n 9; then
+	echo "[SFU-DISTRIBUTED-SCALING][ERROR] sweep root is locked: $SWEEP_ROOT" >&2
+	exit 2
+fi
+mkdir -p "$SWEEP_ROOT/completed" "$SWEEP_ROOT/inputs" "$SWEEP_ROOT/outputs"
 MANIFEST="$SWEEP_ROOT/sweep_manifest.csv"
 
 ROWS="${GOLEM_SFU_DISTRIBUTED_ROWS:-16}"
@@ -17,6 +23,23 @@ CHUNK_ELEMS="${GOLEM_SFU_DISTRIBUTED_CHUNK_ELEMS:-256}"
 RETRY_TICKS="${GOLEM_SFU_DISTRIBUTED_RETRY_TICKS:-1024}"
 MAX_RETRIES="${GOLEM_SFU_DISTRIBUTED_MAX_RETRIES:-8}"
 REDUCTION_TRANSPORT="${GOLEM_SFU_DISTRIBUTED_REDUCTION_TRANSPORT:-modeled_noc}"
+VN_SWEEP="${GOLEM_SFU_VN_SWEEP:-0}"
+REDUCTION_VN="${GOLEM_SFU_REDUCTION_VN:-0}"
+NUM_VNS=3
+DMA_RESPONSE_VN=0
+
+if [[ "$VN_SWEEP" != "0" && "$VN_SWEEP" != "1" ]]; then
+	echo "[SFU-DISTRIBUTED-SCALING][ERROR] GOLEM_SFU_VN_SWEEP must be 0 or 1; got '$VN_SWEEP'" >&2
+	exit 2
+fi
+case "$REDUCTION_VN" in
+	0|1|2)
+		;;
+	*)
+		echo "[SFU-DISTRIBUTED-SCALING][ERROR] invalid reduction VN '$REDUCTION_VN'; expected 0, 1, or 2" >&2
+		exit 2
+		;;
+esac
 
 case "$REDUCTION_TRANSPORT" in
 	modeled_noc|noc_model|noc|explicit_noc)
@@ -27,8 +50,26 @@ case "$REDUCTION_TRANSPORT" in
 		;;
 esac
 
+if [[ "$VN_SWEEP" == "1" ]]; then
+	if [[ "$REDUCTION_TRANSPORT" != "explicit_noc" ]]; then
+		echo "[SFU-DISTRIBUTED-SCALING][ERROR] VN sweep requires exact explicit_noc reduction transport; got '$REDUCTION_TRANSPORT'" >&2
+		exit 2
+	fi
+	if [[ -n "${GOLEM_DMA_RESPONSE_VN+x}" && "$GOLEM_DMA_RESPONSE_VN" != "0" ]]; then
+		echo "[SFU-DISTRIBUTED-SCALING][ERROR] VN sweep requires GOLEM_DMA_RESPONSE_VN=0; got '$GOLEM_DMA_RESPONSE_VN'" >&2
+		exit 2
+	fi
+fi
+
+MANIFEST_HEADER="run_id,rows,dim,chunk_elems,worker_cores,band_cores,cooperative_groups,reduction_vn,num_vns,dma_response_vn,staging_rows,job_rows,retry_ticks,max_retries,status,exit_code,timeout_sec,artifact_validation"
 if [[ ! -f "$MANIFEST" ]]; then
-	printf "run_id,rows,dim,chunk_elems,worker_cores,band_cores,cooperative_groups,staging_rows,job_rows,retry_ticks,max_retries,status,exit_code,timeout_sec,artifact_validation\n" > "$MANIFEST"
+	printf "%s\n" "$MANIFEST_HEADER" > "$MANIFEST"
+else
+	IFS= read -r existing_manifest_header < "$MANIFEST" || existing_manifest_header=""
+	if [[ "$existing_manifest_header" != "$MANIFEST_HEADER" ]]; then
+		echo "[SFU-DISTRIBUTED-SCALING][ERROR] manifest header mismatch in $MANIFEST" >&2
+		exit 2
+	fi
 fi
 
 pipeline_args=()
@@ -56,9 +97,10 @@ record_manifest() {
 	local exit_code="$8"
 	local timeout_sec="$9"
 	local artifact_validation="${10}"
-	printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n" \
+	printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n" \
 		"$run_id" "$rows" "$dim" "$CHUNK_ELEMS" "$worker_cores" "$band_cores" \
-		"$cooperative_groups" "$STAGING_ROWS" "$JOB_ROWS" "$RETRY_TICKS" \
+		"$cooperative_groups" "$REDUCTION_VN" "$NUM_VNS" "$DMA_RESPONSE_VN" \
+		"$STAGING_ROWS" "$JOB_ROWS" "$RETRY_TICKS" \
 		"$MAX_RETRIES" "$status" "$exit_code" "$timeout_sec" "$artifact_validation" \
 		>> "$MANIFEST"
 }
@@ -101,10 +143,11 @@ point_signature() {
 		printf "%s\0" "${#pipeline_args[@]}"
 		printf "%s\0" "${pipeline_args[@]}"
 	} | sha256sum | awk '{ print $1 }')" || return 1
-	printf "rows=%s;dim=%s;chunk=%s;workers=%s;band=%s;staging=%s;job=%s;retry=%s;max_retries=%s;reduction_transport=%s;pipeline_args_sha256=%s" \
+	printf "rows=%s;dim=%s;chunk=%s;workers=%s;band=%s;staging=%s;job=%s;retry=%s;max_retries=%s;reduction_transport=%s;reduction_vn=%s;num_vns=%s;dma_response_vn=%s;pipeline_args_sha256=%s" \
 		"$rows" "$dim" "$CHUNK_ELEMS" "$worker_cores" "$band_cores" \
 		"$STAGING_ROWS" "$JOB_ROWS" "$RETRY_TICKS" "$MAX_RETRIES" \
-		"$REDUCTION_TRANSPORT" "$pipeline_args_sha256"
+		"$REDUCTION_TRANSPORT" "$REDUCTION_VN" "$NUM_VNS" "$DMA_RESPONSE_VN" \
+		"$pipeline_args_sha256"
 }
 
 marker_value() {
@@ -123,6 +166,29 @@ marker_value() {
 file_sha256() {
 	local file="$1"
 	sha256sum "$file" | awk '{ print $1 }'
+}
+
+validate_runtime_vn_mapping() {
+	local run_id="$1"
+	local log_file
+	local expected_gm_mapping="GlobalMemory VN mapping: request_vn=0 response_vn=1 reduction_vn=$REDUCTION_VN (num_vns=3)"
+	log_file="$(find "$SWEEP_ROOT/logs" -maxdepth 1 -type f -name "*${run_id}*.log" -print -quit 2>/dev/null)"
+	if [[ -z "$log_file" ]]; then
+		echo "[SFU-DISTRIBUTED-SCALING][ERROR] missing SST log for VN validation: $run_id" >&2
+		return 1
+	fi
+	if ! rg -F -q "$expected_gm_mapping" "$log_file"; then
+		echo "[SFU-DISTRIBUTED-SCALING][ERROR] resolved GlobalMemory VN mapping mismatch for $run_id" >&2
+		return 1
+	fi
+	if ! rg -q "resolved golem_dma_response_vn=0 num_vns=3" "$log_file"; then
+		echo "[SFU-DISTRIBUTED-SCALING][ERROR] resolved MemNIC DMA response VN mismatch for $run_id" >&2
+		return 1
+	fi
+	if ! rg -q "TRACE_REQ_RESP_CHUNK_SEND.*vn=0" "$log_file"; then
+		echo "[SFU-DISTRIBUTED-SCALING][ERROR] missing DMA completion trace evidence with vn=0 for $run_id" >&2
+		return 1
+	fi
 }
 
 validate_point_artifacts() {
@@ -145,6 +211,9 @@ validate_point_artifacts() {
 	local output_bytes
 	output_bytes="$(stat -c %s "$output_file")" || return 1
 	require_equal "output tensor bytes" "$output_bytes" "$((rows * dim * 4))" || return 1
+	if [[ "$VN_SWEEP" == "1" ]]; then
+		validate_runtime_vn_mapping "$run_id" || return 1
+	fi
 
 	local pass_count=0
 	local file
@@ -216,11 +285,16 @@ validate_point_artifacts() {
 			transport_queued="$(sfu_stat_sum "$stats_file" gmem_reduction_send_queued)" || return 1
 			transport_rejected="$(sfu_stat_sum "$stats_file" gmem_reduction_send_rejected)" || return 1
 			gmem_delivery_count="$(sfu_stat_sum "$stats_file" gmem_reduction_received)" || return 1
+			echo "[SFU-DISTRIBUTED-SCALING] transport immediate=$transport_immediate queued=$transport_queued rejected=$transport_rejected received=$gmem_delivery_count"
 			actual=$(( transport_immediate + transport_queued ))
 			require_equal "GlobalMemory reduction transport sends" "$actual" "$expected_transport_events" || return 1
 			require_equal "GlobalMemory reduction transport rejected sends" "$transport_rejected" 0 || return 1
 			require_equal "GlobalMemory reduction transport receives" "$gmem_delivery_count" "$expected_transport_events" || return 1
 		else
+			if [[ "$VN_SWEEP" == "1" ]]; then
+				echo "[SFU-DISTRIBUTED-SCALING][ERROR] GlobalMemory reduction transport stats unavailable for VN sweep" >&2
+				return 1
+			fi
 			echo "[SFU-DISTRIBUTED-SCALING][INFO] GlobalMemory reduction transport stats unavailable; SFU receive gate remains authoritative" >&2
 		fi
 	fi
@@ -288,7 +362,11 @@ run_point() {
 	local worker_cores="$3"
 	local band_cores="$4"
 	local cooperative_groups=$(( band_cores / worker_cores ))
-	local run_id="sfu_job_dist_r${rows}_d${dim}_w${worker_cores}_bc${band_cores}_g${cooperative_groups}"
+	local vn_suffix=""
+	if [[ "$VN_SWEEP" == "1" ]]; then
+		vn_suffix="_vn${REDUCTION_VN}"
+	fi
+	local run_id="sfu_job_dist_r${rows}_d${dim}_w${worker_cores}_bc${band_cores}_g${cooperative_groups}${vn_suffix}"
 	local timeout_sec
 	timeout_sec="$(timeout_for_dim "$dim")"
 	local marker="$SWEEP_ROOT/completed/${run_id}.pass"
@@ -334,6 +412,11 @@ run_point() {
 		GOLEM_SFU_JOB_SOFTMAX_DIRECT_ROWMAJOR_HBM=1 \
 		GOLEM_SFU_JOB_SOFTMAX_DISTRIBUTED_COLUMNS=1 \
 		GOLEM_SFU_DISTRIBUTED_REDUCTION_TRANSPORT="$REDUCTION_TRANSPORT" \
+		GOLEM_SFU_REDUCTION_VN="$REDUCTION_VN" \
+		GOLEM_DMA_RESPONSE_VN=0 \
+		GOLEM_GM_VERBOSE=2 \
+		GOLEM_DMA_TRACE=1 \
+		GOLEM_BENCH_QUIET_LOGS=0 \
 		GOLEM_SFU_JOB_SOFTMAX_STAGING_ROWS="$STAGING_ROWS" \
 		GOLEM_SFU_JOB_SOFTMAX_JOB_ROWS="$JOB_ROWS" \
 		GOLEM_SFU_JOB_SOFTMAX_BAND_CORES="$band_cores" \

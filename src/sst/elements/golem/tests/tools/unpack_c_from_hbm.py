@@ -53,6 +53,9 @@ def main(argv=None):
     block_k = int(os.getenv("GOLEM_MATMUL_BLOCK_K", str(array_input_size)))
     dtype = normalize_dtype(os.getenv("GOLEM_MATMUL_DTYPE", "int32"))
     out_layout = os.getenv("GOLEM_GEMM_OUT_LAYOUT", "rowmajor").strip().lower()
+    direct_rowmajor_softmax = (
+        int(os.getenv("GOLEM_SFU_JOB_SOFTMAX_DIRECT_ROWMAJOR_HBM", "0")) != 0
+    )
 
     num_memory_nodes = int(os.getenv("GOLEM_NUM_MEMORY_NODES", "4"))
     total_groups = int(os.getenv("GOLEM_TOTAL_GROUPS", "4"))
@@ -154,6 +157,14 @@ def main(argv=None):
     )
     out_tile_bytes = block_m * block_n * elem_bytes
     out_tile_stride = align_up(out_tile_bytes, mm_align)
+    gemm_data_region_end = (
+        off_gemm_out_base + max_macro_tasks_per_data_node * out_reuse_slots * out_tile_stride
+    )
+    rowmajor_matrix_bytes = m * n * elem_bytes
+    off_sfu_softmax_rowmajor_base = align_up(gemm_data_region_end, mm_align)
+    off_sfu_softmax_rowmajor_out_base = (
+        off_sfu_softmax_rowmajor_base + align_up(rowmajor_matrix_bytes, mm_align)
+    )
 
     node_buffers = {}
     for node_idx in data_nodes:
@@ -186,30 +197,45 @@ def main(argv=None):
 
     c = [[cast_scalar(dtype, 0) for _ in range(n)] for _ in range(m)]
 
-    for task_id in range(total_tasks):
-        m_tile = task_id // n_tiles
-        n_tile = task_id % n_tiles
-        m_group = m_tile // b_reuse_m_tiles
-        n_group = n_tile // a_reuse_n_tiles
-        m_offset = m_tile % b_reuse_m_tiles
-        n_offset = n_tile % a_reuse_n_tiles
-        macro_task_id = macro_task_for_group(m_group, n_group)
-        reuse_offset = m_offset * vec_reuse_slots + n_offset
-        node_idx = data_node_for_task(macro_task_id)
-        slot = task_slot_in_node(macro_task_id)
-        tile_off = off_gemm_out_base + (slot * out_reuse_slots + reuse_offset) * out_tile_stride
-
+    if direct_rowmajor_softmax:
+        if not data_nodes:
+            raise ValueError("direct row-major softmax unpack requires at least one data node")
+        node_idx = data_nodes[0]
         node_data = node_buffers[node_idx]
-        tile_raw = node_data[tile_off : tile_off + out_tile_bytes]
-        vals = unpack_values(dtype, tile_raw)
+        raw = node_data[
+            off_sfu_softmax_rowmajor_out_base :
+            off_sfu_softmax_rowmajor_out_base + rowmajor_matrix_bytes
+        ]
+        vals = unpack_values(dtype, raw)
+        for r in range(m):
+            row_base = r * n
+            for cc in range(n):
+                c[r][cc] = vals[row_base + cc]
+    else:
+        for task_id in range(total_tasks):
+            m_tile = task_id // n_tiles
+            n_tile = task_id % n_tiles
+            m_group = m_tile // b_reuse_m_tiles
+            n_group = n_tile // a_reuse_n_tiles
+            m_offset = m_tile % b_reuse_m_tiles
+            n_offset = n_tile % a_reuse_n_tiles
+            macro_task_id = macro_task_for_group(m_group, n_group)
+            reuse_offset = m_offset * vec_reuse_slots + n_offset
+            node_idx = data_node_for_task(macro_task_id)
+            slot = task_slot_in_node(macro_task_id)
+            tile_off = off_gemm_out_base + (slot * out_reuse_slots + reuse_offset) * out_tile_stride
 
-        for r in range(block_m):
-            for cc in range(block_n):
-                if out_layout in {"colmajor", "colmajor_tile", "columnmajor"}:
-                    value = vals[cc * block_m + r]
-                else:
-                    value = vals[r * block_n + cc]
-                c[m_tile * block_m + r][n_tile * block_n + cc] = value
+            node_data = node_buffers[node_idx]
+            tile_raw = node_data[tile_off : tile_off + out_tile_bytes]
+            vals = unpack_values(dtype, tile_raw)
+
+            for r in range(block_m):
+                for cc in range(block_n):
+                    if out_layout in {"colmajor", "colmajor_tile", "columnmajor"}:
+                        value = vals[cc * block_m + r]
+                    else:
+                        value = vals[r * block_n + cc]
+                    c[m_tile * block_m + r][n_tile * block_n + cc] = value
 
     out_file = args.out_file
     os.makedirs(os.path.dirname(os.path.abspath(out_file)), exist_ok=True)
@@ -224,7 +250,7 @@ def main(argv=None):
 
     print(f"[UNPACK] wrote C tensor to: {out_file}")
     print(
-        f"[UNPACK] shape=({m},{n}), block=({block_m},{block_n},{block_k}), dtype={dtype}, layout={out_layout}, tasks={total_tasks}, macro_tasks={total_macro_tasks}, a_reuse_n={a_reuse_n_tiles}, b_reuse_m={b_reuse_m_tiles}"
+        f"[UNPACK] shape=({m},{n}), block=({block_m},{block_n},{block_k}), dtype={dtype}, layout={out_layout}, direct_rowmajor_softmax={int(direct_rowmajor_softmax)}, tasks={total_tasks}, macro_tasks={total_macro_tasks}, a_reuse_n={a_reuse_n_tiles}, b_reuse_m={b_reuse_m_tiles}"
     )
 
 

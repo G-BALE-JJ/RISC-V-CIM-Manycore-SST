@@ -50,6 +50,7 @@ class MemNICBase : public MemLinkBase {
         { "sources",                     "(comma-separated list of ints) List of group IDs that serve as sources for this component. If not specified, defaults to 'group - 1'.", "group-1"},\
         { "destinations",                "(comma-separated list of ints) List of group IDs that serve as destinations for this component. If not specified, defaults to 'group + 1'.", "group+1"},\
         { "range_check",                 "(int) Enable initial check for overlapping memory ranges. 0=Disabled 1=Enabled", "1"},\
+        { "golem_dma_response_vn",       "(int) VN for Golem DMA completion responses. If unset, derives VN1 when num_vns >= 2, otherwise VN0.", ""},\
         { "golem_dma_response_drain_limit", "(int) Max queued Golem DMA responses drained per opportunity. 0 means unlimited.", "0"}
 
         SST_ELI_REGISTER_SUBCOMPONENT_DERIVED_API(SST::MemHierarchy::MemNICBase, SST::MemHierarchy::MemLinkBase)
@@ -837,9 +838,28 @@ class MemNICBase : public MemLinkBase {
             // range_check current is off(0) or on(1) but is using a uint32_t to 
             // allow for future selection of different algorithms.
             range_check=params.find<uint32_t>("range_check", 1);
-            golem_dma_response_vn=params.find<uint32_t>("num_vns", 1) >= 2 ? 1 : 0;
+            const uint32_t num_vns = params.find<uint32_t>("num_vns", 1);
+            bool golem_dma_response_vn_found = false;
+            golem_dma_response_vn = params.find<uint32_t>(
+                "golem_dma_response_vn", 0, golem_dma_response_vn_found);
+            if (!golem_dma_response_vn_found) {
+                golem_dma_response_vn = num_vns >= 2 ? 1 : 0;
+            }
+            if (golem_dma_response_vn >= num_vns) {
+                dbg.fatal(CALL_INFO, -1,
+                        "%s invalid golem_dma_response_vn=%" PRIu32
+                        "; value must be less than num_vns=%" PRIu32 ".\n",
+                        getName().c_str(), golem_dma_response_vn, num_vns);
+            }
             golem_dma_trace=params.find<uint32_t>("golem_dma_trace", envFlagDefault("GOLEM_DMA_TRACE", 0));
             golem_dma_response_drain_limit=params.find<size_t>("golem_dma_response_drain_limit", 0);
+            if (golem_dma_trace) {
+                fprintf(stderr,
+                        "[memNICBase bridge] resolved golem_dma_response_vn=%" PRIu32
+                        " num_vns=%" PRIu32 " explicit=%u\n",
+                        golem_dma_response_vn, num_vns,
+                        golem_dma_response_vn_found ? 1U : 0U);
+            }
 
             std::stringstream sources, destinations;
             uint32_t id;

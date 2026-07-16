@@ -1309,6 +1309,18 @@ class Phase4FReportTest(unittest.TestCase):
             marker.write_text(self.marker_text(record), encoding="utf-8")
         return experiment, records
 
+    def test_child_attempt_validation_normalizes_relative_report_root(self):
+        experiment, records = self.build_report_experiment("relative-root")
+        relative_root = pathlib.Path(os.path.relpath(experiment, pathlib.Path.cwd()))
+
+        child = phase4f._validate_child_attempt(
+            relative_root,
+            records[0].spec,
+            records[0].child_root,
+        )
+
+        self.assertEqual(child, pathlib.Path(records[0].child_root))
+
     def test_complete_matrix_and_lifecycle_gates(self):
         phase4f.validate_complete_matrix(self.records)
         invalid = (
@@ -1407,6 +1419,18 @@ class Phase4FReportTest(unittest.TestCase):
         with Image.open(prefix_a.with_suffix(".png")) as image:
             self.assertAlmostEqual(image.width / image.height, 16 / 9, places=2)
             self.assertAlmostEqual(image.info["dpi"][0], 300, delta=1)
+
+    def test_dimension_latency_axis_does_not_use_offset_notation(self):
+        records = [
+            dataclasses.replace(record, latency_avg_cycles=15580.0 + index)
+            for index, record in enumerate(self.records)
+        ]
+        prefix = self.root / "latency-axis"
+
+        phase4f.render_figure(records, prefix)
+
+        svg = prefix.with_suffix(".svg").read_text(encoding="utf-8")
+        self.assertNotIn("+1.558e4", svg)
 
     def test_qa_distinguishes_measurement_derived_and_unavailable(self):
         outcomes = self.records[:-1] + [self.failure(self.records[-1])]

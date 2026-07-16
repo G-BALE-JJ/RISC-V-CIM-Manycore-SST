@@ -1,17 +1,84 @@
 #!/usr/bin/env python3
 
+import ast
 import os
 import subprocess
 import unittest
 
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+ARCH_SHIM = os.path.abspath(
+    os.path.join(
+        SCRIPT_DIR,
+        "..",
+        "mvm_noc_softmax_cpu",
+        "ncores_selfcom_dma_softmax_archive.py",
+    )
+)
+BASE_ARCHIVE = os.path.abspath(
+    os.path.join(SCRIPT_DIR, "..", "..", "architecture", "archive", "ncores_selfcom_dma.py")
+)
 
 
 class SfuSoftmaxPipelineWrapperTest(unittest.TestCase):
     def read_wrapper(self):
         with open(os.path.join(SCRIPT_DIR, "run_noc_dma_softmax_sfu_pipeline.sh"), "r", encoding="utf-8") as source_file:
             return source_file.read()
+
+    def read_archive_shim(self):
+        with open(ARCH_SHIM, "r", encoding="utf-8") as source_file:
+            return source_file.read()
+
+    def test_archive_shim_keeps_three_vns_and_pins_dma_responses_to_vn0(self):
+        source = self.read_archive_shim()
+
+        self.assertIn("'\"num_vns\": 3,\\n'", source)
+        self.assertIn(
+            "os.getenv(\"GOLEM_DMA_RESPONSE_VN\", \"1\")",
+            source,
+        )
+        self.assertIn("'            \"golem_dma_response_vn\": \"0\",'", source)
+        self.assertNotIn('"num_vns": 1,\\n', source)
+
+    def test_archive_shim_requires_exactly_one_directory_memnic_fragment(self):
+        source = self.read_archive_shim()
+
+        self.assertIn("directory_memnic_fragment", source)
+        self.assertIn(
+            "directory_memnic_fragment_count = source.count(directory_memnic_fragment)",
+            source,
+        )
+        self.assertIn("if directory_memnic_fragment_count != 1", source)
+        self.assertIn("raise RuntimeError", source)
+
+        tree = ast.parse(source)
+        fragment = None
+        for node in tree.body:
+            if not isinstance(node, ast.Assign):
+                continue
+            if any(
+                isinstance(target, ast.Name)
+                and target.id == "directory_memnic_fragment"
+                for target in node.targets
+            ):
+                fragment = ast.literal_eval(node.value)
+                break
+        self.assertIsNotNone(fragment)
+        with open(BASE_ARCHIVE, "r", encoding="utf-8") as source_file:
+            archive_source = source_file.read()
+        self.assertEqual(archive_source.count(fragment), 1)
+
+    def test_archive_shim_reports_effective_global_memory_buffer(self):
+        source = self.read_archive_shim()
+
+        self.assertIn(
+            'gm_buffer_length = os.getenv("GOLEM_GM_BUFFER_LENGTH", "64KB")',
+            source,
+        )
+        self.assertIn(
+            'print(f"[GOLEM] GlobalMemory link buffer_length={gm_buffer_length}")',
+            source,
+        )
 
     def run_wrapper(self, *args):
         env = os.environ.copy()

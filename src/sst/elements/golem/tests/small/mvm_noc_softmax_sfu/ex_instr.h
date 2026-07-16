@@ -8,6 +8,7 @@ static constexpr uint32_t GOLEM_ROCC_FUNC7_SFU_PRIMITIVE = 0x19;
 static constexpr uint32_t GOLEM_ROCC_FUNC7_SFU_PRIMITIVE_WAIT = 0x1a;
 static constexpr uint32_t GOLEM_ROCC_FUNC7_SFU_PRIMITIVE_BATCH = 0x1b;
 static constexpr uint32_t GOLEM_ROCC_FUNC7_SFU_PRIMITIVE_BATCH_WAIT = 0x1c;
+static constexpr uint32_t GOLEM_ROCC_FUNC7_SFU_JOB = 0x1d;
 
 static inline void sfu_softmax_tile(uint64_t desc_gm_addr, uint64_t tag) {
     asm volatile(
@@ -61,4 +62,16 @@ static inline uint64_t sfu_primitive_batch_wait(uint64_t tag) {
         : "r"(tag), "i"(GOLEM_ROCC_FUNC7_SFU_PRIMITIVE_BATCH_WAIT)
         : "memory");
     return status;
+}
+
+static inline void sfu_job(uint64_t desc_gm_addr, uint64_t tag) {
+    asm volatile(
+        ".insn r 0x0b, 7, %2, x0, %0, %1"
+        :
+        : "r"(desc_gm_addr), "r"(tag), "i"(GOLEM_ROCC_FUNC7_SFU_JOB)
+        : "memory");
+}
+
+static inline uint64_t sfu_job_wait(uint64_t tag) {
+    return sfu_wait(tag);
 }

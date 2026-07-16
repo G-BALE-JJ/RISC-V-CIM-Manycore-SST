@@ -33,6 +33,9 @@ TESTS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ARTIFACT_ROOT = os.getenv("GOLEM_ARTIFACT_ROOT", os.path.join(TESTS_DIR, "artifacts"))
 HBM_DIR = os.getenv("GOLEM_HBM_DIR", os.path.join(ARTIFACT_ROOT, "hbm"))
 SFU_STANDALONE_SOFTMAX = int(os.getenv("GOLEM_SFU_STANDALONE_SOFTMAX", "0")) != 0
+SFU_JOB_SOFTMAX_DIRECT_ROWMAJOR_HBM = (
+    int(os.getenv("GOLEM_SFU_JOB_SOFTMAX_DIRECT_ROWMAJOR_HBM", "0")) != 0
+)
 SFU_PRIMITIVE_HBM_STREAM = int(os.getenv("GOLEM_SFU_PRIMITIVE_HBM_STREAM", "0")) != 0
 SFU_PRIMITIVE_HBM_OPS = os.getenv("GOLEM_SFU_PRIMITIVE_HBM_OPS", "EXP")
 SFU_PRIMITIVE_HBM_ELEMS = max(1, int(os.getenv("GOLEM_SFU_PRIMITIVE_HBM_ELEMS", "64")))
@@ -230,11 +233,21 @@ OFF_GEMM_OUT_BASE = (
 )
 GEMM_BIAS_STRIDE_MM = _align_up(GEMM_N * elem_nbytes(MATMUL_DTYPE), MM_ALIGN)
 GEMM_DATA_REGION_END = OFF_GEMM_OUT_BASE + MAX_GEMM_MACRO_TASKS_PER_DATA_NODE * OUT_REUSE_SLOTS * GEMM_OUT_STRIDE_MM
+SFU_SOFTMAX_ROWMAJOR_MATRIX_BYTES = GEMM_M * GEMM_N * elem_nbytes(MATMUL_DTYPE)
+SFU_SOFTMAX_ROWMAJOR_STRIDE_BYTES = _align_up(SFU_SOFTMAX_ROWMAJOR_MATRIX_BYTES, MM_ALIGN)
+OFF_SFU_SOFTMAX_ROWMAJOR_BASE = _align_up(GEMM_DATA_REGION_END, MM_ALIGN)
+OFF_SFU_SOFTMAX_ROWMAJOR_OUT_BASE = (
+    OFF_SFU_SOFTMAX_ROWMAJOR_BASE + SFU_SOFTMAX_ROWMAJOR_STRIDE_BYTES
+)
+SFU_SOFTMAX_ROWMAJOR_REGION_END = (
+    OFF_SFU_SOFTMAX_ROWMAJOR_OUT_BASE + SFU_SOFTMAX_ROWMAJOR_STRIDE_BYTES
+)
 FIXED_AUX_REGION_END = 0x01300000
 
 if MEM_NODE_SIZE_AUTO:
     required_size = max(
         GEMM_DATA_REGION_END + GEMM_BIAS_STRIDE_MM,
+        SFU_SOFTMAX_ROWMAJOR_REGION_END + GEMM_BIAS_STRIDE_MM,
         FIXED_AUX_REGION_END,
         64 * 1024**2,
     )
@@ -618,6 +631,33 @@ def _write_standalone_softmax_logits(node_buffers, logits_matrix):
             tile_off,
             tile_data,
             f"softmax_logits_m{m_tile}_n{n_tile}_node{node_idx}",
+        )
+
+
+def _write_standalone_softmax_rowmajor_logits(node_buffers, logits_matrix):
+    if not DATA_NODE_IDS:
+        raise ValueError("direct row-major standalone softmax requires at least one data node")
+    if SFU_SOFTMAX_ROWMAJOR_REGION_END > OFF_GEMM_BIAS_BASE:
+        raise ValueError(
+            "SFU softmax row-major HBM region exceeds bias area: "
+            f"input=0x{OFF_SFU_SOFTMAX_ROWMAJOR_BASE:X}, "
+            f"output=0x{OFF_SFU_SOFTMAX_ROWMAJOR_OUT_BASE:X}, "
+            f"end=0x{SFU_SOFTMAX_ROWMAJOR_REGION_END:X}, "
+            f"bias=0x{OFF_GEMM_BIAS_BASE:X}"
+        )
+    node_idx = DATA_NODE_IDS[0]
+    row_bytes = GEMM_N * elem_nbytes(MATMUL_DTYPE)
+    for r, row in enumerate(logits_matrix):
+        row_data = _pack_tensor_values(row)
+        if len(row_data) != row_bytes:
+            raise ValueError(
+                f"standalone softmax row-major row size mismatch: expected {row_bytes}, got {len(row_data)}"
+            )
+        _write_block(
+            node_buffers[node_idx],
+            OFF_SFU_SOFTMAX_ROWMAJOR_BASE + r * row_bytes,
+            row_data,
+            f"softmax_rowmajor_logits_row{r}_node{node_idx}",
         )
 
 
@@ -1151,7 +1191,10 @@ def main(argv=None):
                 f"bias_node{node_idx}",
             )
 
-    if softmax_logits is not None:
+    if softmax_logits is not None and SFU_JOB_SOFTMAX_DIRECT_ROWMAJOR_HBM:
+        _write_standalone_softmax_rowmajor_logits(node_buffers, softmax_logits)
+        print("Preloaded standalone softmax logits into direct row-major HBM region")
+    elif softmax_logits is not None:
         _write_standalone_softmax_logits(node_buffers, softmax_logits)
         print("Preloaded standalone softmax logits into GEMM C tile region")
 

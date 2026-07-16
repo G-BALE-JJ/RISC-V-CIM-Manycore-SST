@@ -78,6 +78,28 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+_control_plane_defaults = {
+    "GOLEM_GROUP_MANAGER_ENABLE": False,
+    "GOLEM_CTRL_LINK_ENABLE": False,
+    "GOLEM_REQUEST_SCHEDULER_ENABLE": True,
+    "GOLEM_WORKER_COMMAND_PROCESSOR_ENABLE": False,
+}
+_enabled_control_plane = [
+    name
+    for name, default in _control_plane_defaults.items()
+    if _env_flag(name, default)
+]
+if _enabled_control_plane:
+    raise ValueError(
+        "archive/no-ctrl architecture does not wire control-plane endpoints; "
+        "set GOLEM_GROUP_MANAGER_ENABLE=0, GOLEM_CTRL_LINK_ENABLE=0, "
+        "GOLEM_REQUEST_SCHEDULER_ENABLE=0, and "
+        "GOLEM_WORKER_COMMAND_PROCESSOR_ENABLE=0 (enabled: "
+        + ", ".join(_enabled_control_plane)
+        + ")"
+    )
+
+
 TESTS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DRAMSIM3_CONFIG = os.getenv(
     "GOLEM_DRAMSIM3_CONFIG",
@@ -256,21 +278,7 @@ mmuParams = {
     "page_size": 4096,
 }
 
-# --- 4. 实例化 CPU 核心 ---
-print("[SST] 实例化 CPU_Builder...")
-builder = CPU_Builder()
-
-cpu_ports = []
-for core_id in range(numCpus):
-    print(f"[SST] 构建 core{core_id}...")
-    ports = builder.build(
-        f"core{core_id}", core_id, core_id, add_l2_cache=True, add_rocc_golem=True
-    )
-    cpu_ports.append(ports)
-
-print("[SST] CPU 模块构建完成。")
-
-# --- 5. 构建自适应 Mesh NoC ---
+# --- 4. 构建自适应 Mesh NoC ---
 MESH_DIM_X = int(os.getenv("GOLEM_MESH_DIM_X", "4"))
 if MESH_DIM_X <= 0:
     raise ValueError("GOLEM_MESH_DIM_X must be positive")
@@ -368,6 +376,20 @@ if len(cpu_routers) != numCpus:
         f"insufficient CPU routers: need {numCpus}, got {len(cpu_routers)}"
     )
 
+# CPU_Builder creates GlobalMemory, which reads GOLEM_MEMORY_ROUTERS at build time.
+print("[SST] 实例化 CPU_Builder...")
+builder = CPU_Builder()
+
+cpu_ports = []
+for core_id in range(numCpus):
+    print(f"[SST] 构建 core{core_id}...")
+    ports = builder.build(
+        f"core{core_id}", core_id, core_id, add_l2_cache=True, add_rocc_golem=True
+    )
+    cpu_ports.append(ports)
+
+print("[SST] CPU 模块构建完成。")
+
 print(f"[NUMA] 数据内存节点: {DATA_MEMORY_ROUTERS}")
 print(f"[NUMA] OS 节点: {OS_ROUTER}")
 print(f"[NUMA] CPU 节点: {cpu_routers}")
@@ -461,8 +483,14 @@ for idx, router_id in enumerate(MEMORY_ROUTERS):
             "sources": "1",
             "network_bw": "25GB/s",
             "num_vns": 3,
+            "network_input_buffer_size": os.getenv(
+                "GOLEM_DIRCTRL_HIGHLINK_INPUT_BUF_SIZE", "64KB"
+            ),
+            "network_output_buffer_size": os.getenv(
+                "GOLEM_DIRCTRL_HIGHLINK_OUTPUT_BUF_SIZE", "64KB"
+            ),
             "golem_dma_response_chunk_bytes": os.getenv("GOLEM_DMA_RESPONSE_CHUNK_BYTES", "0"),
-            "golem_dma_response_vn": os.getenv("GOLEM_DMA_RESPONSE_VN", "0"),
+            "golem_dma_response_vn": os.getenv("GOLEM_DMA_RESPONSE_VN", "1"),
             "golem_dma_trace": os.getenv("GOLEM_DMA_TRACE", "0"),
         }
     )

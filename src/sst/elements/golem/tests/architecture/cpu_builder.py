@@ -709,6 +709,8 @@ class CPU_Builder:
             if sfu_reduction_vn:
                 gm_params["reduction_vn"] = sfu_reduction_vn
             GlobalMemory.addParams(gm_params)
+            if enable_all_stats:
+                GlobalMemory.enableAllStatistics()
 
             if sfu_enable:
                 sfu = cpu_rocc.setSubComponent("sfu", "golem.SFU")

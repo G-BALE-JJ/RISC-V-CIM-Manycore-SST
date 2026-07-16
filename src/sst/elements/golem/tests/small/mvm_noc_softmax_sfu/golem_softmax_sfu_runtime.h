@@ -69,6 +69,57 @@ struct SFUPrimitiveBatchDesc {
 static_assert(sizeof(SFUPrimitiveBatchDesc) == 32,
               "SFUPrimitiveBatchDesc ABI must match golem.SFU");
 
+enum class SFUJobOp : uint32_t {
+    ELEMENTWISE = 0x01,
+    REDUCE = 0x02,
+    SOFTMAX_ROW = 0x10,
+    LAYERNORM = 0x11,
+    GELU = 0x12,
+};
+
+enum class SFUJobSubOp : uint32_t {
+    NONE = 0x00,
+    EXP = 0x01,
+    LOG = 0x02,
+    RECIPROCAL = 0x03,
+    RSQRT = 0x04,
+    TANH = 0x05,
+    SIGMOID = 0x06,
+    REDUCE_MAX = 0x20,
+    REDUCE_SUM = 0x21,
+};
+
+constexpr uint32_t SFU_JOB_FLAG_DISTRIBUTED_COLUMNS = 0x1u;
+constexpr uint32_t SFU_JOB_FLAG_DISTRIBUTED_ABORT = 0x2u;
+
+struct SFUJobDesc {
+    uint64_t job_id;
+    uint64_t input0_addr;
+    uint64_t input1_addr;
+    uint64_t output_addr;
+    uint64_t params_addr;
+    uint64_t scratch_addr;
+    uint32_t op_type;
+    uint32_t sub_op;
+    uint32_t dtype;
+    uint32_t layout;
+    uint32_t rows;
+    uint32_t cols;
+    uint32_t elem_count;
+    uint32_t chunk_elems;
+    uint32_t worker_cores;
+    uint32_t owner_core;
+    uint32_t flags;
+    uint32_t reserved0;  // With DISTRIBUTED_COLUMNS, reserved0 stores the worker slot.
+    uint64_t reserved1;
+    uint64_t reserved2;
+    uint64_t reserved3;
+    uint64_t reserved4;
+};
+
+static_assert(sizeof(SFUJobDesc) == 128,
+              "SFUJobDesc ABI must match golem.SFU");
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -87,6 +138,21 @@ golem_status_t golemRunStandaloneSoftmaxSfuForCore(
     const MatmulRuntimeConfig* cfg,
     uint64_t job_id);
 
+golem_status_t golemRunStandaloneSoftmaxSfuJobForCore(
+    const golem_softmax_op_desc_t* op_desc,
+    int executor_core_id,
+    const MatmulRuntimeConfig* cfg,
+    uint64_t input_gm,
+    uint64_t output_gm,
+    uint64_t desc_gm,
+    uint32_t chunk_elems,
+    uint32_t worker_cores,
+    uint32_t worker_slot,
+    uint32_t owner_core,
+    uint32_t flags,
+    uint64_t job_id,
+    uint64_t tag);
+
 golem_status_t golemRunSoftmaxSfuTileFromLocalAccum(
     const golem_softmax_op_desc_t* op_desc,
     int executor_core_id,
@@ -103,6 +169,8 @@ golem_status_t golemWaitSoftmaxSfuTileAndStore(
     uint64_t local_output_gm,
     uint64_t output_hbm,
     uint64_t bytes);
+
+const char* golemSoftmaxSfuGetLastErrorString(void);
 
 #ifdef __cplusplus
 }

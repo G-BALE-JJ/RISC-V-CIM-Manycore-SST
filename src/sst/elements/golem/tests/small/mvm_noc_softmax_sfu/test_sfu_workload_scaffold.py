@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import csv
+import fcntl
 import os
 import re
 import subprocess
@@ -397,84 +398,6 @@ class SfuWorkloadScaffoldTest(unittest.TestCase):
             body.index("golemRunStandaloneSoftmaxSfuJobForCore"),
         )
 
-    def test_unified_job_direct_sweep_uses_direct_rowmajor_standalone_job_path(self):
-        sweep_source = read_local("run_sfu_unified_job_direct_sweep.sh")
-
-        self.assertIn("GOLEM_SFU_STANDALONE_SOFTMAX=1", sweep_source)
-        self.assertIn("GOLEM_SFU_JOB_SOFTMAX=1", sweep_source)
-        self.assertIn("GOLEM_SFU_JOB_SOFTMAX_DIRECT_ROWMAJOR_HBM=1", sweep_source)
-        self.assertIn("GOLEM_SOFTMAX_VERIFY_REFERENCE=logits", sweep_source)
-        self.assertIn("GOLEM_A_REUSE_N_TILES=1", sweep_source)
-        self.assertIn("GOLEM_B_REUSE_M_TILES=1", sweep_source)
-        self.assertIn("--verify-softmax", sweep_source)
-        self.assertIn("--group-manager-enable 0", sweep_source)
-        self.assertIn("--ctrl-link-enable 0", sweep_source)
-        self.assertIn("run_noc_dma_softmax_sfu_pipeline.sh", sweep_source)
-        self.assertNotIn("GOLEM_SFU_PRIMITIVE_SOFTMAX=1", sweep_source)
-
-    def test_unified_job_direct_sweep_has_stable_and_pressure_profiles(self):
-        sweep_source = read_local("run_sfu_unified_job_direct_sweep.sh")
-
-        self.assertIn("GOLEM_SFU_JOB_DIRECT_PROFILE", sweep_source)
-        self.assertIn("stable512", sweep_source)
-        self.assertIn("stable1024", sweep_source)
-        self.assertIn("stable2048", sweep_source)
-        self.assertIn("stable4096", sweep_source)
-        self.assertIn("pressure1024", sweep_source)
-        self.assertIn("pressure4096_jr4_rt384", sweep_source)
-        self.assertIn("pressure4096_jr4_rt512", sweep_source)
-        self.assertIn("pressure4096_jr4_rt704", sweep_source)
-        self.assertIn("pressure4096_jr4_rt768", sweep_source)
-        self.assertIn("pressure4096_jr4_rt1024", sweep_source)
-        self.assertIn('run_point 1024 8 8 320 8 pass "$(timeout_for_dim 1024)" "stable1024"', sweep_source)
-        self.assertIn("stable1024 band_cores=8 retry_ticks=320 max_retries=8 expect=pass", sweep_source)
-        self.assertIn('run_point 2048 8 4 384 8 pass "$(timeout_for_dim 2048)" "stable2048"', sweep_source)
-        self.assertIn("stable2048 band_cores=8 job_rows=4 retry_ticks=384 max_retries=8 expect=pass", sweep_source)
-        self.assertIn('run_point 4096 8 2 384 8 pass "$(timeout_for_dim 4096)" "stable4096" 268435456', sweep_source)
-        self.assertIn("stable4096 band_cores=8 job_rows=2 retry_ticks=384 max_retries=8 mem_node_size=268435456 expect=pass", sweep_source)
-        self.assertIn('run_point 4096 8 4 384 8 fail "$(timeout_for_dim 4096)" "pressure4096_jr4_rt384" 268435456', sweep_source)
-        self.assertIn("pressure4096_jr4_rt384 band_cores=8 job_rows=4 retry_ticks=384 max_retries=8 mem_node_size=268435456 expect=fail", sweep_source)
-        self.assertIn('run_point 4096 8 4 512 8 fail "$(timeout_for_dim 4096)" "pressure4096_jr4_rt512" 268435456', sweep_source)
-        self.assertIn("pressure4096_jr4_rt512 band_cores=8 job_rows=4 retry_ticks=512 max_retries=8 mem_node_size=268435456 expect=fail", sweep_source)
-        self.assertIn('run_point 4096 8 4 704 8 pass "$(timeout_for_dim 4096)" "pressure4096_jr4_rt704" 268435456', sweep_source)
-        self.assertIn("pressure4096_jr4_rt704 band_cores=8 job_rows=4 retry_ticks=704 max_retries=8 mem_node_size=268435456 expect=pass", sweep_source)
-        self.assertIn('run_point 4096 8 4 768 8 pass "$(timeout_for_dim 4096)" "pressure4096_jr4_rt768" 268435456', sweep_source)
-        self.assertIn("pressure4096_jr4_rt768 band_cores=8 job_rows=4 retry_ticks=768 max_retries=8 mem_node_size=268435456 expect=pass", sweep_source)
-        self.assertIn('run_point 4096 8 4 1024 8 pass "$(timeout_for_dim 4096)" "pressure4096_jr4_rt1024" 268435456', sweep_source)
-        self.assertIn("pressure4096_jr4_rt1024 band_cores=8 job_rows=4 retry_ticks=1024 max_retries=8 mem_node_size=268435456 expect=pass", sweep_source)
-        self.assertIn('local mem_node_size="${9:-134217728}"', sweep_source)
-        self.assertIn('--mem-node-size "$mem_node_size"', sweep_source)
-        self.assertIn('echo "${GOLEM_TIMEOUT_4096:-2400}"', sweep_source)
-        self.assertIn("mem_node_size=$mem_node_size", sweep_source)
-        self.assertIn('run_point 1024 8 8 256 8 fail "$(timeout_for_dim 1024)" "pressure1024"', sweep_source)
-        self.assertIn("pressure1024 band_cores=8 retry_ticks=256 max_retries=8 expect=fail", sweep_source)
-        self.assertIn("expect=fail", sweep_source)
-
-    def test_unified_job_direct_sweep_supports_point_list_manifest_and_dry_run(self):
-        sweep_source = read_local("run_sfu_unified_job_direct_sweep.sh")
-
-        self.assertIn("GOLEM_SFU_JOB_DIRECT_POINT_LIST", sweep_source)
-        self.assertIn("dim:band_cores:job_rows:retry_ticks:max_retries:expect", sweep_source)
-        self.assertIn("sweep_manifest.csv", sweep_source)
-        self.assertIn(
-            "run_id,dim,band_cores,job_rows,retry_ticks,max_retries,expect,status,exit_code",
-            sweep_source,
-        )
-        self.assertIn("GOLEM_DRY_RUN_SWEEP", sweep_source)
-        self.assertIn("EXPECTED_FAIL", sweep_source)
-        self.assertIn("UNEXPECTED_PASS", sweep_source)
-        self.assertIn("TIMEOUT", sweep_source)
-
-    def test_unified_job_direct_sweep_normalizes_artifact_root_to_absolute_path(self):
-        sweep_source = read_local("run_sfu_unified_job_direct_sweep.sh")
-
-        self.assertIn('mkdir -p "$SWEEP_ROOT"', sweep_source)
-        self.assertIn('SWEEP_ROOT="$(cd "$SWEEP_ROOT" && pwd)"', sweep_source)
-        self.assertLess(
-            sweep_source.index('SWEEP_ROOT="$(cd "$SWEEP_ROOT" && pwd)"'),
-            sweep_source.index('MANIFEST="$SWEEP_ROOT/sweep_manifest.csv"'),
-        )
-
     def test_distributed_scaling_sweep_uses_fixed_unified_job_architecture_knobs(self):
         sweep_source = read_local("run_sfu_unified_job_distributed_scaling.sh")
 
@@ -552,6 +475,137 @@ class SfuWorkloadScaffoldTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("reduction_transport=explicit_noc", result.stdout.splitlines()[-1])
 
+    def test_distributed_scaling_vn_sweep_has_unique_ids_and_manifest_identity(self):
+        script = os.path.join(SCRIPT_DIR, "run_sfu_unified_job_distributed_scaling.sh")
+        run_ids = []
+        signatures = []
+        for vn in (0, 1, 2):
+            with tempfile.TemporaryDirectory() as temp_dir:
+                env = os.environ.copy()
+                env.update(
+                    {
+                        "GOLEM_SWEEP_ROOT": temp_dir,
+                        "GOLEM_DRY_RUN_SWEEP": "1",
+                        "GOLEM_SFU_VN_SWEEP": "1",
+                        "GOLEM_SFU_REDUCTION_VN": str(vn),
+                        "GOLEM_SFU_DISTRIBUTED_REDUCTION_TRANSPORT": "explicit_noc",
+                        "GOLEM_SFU_DISTRIBUTED_POINT_LIST": "16:512:4:4",
+                    }
+                )
+                result = subprocess.run(
+                    ["bash", script],
+                    cwd=SCRIPT_DIR,
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                with open(
+                    os.path.join(temp_dir, "sweep_manifest.csv"),
+                    newline="",
+                    encoding="utf-8",
+                ) as manifest_file:
+                    row = list(csv.DictReader(manifest_file))[-1]
+                run_ids.append(row["run_id"])
+                self.assertEqual(row["reduction_vn"], str(vn))
+                self.assertEqual(row["num_vns"], "3")
+                self.assertEqual(row["dma_response_vn"], "0")
+
+                signature_result = subprocess.run(
+                    ["bash", "-c", f'source "{script}"; point_signature 16 512 4 4'],
+                    cwd=SCRIPT_DIR,
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(
+                    signature_result.returncode,
+                    0,
+                    signature_result.stdout + signature_result.stderr,
+                )
+                signatures.append(signature_result.stdout.splitlines()[-1])
+
+        self.assertEqual(len(set(run_ids)), 3)
+        self.assertEqual(len(set(signatures)), 3)
+        for vn, run_id in enumerate(run_ids):
+            self.assertTrue(run_id.endswith(f"_vn{vn}"), run_id)
+
+    def test_distributed_scaling_vn_sweep_rejects_invalid_or_incompatible_env(self):
+        script = os.path.join(SCRIPT_DIR, "run_sfu_unified_job_distributed_scaling.sh")
+        cases = (
+            ({"GOLEM_SFU_REDUCTION_VN": "3", "GOLEM_SFU_DISTRIBUTED_REDUCTION_TRANSPORT": "explicit_noc"}, "invalid reduction VN"),
+            ({"GOLEM_SFU_REDUCTION_VN": "0", "GOLEM_SFU_DISTRIBUTED_REDUCTION_TRANSPORT": "modeled_noc"}, "requires exact explicit_noc"),
+            ({"GOLEM_SFU_REDUCTION_VN": "0", "GOLEM_SFU_DISTRIBUTED_REDUCTION_TRANSPORT": "explicit_noc", "GOLEM_DMA_RESPONSE_VN": "1"}, "GOLEM_DMA_RESPONSE_VN=0"),
+        )
+        for overrides, expected_error in cases:
+            with self.subTest(overrides=overrides), tempfile.TemporaryDirectory() as temp_dir:
+                env = os.environ.copy()
+                env.update(
+                    {
+                        "GOLEM_SWEEP_ROOT": temp_dir,
+                        "GOLEM_DRY_RUN_SWEEP": "1",
+                        "GOLEM_SFU_VN_SWEEP": "1",
+                        "GOLEM_SFU_DISTRIBUTED_POINT_LIST": "16:512:4:4",
+                        **overrides,
+                    }
+                )
+                result = subprocess.run(
+                    ["bash", script], cwd=SCRIPT_DIR, env=env, text=True,
+                    capture_output=True, check=False,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(expected_error, result.stderr)
+
+    def test_distributed_scaling_rejects_stale_manifest_schema(self):
+        script = os.path.join(SCRIPT_DIR, "run_sfu_unified_job_distributed_scaling.sh")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with open(os.path.join(temp_dir, "sweep_manifest.csv"), "w", encoding="utf-8") as manifest_file:
+                manifest_file.write("run_id,old_schema\n")
+            env = os.environ.copy()
+            env.update({"GOLEM_SWEEP_ROOT": temp_dir, "GOLEM_DRY_RUN_SWEEP": "1"})
+            result = subprocess.run(
+                ["bash", script], cwd=SCRIPT_DIR, env=env, text=True,
+                capture_output=True, check=False,
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("manifest header mismatch", result.stderr)
+
+    def test_distributed_scaling_rejects_a_locked_root(self):
+        script = os.path.join(SCRIPT_DIR, "run_sfu_unified_job_distributed_scaling.sh")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            lock_path = os.path.join(temp_dir, ".sweep.lock")
+            with open(lock_path, "w", encoding="utf-8") as lock_file:
+                fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                env = os.environ.copy()
+                env.update({"GOLEM_SWEEP_ROOT": temp_dir, "GOLEM_DRY_RUN_SWEEP": "1"})
+                result = subprocess.run(
+                    ["bash", script], cwd=SCRIPT_DIR, env=env, text=True,
+                    capture_output=True, check=False,
+                )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("sweep root is locked", result.stderr)
+
+    def test_distributed_scaling_vn_sweep_pins_and_validates_runtime_topology(self):
+        sweep_source = read_local("run_sfu_unified_job_distributed_scaling.sh")
+
+        for setting in (
+            'GOLEM_SFU_REDUCTION_VN="$REDUCTION_VN"',
+            "GOLEM_DMA_RESPONSE_VN=0",
+            "GOLEM_GM_VERBOSE=2",
+            "GOLEM_DMA_TRACE=1",
+            "GOLEM_BENCH_QUIET_LOGS=0",
+        ):
+            self.assertIn(setting, sweep_source)
+        self.assertIn("GlobalMemory VN mapping: request_vn=0 response_vn=1", sweep_source)
+        self.assertIn("reduction_vn=$REDUCTION_VN (num_vns=3)", sweep_source)
+        self.assertIn("resolved golem_dma_response_vn=0 num_vns=3", sweep_source)
+        self.assertIn("TRACE_REQ_RESP_CHUNK_SEND", sweep_source)
+        self.assertIn("vn=0", sweep_source)
+
     def test_distributed_scaling_sweep_validates_sfu_and_dma_lifecycle(self):
         sweep_source = read_local("run_sfu_unified_job_distributed_scaling.sh")
 
@@ -591,6 +645,8 @@ class SfuWorkloadScaffoldTest(unittest.TestCase):
         self.assertIn("gmem_reduction_send_rejected", sweep_source)
         self.assertIn("gmem_reduction_received", sweep_source)
         self.assertIn('if rg -q ",gmem_reduction_send_immediate," "$stats_file"', sweep_source)
+        self.assertIn('if [[ "$VN_SWEEP" == "1" ]]', sweep_source)
+        self.assertIn("GlobalMemory reduction transport stats unavailable for VN sweep", sweep_source)
 
     def test_gemm_architecture_keeps_sfu_disabled_except_explicit_softmax_runs(self):
         architecture_source = read_repo_relative("../../architecture/cpu_builder.py")
@@ -997,7 +1053,6 @@ class SfuWorkloadScaffoldTest(unittest.TestCase):
         entry_source = read_local("test_noc_dma_softmax_sfu.cpp")
         wrapper_source = read_local("run_noc_dma_softmax_sfu_pipeline.sh")
         ex_instr_source = read_local("ex_instr.h")
-        sweep_source = read_local("run_sfu_hbm_chunk_batch_sweep.sh")
 
         self.assertIn('read_i64_env_or_default("GOLEM_SFU_PRIMITIVE_HBM_BATCH", 1)', entry_source)
         self.assertIn("run_hbm_stream_sfu_primitive_batch_case", entry_source)
@@ -1009,9 +1064,6 @@ class SfuWorkloadScaffoldTest(unittest.TestCase):
         self.assertIn("export GOLEM_SFU_PRIMITIVE_HBM_BATCH", wrapper_source)
         self.assertIn("default architecture path", wrapper_source)
         self.assertIn("legacy/debug fallback", wrapper_source)
-        self.assertIn("GOLEM_SFU_RUN_LEGACY_NONBATCH", sweep_source)
-        self.assertIn('GOLEM_SFU_PRIMITIVE_HBM_BATCH="1"', sweep_source)
-        self.assertNotIn("for batch in 0 1", sweep_source)
         self.assertIn("GOLEM_ROCC_FUNC7_SFU_PRIMITIVE_BATCH", ex_instr_source)
         self.assertIn("GOLEM_ROCC_FUNC7_SFU_PRIMITIVE_BATCH_WAIT", ex_instr_source)
 
@@ -1301,93 +1353,6 @@ class SfuWorkloadScaffoldTest(unittest.TestCase):
         self.assertIn("for (uint64_t row_base = 0; row_base < rows; row_base += pipeline_window_rows)", body)
         self.assertNotIn("row_block=pipeline_window_rows", body)
         self.assertNotIn("return run_sfu_primitive_softmax_row_block_for_core", body)
-
-    def test_softmax_primitive_sweep_script_uses_batch_default_path(self):
-        sweep_source = read_local("run_sfu_softmax_primitive_sweep.sh")
-
-        self.assertIn("GOLEM_SFU_PRIMITIVE_SOFTMAX=1", sweep_source)
-        self.assertIn("GOLEM_SFU_PRIMITIVE_SOFTMAX_DIM", sweep_source)
-        self.assertIn("GOLEM_SFU_PRIMITIVE_SOFTMAX_CHUNK_ELEMS", sweep_source)
-        self.assertIn("GOLEM_SFU_PRIMITIVE_SOFTMAX_ROWS", sweep_source)
-        self.assertIn("mode=sfu-primitive-softmax", sweep_source)
-        self.assertIn("sizes=(128 256 512 1024 2048 4096)", sweep_source)
-        self.assertNotIn("GOLEM_SFU_PRIMITIVE_HBM_BATCH=0", sweep_source)
-        self.assertNotIn("nonbatch", sweep_source.lower())
-
-    def test_softmax_primitive_sweep_reuses_hbm_after_first_point(self):
-        sweep_source = read_local("run_sfu_softmax_primitive_sweep.sh")
-
-        self.assertIn("GOLEM_SFU_SWEEP_REUSE_HBM", sweep_source)
-        self.assertIn("hbm_config.env", sweep_source)
-        self.assertIn("GOLEM_SKIP_TENSOR_GEN", sweep_source)
-        self.assertIn("GOLEM_SKIP_HBM_GEN", sweep_source)
-        self.assertIn('local skip_build="${GOLEM_SKIP_BUILD:-$reuse_hbm}"', sweep_source)
-
-    def test_softmax_primitive_sweep_has_real_sst_perf_profile(self):
-        sweep_source = read_local("run_sfu_softmax_primitive_sweep.sh")
-
-        self.assertIn("GOLEM_SFU_PERF_PROFILE", sweep_source)
-        self.assertIn("perf_verify", sweep_source)
-        self.assertIn("GOLEM_SFU_PRIMITIVE_SOFTMAX_VERIFY", sweep_source)
-        self.assertIn("GOLEM_BENCH_DISABLE_SST_STATS", sweep_source)
-        self.assertIn("run_noc_dma_softmax_sfu_pipeline.sh", sweep_source)
-        self.assertNotIn("timing-only", sweep_source.lower())
-
-    def test_softmax_primitive_sweep_supports_focused_real_sst_point_lists(self):
-        sweep_source = read_local("run_sfu_softmax_primitive_sweep.sh")
-
-        self.assertIn("GOLEM_SFU_SOFTMAX_POINT_LIST", sweep_source)
-        self.assertIn("run_explicit_point_list", sweep_source)
-        self.assertIn("IFS=:", sweep_source)
-        self.assertIn("rows:dim:chunk_elems:worker_cores", sweep_source)
-        self.assertIn("GOLEM_SFU_SOFTMAX_SWEEP_DIMS", sweep_source)
-        self.assertIn("GOLEM_SFU_SOFTMAX_CHUNK_SWEEP_DIM", sweep_source)
-        self.assertIn("GOLEM_SFU_SOFTMAX_CHUNKS", sweep_source)
-        self.assertIn("GOLEM_SFU_SOFTMAX_WORKERS", sweep_source)
-        self.assertIn("GOLEM_SFU_SOFTMAX_MULTICORE_MATRIX", sweep_source)
-        self.assertIn("worker_cores", sweep_source)
-        self.assertIn("GOLEM_SFU_PRIMITIVE_SOFTMAX_WORKER_CORES", sweep_source)
-        self.assertIn("GOLEM_SFU_PRIMITIVE_SOFTMAX_MULTICORE_MIN_DIM", sweep_source)
-        self.assertIn("GOLEM_SFU_SOFTMAX_PIPELINE_ARGS", sweep_source)
-        self.assertIn("pipeline_args", sweep_source)
-        self.assertIn("read -r -a", sweep_source)
-
-    def test_softmax_primitive_sweep_normalizes_artifact_root_to_absolute_path(self):
-        sweep_source = read_local("run_sfu_softmax_primitive_sweep.sh")
-
-        self.assertIn('mkdir -p "$SWEEP_ROOT"', sweep_source)
-        self.assertIn('SWEEP_ROOT="$(cd "$SWEEP_ROOT" && pwd)"', sweep_source)
-        self.assertLess(
-            sweep_source.index('SWEEP_ROOT="$(cd "$SWEEP_ROOT" && pwd)"'),
-            sweep_source.index('MANIFEST="$SWEEP_ROOT/sweep_manifest.csv"'),
-        )
-
-    def test_softmax_primitive_plotter_parses_pass_lines_and_writes_chinese_notes(self):
-        plot_source = read_local("plot_sfu_softmax_primitive_sweep.py")
-
-        self.assertIn("mode=sfu-primitive-softmax", plot_source)
-        self.assertIn("max_abs_diff", plot_source)
-        self.assertIn("max_row_sum_error", plot_source)
-        self.assertIn("worker_cores", plot_source)
-        self.assertIn("dim_per_core", plot_source)
-        self.assertIn("simulated_time_us", plot_source)
-        self.assertIn("wall_time_sec", plot_source)
-        self.assertIn("softmax_primitive_summary.csv", plot_source)
-        self.assertIn("softmax_primitive_notes.md", plot_source)
-        self.assertIn("softmax_primitive_dse.svg", plot_source)
-        self.assertIn("softmax_primitive_multirow.svg", plot_source)
-        self.assertIn("softmax_primitive_timeout_diagnosis.md", plot_source)
-        self.assertIn("write_focused_dse_svg", plot_source)
-        self.assertIn("write_multirow_svg", plot_source)
-        self.assertIn("write_timeout_diagnosis", plot_source)
-        self.assertIn("estimated_rows_by_reads", plot_source)
-        self.assertIn("实验结论", plot_source)
-        self.assertIn("PASS 点摘要", plot_source)
-        self.assertIn("chunk 覆盖说明", plot_source)
-        self.assertIn("路线纠偏", plot_source)
-        self.assertIn("multi-core cooperative", plot_source)
-        self.assertNotIn("所有 PASS 点使用单核 batch-default primitive softmax 原型路径", plot_source)
-        self.assertNotIn("2048 维度在 `chunk=512` 和 `chunk=2048` 下均 timeout", plot_source)
 
     def test_standalone_softmax_uses_row_band_issue_wait_window(self):
         runtime_source = read_local("golem_softmax_sfu_runtime.cpp")
