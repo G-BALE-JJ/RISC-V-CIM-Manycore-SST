@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 
+import csv
+import dataclasses
+import hashlib
 import pathlib
 import sys
+import tempfile
 import unittest
+from unittest import mock
 
 
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
@@ -10,6 +15,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import sfu_4096x4096_capacity as capacity
+import test_sfu_phase4f_large_scale as phase4f_test_support
 
 
 class CapacityContractTest(unittest.TestCase):
@@ -79,6 +85,174 @@ class CapacityContractTest(unittest.TestCase):
                 evidence = capacity.derive_capacity(point)
                 self.assertGreater(evidence.layout_margin_bytes, 0)
                 self.assertLess(point.rowmajor_region_end, evidence.bias_base)
+
+
+class CapacityResourceAndEvidenceTest(unittest.TestCase):
+    def test_resource_snapshot_enforces_disk_memory_and_tmpdir(self):
+        valid = capacity.ResourceSnapshot(
+            artifact_free_bytes=16 * 1024**3,
+            available_memory_bytes=8 * 1024**3,
+            tmpdir=pathlib.Path("/data4/jjgong/tmp"),
+            tmpdir_writable=True,
+        )
+        capacity.validate_resource_snapshot(valid)
+
+        invalid = (
+            dataclasses.replace(valid, artifact_free_bytes=16 * 1024**3 - 1),
+            dataclasses.replace(valid, available_memory_bytes=8 * 1024**3 - 1),
+            dataclasses.replace(valid, tmpdir=pathlib.Path("/tmp")),
+            dataclasses.replace(valid, tmpdir_writable=False),
+        )
+        for snapshot in invalid:
+            with self.subTest(snapshot=snapshot), self.assertRaises(ValueError):
+                capacity.validate_resource_snapshot(snapshot)
+
+    def test_preflight_csv_is_complete_and_deterministic(self):
+        snapshot = capacity.ResourceSnapshot(
+            artifact_free_bytes=32 * 1024**3,
+            available_memory_bytes=64 * 1024**3,
+            tmpdir=pathlib.Path("/data4/jjgong/tmp"),
+            tmpdir_writable=True,
+        )
+        with tempfile.TemporaryDirectory(dir="/data4/jjgong/tmp") as temp:
+            first = pathlib.Path(temp) / "first.csv"
+            second = pathlib.Path(temp) / "second.csv"
+            capacity.write_preflight_csv(capacity.DEFAULT_POINTS, snapshot, first)
+            capacity.write_preflight_csv(capacity.DEFAULT_POINTS, snapshot, second)
+            self.assertEqual(first.read_bytes(), second.read_bytes())
+            self.assertNotIn(b"\r\n", first.read_bytes())
+            with first.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+
+        self.assertEqual(len(rows), 4)
+        self.assertEqual(
+            list(rows[0]),
+            [
+                "rows", "dim", "worker_cores", "band_cores",
+                "mem_node_size", "timeout_sec", "elements", "tensor_bytes",
+                "rowmajor_region_end", "bias_base", "layout_margin_bytes",
+                "expected_reduction_each", "expected_transport_total",
+                "expected_dma_ops", "expected_dma_bytes",
+                "artifact_free_bytes", "available_memory_bytes", "tmpdir",
+                "status",
+            ],
+        )
+        self.assertEqual([int(row["rows"]) for row in rows], [512, 1024, 2048, 4096])
+        self.assertTrue(all(row["status"] == "PASS" for row in rows))
+
+    def test_collect_child_reuses_generic_phase4f_parser(self):
+        point = capacity.DEFAULT_POINTS[0]
+        spec = capacity.to_phase4f_spec(point)
+        with tempfile.TemporaryDirectory(dir="/data4/jjgong/tmp") as temp:
+            root = pathlib.Path(temp)
+            child = phase4f_test_support.SyntheticChild(root / "child", spec)
+            manifest = root / "capacity_manifest.csv"
+            record = capacity.collect_child(
+                child.root, point, child.verifier, manifest
+            )
+            loaded = capacity.phase4f.load_parent_manifest(manifest)
+
+        self.assertEqual(record.spec.stage, "CAP")
+        self.assertEqual(record.golden_checked, point.rows * point.dim)
+        self.assertEqual(loaded, [record])
+
+    @staticmethod
+    def record_for(point, child_root):
+        evidence = capacity.derive_capacity(point)
+        return capacity.phase4f.PointRecord(
+            spec=capacity.to_phase4f_spec(point),
+            run_id=(
+                f"sfu_job_dist_r{point.rows}_d{point.dim}_w16_bc16_g1_vn0"
+            ),
+            chunk_elems=256,
+            cooperative_groups=1,
+            transport="explicit_noc",
+            reduction_vn=0,
+            num_vns=3,
+            dma_response_vn=0,
+            noc_link_bw="1200GB/s",
+            noc_xbar_bw="1200GB/s",
+            dirctrl_highlink_bw="1200GB/s",
+            noc_input_buffer="512KB",
+            noc_output_buffer="512KB",
+            gm_buffer="1024KB",
+            flit_size="128B",
+            inter_router_no_cut=0,
+            local_no_cut=0,
+            retry_ticks=1024,
+            max_retries=8,
+            status="PASS",
+            exit_code=0,
+            artifact_validation="PASS",
+            golden_checked=evidence.elements,
+            golden_mismatches=0,
+            transport_events=evidence.expected_transport_total,
+            transport_immediate=evidence.expected_transport_total,
+            transport_queued=0,
+            transport_rejected=0,
+            transport_stale=0,
+            inbox_high_water=4,
+            latency_avg_cycles=10.0,
+            latency_max_cycles=20,
+            total_send_packets=100,
+            total_send_bits=1000,
+            total_xbar_stalls=0,
+            simulated_time_us=float(point.rows),
+            wall_time_sec=float(point.rows * 2),
+            dma_timeout_retry=0,
+            dma_timeout_exhausted=0,
+            dma_write_timeout_retry=0,
+            output_sha256=hashlib.sha256(str(point.rows).encode()).hexdigest(),
+            child_root=str(child_root),
+        )
+
+    def test_report_reparses_all_four_children_and_is_deterministic(self):
+        with tempfile.TemporaryDirectory(dir="/data4/jjgong/tmp") as temp:
+            root = pathlib.Path(temp)
+            records = []
+            for point in capacity.DEFAULT_POINTS:
+                child_root = root / "children" / f"r{point.rows}" / "attempt-0001"
+                child_root.mkdir(parents=True)
+                record = self.record_for(point, child_root)
+                capacity.phase4f.upsert_parent_manifest(
+                    root / "capacity_manifest.csv", record
+                )
+                records.append(record)
+
+            first = root / "report-a"
+            second = root / "report-b"
+            with mock.patch.object(
+                capacity.phase4f, "parse_child_point", side_effect=records + records
+            ) as parser:
+                capacity.write_capacity_report(root, first, pathlib.Path("verifier.py"))
+                capacity.write_capacity_report(root, second, pathlib.Path("verifier.py"))
+            self.assertEqual(parser.call_count, 8)
+            for name in (
+                "sfu_4096x4096_capacity_source_data.csv",
+                "sfu_4096x4096_capacity_summary.md",
+            ):
+                self.assertEqual((first / name).read_bytes(), (second / name).read_bytes())
+            summary = (first / "sfu_4096x4096_capacity_summary.md").read_text(
+                encoding="utf-8"
+            )
+
+        self.assertIn("16,777,216", summary)
+        self.assertIn("65,536", summary)
+        self.assertIn("262,144", summary)
+        self.assertIn("67,108,864", summary)
+
+    def test_report_rejects_incomplete_matrix(self):
+        with tempfile.TemporaryDirectory(dir="/data4/jjgong/tmp") as temp:
+            root = pathlib.Path(temp)
+            point = capacity.DEFAULT_POINTS[0]
+            record = self.record_for(point, root / "child")
+            capacity.phase4f.upsert_parent_manifest(
+                root / "capacity_manifest.csv", record
+            )
+            with self.assertRaises(ValueError):
+                capacity.write_capacity_report(
+                    root, root / "report", pathlib.Path("verifier.py")
+                )
 
 
 if __name__ == "__main__":
