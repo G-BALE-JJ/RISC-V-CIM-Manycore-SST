@@ -28,6 +28,7 @@ from golem_dtype import (
     parse_scalar_text,
     unpack_values,
 )
+from softmax_hbm_layout import softmax_row_location
 
 TESTS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ARTIFACT_ROOT = os.getenv("GOLEM_ARTIFACT_ROOT", os.path.join(TESTS_DIR, "artifacts"))
@@ -40,6 +41,10 @@ SFU_PRIMITIVE_HBM_STREAM = int(os.getenv("GOLEM_SFU_PRIMITIVE_HBM_STREAM", "0"))
 SFU_PRIMITIVE_HBM_OPS = os.getenv("GOLEM_SFU_PRIMITIVE_HBM_OPS", "EXP")
 SFU_PRIMITIVE_HBM_ELEMS = max(1, int(os.getenv("GOLEM_SFU_PRIMITIVE_HBM_ELEMS", "64")))
 SOFTMAX_LOGITS_FILE = os.getenv("GOLEM_SOFTMAX_LOGITS_FILE", "")
+SFU_SOFTMAX_HBM_LAYOUT = os.getenv("GOLEM_SFU_SOFTMAX_HBM_LAYOUT", "single_node")
+SFU_SOFTMAX_STAGING_ROWS = max(
+    1, int(os.getenv("GOLEM_SFU_JOB_SOFTMAX_STAGING_ROWS", "1"))
+)
 HBM_DUMP_OUTPUT = os.getenv("GOLEM_HBM_DUMP_OUTPUT", "1").strip().lower() not in {
     "0",
     "false",
@@ -645,9 +650,11 @@ def _write_standalone_softmax_rowmajor_logits(node_buffers, logits_matrix):
             f"end=0x{SFU_SOFTMAX_ROWMAJOR_REGION_END:X}, "
             f"bias=0x{OFF_GEMM_BIAS_BASE:X}"
         )
-    node_idx = DATA_NODE_IDS[0]
     row_bytes = GEMM_N * elem_nbytes(MATMUL_DTYPE)
     for r, row in enumerate(logits_matrix):
+        node_idx, local_row = softmax_row_location(
+            r, SFU_SOFTMAX_STAGING_ROWS, DATA_NODE_IDS, SFU_SOFTMAX_HBM_LAYOUT
+        )
         row_data = _pack_tensor_values(row)
         if len(row_data) != row_bytes:
             raise ValueError(
@@ -655,7 +662,7 @@ def _write_standalone_softmax_rowmajor_logits(node_buffers, logits_matrix):
             )
         _write_block(
             node_buffers[node_idx],
-            OFF_SFU_SOFTMAX_ROWMAJOR_BASE + r * row_bytes,
+            OFF_SFU_SOFTMAX_ROWMAJOR_BASE + local_row * row_bytes,
             row_data,
             f"softmax_rowmajor_logits_row{r}_node{node_idx}",
         )

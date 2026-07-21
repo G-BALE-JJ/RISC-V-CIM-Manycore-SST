@@ -207,6 +207,13 @@ sfu_max_inflight = os.getenv("GOLEM_SFU_MAX_INFLIGHT", "8")
 sfu_stats_latency = os.getenv("GOLEM_SFU_STATS_LATENCY", "1")
 sfu_merge_latency = os.getenv("GOLEM_SFU_MERGE_LATENCY", "1")
 sfu_normalize_latency = os.getenv("GOLEM_SFU_NORMALIZE_LATENCY", "1")
+sfu_vector_lanes = os.getenv("GOLEM_SFU_VECTOR_LANES", "16")
+sfu_exp_lanes = os.getenv("GOLEM_SFU_EXP_LANES", "4")
+sfu_reduction_tree_latency = os.getenv("GOLEM_SFU_REDUCTION_TREE_LATENCY", "4")
+sfu_exp_latency = os.getenv("GOLEM_SFU_EXP_LATENCY", "8")
+sfu_reciprocal_latency = os.getenv("GOLEM_SFU_RECIPROCAL_LATENCY", "1")
+sfu_row_contexts = os.getenv("GOLEM_SFU_ROW_CONTEXTS", "4")
+sfu_scratchpad_bytes = os.getenv("GOLEM_SFU_SCRATCHPAD_BYTES", "65536")
 sfu_distributed_reduction_transport = os.getenv("GOLEM_SFU_DISTRIBUTED_REDUCTION_TRANSPORT", "shared")
 sfu_reduction_vn = os.getenv("GOLEM_SFU_REDUCTION_VN", "")
 sfu_verbose = os.getenv("GOLEM_SFU_VERBOSE", "0")
@@ -722,6 +729,14 @@ class CPU_Builder:
                         "stats_latency": sfu_stats_latency,
                         "merge_latency": sfu_merge_latency,
                         "normalize_latency": sfu_normalize_latency,
+                        "accelerator_clock_hz": int(_parse_frequency_hz(cpu_clock)),
+                        "vector_lanes": sfu_vector_lanes,
+                        "exp_lanes": sfu_exp_lanes,
+                        "reduction_tree_latency": sfu_reduction_tree_latency,
+                        "exp_latency": sfu_exp_latency,
+                        "reciprocal_latency": sfu_reciprocal_latency,
+                        "row_contexts": sfu_row_contexts,
+                        "scratchpad_bytes": sfu_scratchpad_bytes,
                         "distributed_reduction_transport": sfu_distributed_reduction_transport,
                         "verbose": sfu_verbose,
                     }

@@ -102,6 +102,15 @@ void write_sfu_job_desc_to_gm(int core_id, uint64_t desc_gm_addr, const SFUJobDe
     }
 }
 
+void write_sfu_tensor_params_to_gm(uint64_t params_gm_addr,
+                                   const SFUSoftmaxJobParamsV1& params) {
+    const uint64_t* words = reinterpret_cast<const uint64_t*>(&params);
+    constexpr size_t kWords = sizeof(SFUSoftmaxJobParamsV1) / sizeof(uint64_t);
+    for (size_t i = 0; i < kWords; ++i) {
+        reg2gm(words[i], params_gm_addr + static_cast<uint64_t>(i) * sizeof(uint64_t));
+    }
+}
+
 int task_id_for_tile(int n_tiles, int m_tile, int n_tile) {
     return m_tile * n_tiles + n_tile;
 }
@@ -319,8 +328,17 @@ extern "C" golem_status_t golemRunStandaloneSoftmaxSfuJobForCore(
     uint32_t flags,
     uint64_t job_id,
     uint64_t tag) {
+    MatmulRuntimeConfig validation_cfg = cfg != nullptr ? *cfg : MatmulRuntimeConfig{};
+    if ((flags & SFU_JOB_FLAG_ROW_ENGINE_MODEL) != 0 &&
+        validation_cfg.block_m > GEMM_BLOCK_M) {
+        validation_cfg.block_m = GEMM_BLOCK_M;
+    }
     const golem_status_t status =
-        validate_sfu_softmax_request(op_desc, executor_core_id, executor_core_id, cfg);
+        validate_sfu_softmax_request(
+            op_desc,
+            executor_core_id,
+            executor_core_id,
+            cfg != nullptr ? &validation_cfg : nullptr);
     if (status != GOLEM_STATUS_OK) {
         return status;
     }
@@ -352,6 +370,99 @@ extern "C" golem_status_t golemRunStandaloneSoftmaxSfuJobForCore(
     const uint64_t sfu_status = sfu_job_wait(tag);
     if (sfu_status != SFU_STATUS_SUCCESS) {
         set_sfu_softmax_last_error("softmax SFU job wait failed with status=%llu",
+                                   static_cast<unsigned long long>(sfu_status));
+        return GOLEM_STATUS_RUNTIME_ERROR;
+    }
+    return GOLEM_STATUS_OK;
+}
+
+extern "C" golem_status_t golemRunTensorSoftmaxSfuJob(
+    const golem_softmax_op_desc_t* op_desc,
+    int executor_core_id,
+    const MatmulRuntimeConfig* cfg,
+    uint64_t input_hbm,
+    uint64_t output_hbm,
+    uint64_t scratch_gm,
+    uint64_t params_gm,
+    uint64_t desc_gm,
+    uint64_t node_stride_bytes,
+    uint32_t rows_per_band,
+    uint32_t row_contexts,
+    uint32_t physical_engines,
+    uint64_t job_id,
+    uint64_t tag,
+    golem_softmax_launch_timeline_t* timeline) {
+    if (timeline != nullptr) {
+        *timeline = {};
+        timeline->launch_start_cycle = read_cycle_counter();
+    }
+    const golem_status_t validation = validate_sfu_softmax_request(
+        op_desc, executor_core_id, executor_core_id, cfg);
+    if (validation != GOLEM_STATUS_OK) {
+        return validation;
+    }
+    if (input_hbm == 0 || output_hbm == 0 || scratch_gm == 0 || params_gm == 0 ||
+        desc_gm == 0 || node_stride_bytes == 0 || rows_per_band == 0 ||
+        row_contexts == 0 || physical_engines == 0) {
+        set_sfu_softmax_last_error("tensor softmax SFU job received invalid addresses or config");
+        return GOLEM_STATUS_INVALID_ARGUMENT;
+    }
+
+    const SFUSoftmaxJobParamsV1 params = {
+        .magic = SFU_SOFTMAX_JOB_PARAMS_MAGIC,
+        .version = SFU_SOFTMAX_JOB_PARAMS_VERSION,
+        .size_bytes = sizeof(SFUSoftmaxJobParamsV1),
+        .mapping_policy = 1,
+        .tiles_per_row = 1,
+        .row_contexts_hint = row_contexts,
+        .hbm_layout = SFU_SOFTMAX_HBM_LAYOUT_BAND_STRIPED,
+        .data_node_mask = 0x0fu,
+        .flags = 0,
+        .completion_addr = 0,
+        .node_stride_bytes = node_stride_bytes,
+        .rows_per_band = rows_per_band,
+        .coordinator_core = static_cast<uint32_t>(executor_core_id),
+        .reserved0 = rows_per_band,
+    };
+    SFUJobDesc desc = {};
+    desc.job_id = job_id;
+    desc.input0_addr = input_hbm;
+    desc.output_addr = output_hbm;
+    desc.params_addr = params_gm;
+    desc.scratch_addr = scratch_gm;
+    desc.op_type = static_cast<uint32_t>(SFUJobOp::SOFTMAX_ROW);
+    desc.dtype = static_cast<uint32_t>(GOLEM_DTYPE_FP32);
+    desc.layout = static_cast<uint32_t>(GOLEM_LAYOUT_ROW_MAJOR);
+    desc.rows = static_cast<uint32_t>(op_desc->outer);
+    desc.cols = static_cast<uint32_t>(op_desc->dim);
+    desc.elem_count = static_cast<uint32_t>(op_desc->outer * op_desc->dim);
+    desc.chunk_elems = 256;
+    desc.worker_cores = physical_engines;
+    desc.owner_core = static_cast<uint32_t>(executor_core_id);
+    desc.flags = SFU_JOB_FLAG_ROW_ENGINE_MODEL | SFU_JOB_FLAG_TENSOR_ROW_ENGINE;
+
+    if (timeline != nullptr) {
+        timeline->descriptors_ready_cycle = read_cycle_counter();
+    }
+    write_sfu_tensor_params_to_gm(params_gm, params);
+    if (timeline != nullptr) {
+        timeline->params_write_done_cycle = read_cycle_counter();
+    }
+    write_sfu_job_desc_to_gm(executor_core_id, desc_gm, desc);
+    if (timeline != nullptr) {
+        timeline->desc_write_done_cycle = read_cycle_counter();
+    }
+    sfu_job(desc_gm, tag);
+    if (timeline != nullptr) {
+        timeline->issue_return_cycle = read_cycle_counter();
+        timeline->wait_start_cycle = read_cycle_counter();
+    }
+    const uint64_t sfu_status = sfu_job_wait(tag);
+    if (timeline != nullptr) {
+        timeline->wait_return_cycle = read_cycle_counter();
+    }
+    if (sfu_status != SFU_STATUS_SUCCESS) {
+        set_sfu_softmax_last_error("tensor softmax SFU wait failed with status=%llu",
                                    static_cast<unsigned long long>(sfu_status));
         return GOLEM_STATUS_RUNTIME_ERROR;
     }

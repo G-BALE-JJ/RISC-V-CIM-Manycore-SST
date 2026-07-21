@@ -48,6 +48,23 @@ source = source.replace(
     directory_memnic_replacement,
     1,
 )
+directory_memnic_bandwidth_fragment = (
+    '"network_bw": "25GB/s",\n'
+    '            "num_vns": 3,\n'
+    '            "network_input_buffer_size": os.getenv("GOLEM_NOC_INPUT_BUF_SIZE", "512KB"),'
+)
+directory_memnic_bandwidth_replacement = (
+    '"network_bw": os.getenv("GOLEM_DIRCTRL_HIGHLINK_BW", "100GB/s"),\n'
+    '            "num_vns": 3,\n'
+    '            "network_input_buffer_size": os.getenv("GOLEM_NOC_INPUT_BUF_SIZE", "512KB"),'
+)
+if source.count(directory_memnic_bandwidth_fragment) != 1:
+    raise RuntimeError("expected exactly one archive directory MemNIC bandwidth fragment")
+source = source.replace(
+    directory_memnic_bandwidth_fragment,
+    directory_memnic_bandwidth_replacement,
+    1,
+)
 source = source.replace(
     "sst.setStatisticLoadLevel(16)\n"
     'sst.enableAllStatisticsForAllComponents({"type": "sst.AccumulatorStatistic"})',
@@ -92,6 +109,9 @@ source = source.replace(
     '    "GOLEM_SFU_JOB_SOFTMAX_JOB_ROWS",\n'
     '    "GOLEM_SFU_JOB_SOFTMAX_DIRECT_ROWMAJOR_HBM",\n'
     '    "GOLEM_SFU_JOB_SOFTMAX_DISTRIBUTED_COLUMNS",\n'
+    '    "GOLEM_SFU_JOB_SOFTMAX_ROW_ENGINE",\n'
+    '    "GOLEM_SFU_JOB_SOFTMAX_TENSOR_CONTROLLER",\n'
+    '    "GOLEM_SFU_SOFTMAX_HBM_LAYOUT",\n'
     '    "GOLEM_SFU_PRIMITIVE_HBM_STREAM",\n'
     '    "GOLEM_SFU_PRIMITIVE_HBM_ELEMS",\n'
     '    "GOLEM_SFU_PRIMITIVE_HBM_CHUNK_ELEMS",\n'

@@ -17,6 +17,7 @@ from golem_dtype import (
     pack_values,
     unpack_values,
 )
+from softmax_hbm_layout import softmax_row_location
 
 
 def align_up(value: int, align: int) -> int:
@@ -55,6 +56,10 @@ def main(argv=None):
     out_layout = os.getenv("GOLEM_GEMM_OUT_LAYOUT", "rowmajor").strip().lower()
     direct_rowmajor_softmax = (
         int(os.getenv("GOLEM_SFU_JOB_SOFTMAX_DIRECT_ROWMAJOR_HBM", "0")) != 0
+    )
+    softmax_hbm_layout = os.getenv("GOLEM_SFU_SOFTMAX_HBM_LAYOUT", "single_node")
+    softmax_staging_rows = max(
+        1, int(os.getenv("GOLEM_SFU_JOB_SOFTMAX_STAGING_ROWS", "1"))
     )
 
     num_memory_nodes = int(os.getenv("GOLEM_NUM_MEMORY_NODES", "4"))
@@ -200,17 +205,16 @@ def main(argv=None):
     if direct_rowmajor_softmax:
         if not data_nodes:
             raise ValueError("direct row-major softmax unpack requires at least one data node")
-        node_idx = data_nodes[0]
-        node_data = node_buffers[node_idx]
-        raw = node_data[
-            off_sfu_softmax_rowmajor_out_base :
-            off_sfu_softmax_rowmajor_out_base + rowmajor_matrix_bytes
-        ]
-        vals = unpack_values(dtype, raw)
+        row_bytes = n * elem_bytes
         for r in range(m):
-            row_base = r * n
+            node_idx, local_row = softmax_row_location(
+                r, softmax_staging_rows, data_nodes, softmax_hbm_layout
+            )
+            node_data = node_buffers[node_idx]
+            row_offset = off_sfu_softmax_rowmajor_out_base + local_row * row_bytes
+            vals = unpack_values(dtype, node_data[row_offset : row_offset + row_bytes])
             for cc in range(n):
-                c[r][cc] = vals[row_base + cc]
+                c[r][cc] = vals[cc]
     else:
         for task_id in range(total_tasks):
             m_tile = task_id // n_tiles
@@ -250,7 +254,7 @@ def main(argv=None):
 
     print(f"[UNPACK] wrote C tensor to: {out_file}")
     print(
-        f"[UNPACK] shape=({m},{n}), block=({block_m},{block_n},{block_k}), dtype={dtype}, layout={out_layout}, direct_rowmajor_softmax={int(direct_rowmajor_softmax)}, tasks={total_tasks}, macro_tasks={total_macro_tasks}, a_reuse_n={a_reuse_n_tiles}, b_reuse_m={b_reuse_m_tiles}"
+        f"[UNPACK] shape=({m},{n}), block=({block_m},{block_n},{block_k}), dtype={dtype}, layout={out_layout}, direct_rowmajor_softmax={int(direct_rowmajor_softmax)}, softmax_hbm_layout={softmax_hbm_layout}, tasks={total_tasks}, macro_tasks={total_macro_tasks}, a_reuse_n={a_reuse_n_tiles}, b_reuse_m={b_reuse_m_tiles}"
     )
 
 

@@ -3682,7 +3682,9 @@ int run_standalone_unified_job_softmax_band_for_core(
             static_cast<uint32_t>(worker_cores),
             0,
             static_cast<uint32_t>(executor_core_id),
-            0,
+            read_i64_env_or_default("GOLEM_SFU_JOB_SOFTMAX_ROW_ENGINE", 0) != 0
+                ? SFU_JOB_FLAG_ROW_ENGINE_MODEL
+                : 0,
             job_id ^ static_cast<uint64_t>(row_band_begin + job_row_begin),
             tag + static_cast<uint64_t>(sub_job_index));
         if (sfu_status != GOLEM_STATUS_OK) {
@@ -3923,10 +3925,8 @@ int run_standalone_unified_job_softmax_direct_band_for_core(
     bool trace_bands,
     uint64_t rowmajor_input_hbm,
     uint64_t rowmajor_output_hbm) {
-    const uint64_t band_offset_bytes =
-        static_cast<uint64_t>(row_band_begin) * static_cast<uint64_t>(cfg.n) *
-        sizeof(float);
-
+    const bool row_engine_model =
+        read_i64_env_or_default("GOLEM_SFU_JOB_SOFTMAX_ROW_ENGINE", 0) != 0;
     if (job_rows_per_issue <= 0 || job_rows_per_issue > row_band_rows) {
         job_rows_per_issue = row_band_rows;
     }
@@ -3951,9 +3951,9 @@ int run_standalone_unified_job_softmax_direct_band_for_core(
         const uint64_t sub_job_input_gm = input_gm;
         const uint64_t sub_job_output_gm = output_gm;
         const uint64_t sub_job_input_hbm =
-            rowmajor_input_hbm + band_offset_bytes + sub_job_offset_bytes;
+            rowmajor_input_hbm + sub_job_offset_bytes;
         const uint64_t sub_job_output_hbm =
-            rowmajor_output_hbm + band_offset_bytes + sub_job_offset_bytes;
+            rowmajor_output_hbm + sub_job_offset_bytes;
         if (trace_bands) {
             std::printf("[SOFTMAX-SFU-JOB] band_stage=direct-load row_band_begin=%d job_row_begin=%d sub_job_rows=%d bytes=%llu hbm=0x%llx tag=%llu\n",
                         row_band_begin,
@@ -4011,7 +4011,9 @@ int run_standalone_unified_job_softmax_direct_band_for_core(
             static_cast<uint32_t>(worker_cores),
             0,
             static_cast<uint32_t>(executor_core_id),
-            0,
+            row_engine_model
+                ? SFU_JOB_FLAG_ROW_ENGINE_MODEL
+                : 0,
             job_id ^ static_cast<uint64_t>(row_band_begin + job_row_begin),
             tag + static_cast<uint64_t>(sub_job_index));
         if (sfu_status != GOLEM_STATUS_OK) {
@@ -4035,7 +4037,11 @@ int run_standalone_unified_job_softmax_direct_band_for_core(
             std::fflush(stdout);
         }
         set_len(sub_job_bytes);
-        remote_store(sub_job_output_gm, sub_job_output_hbm);
+        if (row_engine_model) {
+            remote_store_wait(sub_job_output_gm, sub_job_output_hbm);
+        } else {
+            remote_store(sub_job_output_gm, sub_job_output_hbm);
+        }
         ++sub_job_index;
     }
 
@@ -4079,11 +4085,18 @@ int run_standalone_unified_job_softmax_for_core(int executor_core_id,
         read_i64_env_or_default("GOLEM_SFU_JOB_SOFTMAX_DIRECT_ROWMAJOR_HBM", 0) != 0;
     const bool distributed_columns =
         read_i64_env_or_default("GOLEM_SFU_JOB_SOFTMAX_DISTRIBUTED_COLUMNS", 0) != 0;
+    const bool row_engine_model =
+        read_i64_env_or_default("GOLEM_SFU_JOB_SOFTMAX_ROW_ENGINE", 0) != 0;
+    const bool tensor_controller =
+        read_i64_env_or_default("GOLEM_SFU_JOB_SOFTMAX_TENSOR_CONTROLLER", 0) != 0;
     const int total_bands = (cfg.m + staging_rows - 1) / staging_rows;
     if (!distributed_columns && band_core_count > total_bands) {
         band_core_count = total_bands;
     }
-    if (!distributed_columns && requested_core_id >= band_core_count) {
+    if (tensor_controller && requested_core_id != 0) {
+        return 0;
+    }
+    if (!tensor_controller && !distributed_columns && requested_core_id >= band_core_count) {
         return 0;
     }
     const int active_worker_slot = gemm_worker_slot_for_core(executor_core_id);
@@ -4156,8 +4169,11 @@ int run_standalone_unified_job_softmax_for_core(int executor_core_id,
         static_cast<uint64_t>(local_buffer_rows) * local_buffer_cols;
     const uint64_t local_buffer_bytes = local_buffer_elems * sizeof(float);
     const uint64_t local_buffer_bytes_aligned = align_up_constexpr(local_buffer_bytes, LOCAL_ALIGN);
-    const uint64_t required_bytes =
-        direct_rowmajor_hbm
+    const uint64_t tensor_scratch_bytes = static_cast<uint64_t>(
+        std::min(cfg.m, ACTIVE_GEMM_CORES * 4)) * static_cast<uint64_t>(cfg.n) * sizeof(float);
+    const uint64_t required_bytes = tensor_controller
+        ? tensor_scratch_bytes
+        : direct_rowmajor_hbm
             ? (local_buffer_bytes_aligned + local_buffer_bytes_aligned)
             : (band_matrix_bytes_aligned + band_matrix_bytes_aligned + tile_bytes_aligned);
     const uint64_t available_bytes =
@@ -4198,10 +4214,10 @@ int run_standalone_unified_job_softmax_for_core(int executor_core_id,
         row_band.assign(static_cast<size_t>(band_matrix_elems), 0.0f);
         tile.assign(static_cast<size_t>(tile_elems), 0.0f);
     }
-    const uint64_t rowmajor_input_hbm =
-        node_base_addr(kSfuSoftmaxRowmajorDataNode) + OFF_SFU_SOFTMAX_ROWMAJOR_BASE;
-    const uint64_t rowmajor_output_hbm =
-        node_base_addr(kSfuSoftmaxRowmajorDataNode) + OFF_SFU_SOFTMAX_ROWMAJOR_OUT_BASE;
+    const char* softmax_hbm_layout = std::getenv("GOLEM_SFU_SOFTMAX_HBM_LAYOUT");
+    const bool band_striped_hbm = softmax_hbm_layout != nullptr &&
+        (std::strcmp(softmax_hbm_layout, "band_striped") == 0 ||
+         std::strcmp(softmax_hbm_layout, "striped") == 0);
 
     uint64_t chunk_elems = static_cast<uint64_t>(
         read_i64_env_or_default("GOLEM_SFU_JOB_SOFTMAX_CHUNK_ELEMS", 256));
@@ -4211,6 +4227,8 @@ int run_standalone_unified_job_softmax_for_core(int executor_core_id,
     const bool trace_bands =
         read_i64_env_or_default("GOLEM_SFU_JOB_SOFTMAX_TRACE_BANDS", 0) != 0;
     const uint64_t tag = kPrimitiveTagBase + 0xa00000ULL;
+    uint64_t row_engine_start_cycle = 0;
+    uint64_t row_engine_rows = 0;
 
     std::printf("[SOFTMAX] dispatch=sfu-standalone-unified-job-softmax rows=%d dim=%d chunk=%llu workers=%llu staging_rows=%d job_rows=%d band_cores=%d direct_rowmajor_hbm=%d distributed_columns=%d executor_core=%d requested_core=%d\n",
                 cfg.m,
@@ -4226,7 +4244,68 @@ int run_standalone_unified_job_softmax_for_core(int executor_core_id,
                 requested_core_id);
     std::fflush(stdout);
 
+    // Exclude benchmark diagnostics from the accelerator kernel timing window.
+    row_engine_start_cycle = row_engine_model ? read_cycle_counter() : 0;
+
+    if (tensor_controller) {
+        if (!row_engine_model || !direct_rowmajor_hbm || !band_striped_hbm) {
+            std::fprintf(stderr,
+                         "[SOFTMAX-TENSOR-CONTROLLER] requires Row Engine, direct HBM, and band striping\n");
+            return 1;
+        }
+        const uint64_t params_gm = desc_gm + sizeof(SFUJobDesc);
+        const uint64_t rowmajor_input_hbm =
+            node_base_addr(kSfuSoftmaxRowmajorDataNode) + OFF_SFU_SOFTMAX_ROWMAJOR_BASE;
+        const uint64_t rowmajor_output_hbm =
+            node_base_addr(kSfuSoftmaxRowmajorDataNode) + OFF_SFU_SOFTMAX_ROWMAJOR_OUT_BASE;
+        const uint32_t row_contexts = static_cast<uint32_t>(
+            std::min(cfg.m, ACTIVE_GEMM_CORES * 4));
+        golem_softmax_launch_timeline_t launch_timeline = {};
+        const golem_status_t status = golemRunTensorSoftmaxSfuJob(
+            &softmax_desc,
+            executor_core_id,
+            &cfg,
+            rowmajor_input_hbm,
+            rowmajor_output_hbm,
+            input_gm,
+            params_gm,
+            desc_gm,
+            GOLEM_MEM_NODE_SIZE_BYTES,
+            static_cast<uint32_t>(staging_rows),
+            row_contexts,
+            ACTIVE_GEMM_CORES,
+            job_id,
+            tag,
+            &launch_timeline);
+        if (status != GOLEM_STATUS_OK) {
+            std::fprintf(stderr,
+                         "[SOFTMAX-TENSOR-CONTROLLER] failed: %s\n",
+                         golemSoftmaxSfuGetLastErrorString());
+            return 1;
+        }
+        const uint64_t row_engine_end_cycle = read_cycle_counter();
+        std::printf("[SOFTMAX-ROW-ENGINE] core=%d rows=%d start_cycle=%llu end_cycle=%llu cycles=%llu output_dma_completion=1 tensor_controller=1 launch_start_cycle=%llu descriptors_ready_cycle=%llu params_write_done_cycle=%llu desc_write_done_cycle=%llu issue_return_cycle=%llu wait_start_cycle=%llu wait_return_cycle=%llu\n",
+                    executor_core_id,
+                    cfg.m,
+                    static_cast<unsigned long long>(row_engine_start_cycle),
+                    static_cast<unsigned long long>(row_engine_end_cycle),
+                    static_cast<unsigned long long>(row_engine_end_cycle - row_engine_start_cycle),
+                    static_cast<unsigned long long>(launch_timeline.launch_start_cycle),
+                    static_cast<unsigned long long>(launch_timeline.descriptors_ready_cycle),
+                    static_cast<unsigned long long>(launch_timeline.params_write_done_cycle),
+                    static_cast<unsigned long long>(launch_timeline.desc_write_done_cycle),
+                    static_cast<unsigned long long>(launch_timeline.issue_return_cycle),
+                    static_cast<unsigned long long>(launch_timeline.wait_start_cycle),
+                    static_cast<unsigned long long>(launch_timeline.wait_return_cycle));
+        std::fflush(stdout);
+        return 0;
+    }
+
     if (distributed_columns) {
+        const uint64_t rowmajor_input_hbm =
+            node_base_addr(kSfuSoftmaxRowmajorDataNode) + OFF_SFU_SOFTMAX_ROWMAJOR_BASE;
+        const uint64_t rowmajor_output_hbm =
+            node_base_addr(kSfuSoftmaxRowmajorDataNode) + OFF_SFU_SOFTMAX_ROWMAJOR_OUT_BASE;
         const int status =
             run_standalone_unified_job_softmax_distributed_direct_for_core(
                 executor_core_id,
@@ -4275,6 +4354,19 @@ int run_standalone_unified_job_softmax_for_core(int executor_core_id,
             continue;
         }
         const uint64_t band_tag = tag + static_cast<uint64_t>(band_index);
+        const int data_node_count = std::max(1, GOLEM_NUM_MEMORY_NODES - 1);
+        const int data_node = band_striped_hbm
+            ? 1 + (band_index % data_node_count)
+            : kSfuSoftmaxRowmajorDataNode;
+        const uint64_t local_band = band_striped_hbm
+            ? static_cast<uint64_t>(band_index / data_node_count)
+            : static_cast<uint64_t>(row_band_begin / staging_rows);
+        const uint64_t local_band_offset = local_band * static_cast<uint64_t>(staging_rows) *
+            static_cast<uint64_t>(cfg.n) * sizeof(float);
+        const uint64_t rowmajor_input_hbm = node_base_addr(data_node) +
+            OFF_SFU_SOFTMAX_ROWMAJOR_BASE + local_band_offset;
+        const uint64_t rowmajor_output_hbm = node_base_addr(data_node) +
+            OFF_SFU_SOFTMAX_ROWMAJOR_OUT_BASE + local_band_offset;
         const int status = direct_rowmajor_hbm
             ? run_standalone_unified_job_softmax_direct_band_for_core(
                   executor_core_id,
@@ -4317,7 +4409,19 @@ int run_standalone_unified_job_softmax_for_core(int executor_core_id,
                          requested_core_id);
             return status;
         }
+        row_engine_rows += static_cast<uint64_t>(row_band_rows);
         ++band_index;
+    }
+
+    if (row_engine_model) {
+        const uint64_t row_engine_end_cycle = read_cycle_counter();
+        std::printf("[SOFTMAX-ROW-ENGINE] core=%d rows=%llu start_cycle=%llu end_cycle=%llu cycles=%llu output_dma_completion=1\n",
+                    executor_core_id,
+                    static_cast<unsigned long long>(row_engine_rows),
+                    static_cast<unsigned long long>(row_engine_start_cycle),
+                    static_cast<unsigned long long>(row_engine_end_cycle),
+                    static_cast<unsigned long long>(row_engine_end_cycle - row_engine_start_cycle));
+        std::fflush(stdout);
     }
 
     std::printf("[SOFTMAX] mode=sfu-standalone-job-softmax executor_core=%d requested_core=%d rows=%d dim=%d chunk_elems=%llu worker_cores=%llu staging_rows=%d job_rows=%d band_cores=%d direct_rowmajor_hbm=%d distributed_columns=0 PASS\n",

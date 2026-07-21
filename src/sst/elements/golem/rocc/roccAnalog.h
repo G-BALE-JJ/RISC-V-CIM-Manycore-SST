@@ -62,6 +62,7 @@ constexpr uint8_t GOLEM_ROCC_FUNC7_SFU_PRIMITIVE_WAIT = 0x1a;
 constexpr uint8_t GOLEM_ROCC_FUNC7_SFU_PRIMITIVE_BATCH = 0x1b;
 constexpr uint8_t GOLEM_ROCC_FUNC7_SFU_PRIMITIVE_BATCH_WAIT = 0x1c;
 constexpr uint8_t GOLEM_ROCC_FUNC7_SFU_JOB = 0x1d;
+constexpr uint8_t GOLEM_ROCC_FUNC7_REMOTE_STORE_WAIT = 0x1e;
 
 template <typename T>
 class RoCCAnalog : public SST::Vanadis::VanadisRoCCInterface {
@@ -420,6 +421,11 @@ public:
                 delete next_cmd;
                 return;
             }
+            if (next_cmd->inst->func7 == GOLEM_ROCC_FUNC7_SFU_WAIT &&
+                sfuWaitBlocked_ && next_cmd->cmd_id == sfuWaitBlockedCmdId_ &&
+                getCurrentSimCycle() < sfuWaitBlockedUntilTick_) {
+                return;
+            }
             if (next_cmd != nullptr && next_cmd->inst != nullptr && next_cmd->inst->func7 == 0x3) {
                 const uint64_t array_id = next_cmd->rs1;
                 const bool is_async_compute = (next_cmd->inst->rd == 0);
@@ -656,6 +662,12 @@ public:
                               "Instruction read: remote_ld (MVM remote load)\n");
                     RemoteLoad(cycle);
                 } break;
+                case GOLEM_ROCC_FUNC7_REMOTE_STORE_WAIT:
+                {
+                    output->verbose(CALL_INFO, 1, 0,
+                              "Instruction read: remote_st.wait (waitable HBM store)\n");
+                    RemoteStoreWait(cycle);
+                } break;
                 case 0xB: //mvm.slen Remote transfer length setup
                 {
                     output->verbose(CALL_INFO, 1, 0,
@@ -778,6 +790,9 @@ public:
                         break;
                     case 0xA:
                         RemoteLoad(cycle);
+                        break;
+                    case GOLEM_ROCC_FUNC7_REMOTE_STORE_WAIT:
+                        RemoteStoreWait(cycle);
                         break;
                     default:
                         break;
@@ -1041,6 +1056,20 @@ public:
                 cmd->inst->rd, 1, cmd->cmd_id, cmd->hw_thread));
             delete cmd;
             return true;
+        }
+        uint64_t completionTick = 0;
+        if (sfuWaitBlocked_ && cmd->cmd_id == sfuWaitBlockedCmdId_) {
+            if (getCurrentSimCycle() < sfuWaitBlockedUntilTick_) {
+                return false;
+            }
+            sfuWaitBlocked_ = false;
+        }
+        if (sfu->completionTick(cmd->rs1, &completionTick) &&
+            getCurrentSimCycle() < completionTick) {
+            sfuWaitBlocked_ = true;
+            sfuWaitBlockedCmdId_ = cmd->cmd_id;
+            sfuWaitBlockedUntilTick_ = completionTick;
+            return false;
         }
         uint64_t status = 1;
         if (!sfu->wait(cmd->rs1, &status)) {
@@ -1468,6 +1497,29 @@ public:
         completeRoCC(0);  // 发送后即可返回（若需 ACK，可扩展为等待网络回包）
     }
 
+    void RemoteStoreWait(uint64_t cycle) {
+        const uint64_t cycles_elapsed =
+            (cycle >= StartTickCycle) ? (cycle - StartTickCycle + 1) : 0;
+        if (remoteStoreCompletionToken == 0) {
+            if (cycles_elapsed < latency_remote_st) {
+                return;
+            }
+            const uint64_t local_addr = curr_cmd->rs1;
+            const uint64_t host_addr = curr_cmd->rs2;
+            const size_t length = resolveRemoteLength();
+            std::vector<uint8_t> data(length);
+            globalMem->rd_from_globalmem(local_addr, length, data);
+            remoteStoreCompletionToken =
+                globalMem->dma_write_to_host_async(host_addr, length, data);
+        }
+        if (!globalMem->dma_completion_done(remoteStoreCompletionToken)) {
+            return;
+        }
+        globalMem->dma_completion_retire(remoteStoreCompletionToken);
+        remoteStoreCompletionToken = 0;
+        completeRoCC(0);
+    }
+
     void RemoteLoad(uint64_t cycle) {
         uint64_t cycles_elapsed = (cycle >= StartTickCycle) ? (cycle - StartTickCycle + 1) : 0;
 
@@ -1641,7 +1693,10 @@ public:
                 case 0x6: stat_cycles_mvm_ovec2gm->addData(cycles_spent); break;
                 case 0x7: stat_cycles_mvm_gm2ivec->addData(cycles_spent); break;
                 case 0x8: stat_cycles_mvm_gm2imat->addData(cycles_spent); break;
-                case 0x9: stat_cycles_remote_st->addData(cycles_spent); break;
+                case 0x9:
+                case GOLEM_ROCC_FUNC7_REMOTE_STORE_WAIT:
+                    stat_cycles_remote_st->addData(cycles_spent);
+                    break;
                 case 0xA: stat_cycles_remote_ld->addData(cycles_spent); break;
                 default: break;
             }
@@ -2161,6 +2216,9 @@ private:
     SST::Golem::RequestSchedulerAPI *requestScheduler;
     SST::Golem::WorkerCommandProcessorAPI *workerCommandProcessor;
     SST::Golem::SFUAPI *sfu;
+    bool sfuWaitBlocked_ = false;
+    uint64_t sfuWaitBlockedCmdId_ = 0;
+    uint64_t sfuWaitBlockedUntilTick_ = 0;
     uint64_t coreID;
 
   
@@ -2222,6 +2280,7 @@ private:
     uint64_t write_offset;
     std::vector<uint8_t> outputPayload;
     size_t remoteTransferLength;
+    uint64_t remoteStoreCompletionToken = 0;
     bool enable_async_array_load = true;
     bool sfuEnable = false;
 

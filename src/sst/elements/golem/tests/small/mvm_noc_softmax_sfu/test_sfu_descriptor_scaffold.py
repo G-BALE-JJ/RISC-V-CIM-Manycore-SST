@@ -168,6 +168,10 @@ class SfuDescriptorScaffoldTest(unittest.TestCase):
         self.assertIn("reserved0 stores the worker slot", self.header)
         self.assertIn("reserved0 stores the worker slot", self.guest_header)
 
+        row_engine_declaration = "SFU_JOB_FLAG_ROW_ENGINE_MODEL = 0x4u"
+        self.assertIn(row_engine_declaration, self.header)
+        self.assertIn(row_engine_declaration, self.guest_header)
+
     def test_unified_job_is_new_official_api_without_removing_legacy_debug_abi(self):
         self.assertIn("virtual bool issueJob(uint64_t descAddr, uint64_t tag) = 0", self.header)
         self.assertIn("bool issueJob(uint64_t descAddr, uint64_t tag) override", self.header)

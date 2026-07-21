@@ -50,6 +50,21 @@ class CpuBuilderSfuMountTest(unittest.TestCase):
             self.text,
         )
 
+    def test_passes_row_engine_hardware_parameters_to_each_physical_sfu(self):
+        for declaration in [
+            'sfu_vector_lanes = os.getenv("GOLEM_SFU_VECTOR_LANES", "16")',
+            'sfu_exp_lanes = os.getenv("GOLEM_SFU_EXP_LANES", "4")',
+            'sfu_reduction_tree_latency = os.getenv("GOLEM_SFU_REDUCTION_TREE_LATENCY", "4")',
+            'sfu_exp_latency = os.getenv("GOLEM_SFU_EXP_LATENCY", "8")',
+            'sfu_reciprocal_latency = os.getenv("GOLEM_SFU_RECIPROCAL_LATENCY", "1")',
+            'sfu_row_contexts = os.getenv("GOLEM_SFU_ROW_CONTEXTS", "4")',
+            'sfu_scratchpad_bytes = os.getenv("GOLEM_SFU_SCRATCHPAD_BYTES", "65536")',
+        ]:
+            self.assertIn(declaration, self.text)
+        self.assertIn('"accelerator_clock_hz": int(_parse_frequency_hz(cpu_clock))', self.text)
+        self.assertIn('"vector_lanes": sfu_vector_lanes', self.text)
+        self.assertIn('"exp_lanes": sfu_exp_lanes', self.text)
+
     def test_passes_reduction_vn_only_to_global_memory(self):
         self.assertIn(
             'sfu_reduction_vn = os.getenv("GOLEM_SFU_REDUCTION_VN", "")',

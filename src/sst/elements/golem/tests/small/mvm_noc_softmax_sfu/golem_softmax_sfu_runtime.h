@@ -91,6 +91,31 @@ enum class SFUJobSubOp : uint32_t {
 
 constexpr uint32_t SFU_JOB_FLAG_DISTRIBUTED_COLUMNS = 0x1u;
 constexpr uint32_t SFU_JOB_FLAG_DISTRIBUTED_ABORT = 0x2u;
+constexpr uint32_t SFU_JOB_FLAG_ROW_ENGINE_MODEL = 0x4u;
+constexpr uint32_t SFU_JOB_FLAG_TENSOR_ROW_ENGINE = 0x8u;
+constexpr uint32_t SFU_SOFTMAX_JOB_PARAMS_MAGIC = 0x53465531u;
+constexpr uint16_t SFU_SOFTMAX_JOB_PARAMS_VERSION = 1u;
+constexpr uint32_t SFU_SOFTMAX_HBM_LAYOUT_BAND_STRIPED = 1u;
+
+struct SFUSoftmaxJobParamsV1 {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t size_bytes;
+    uint32_t mapping_policy;
+    uint32_t tiles_per_row;
+    uint32_t row_contexts_hint;
+    uint32_t hbm_layout;
+    uint32_t data_node_mask;
+    uint32_t flags;
+    uint64_t completion_addr;
+    uint64_t node_stride_bytes;
+    uint32_t rows_per_band;
+    uint32_t coordinator_core;
+    uint64_t reserved0;
+};
+
+static_assert(sizeof(SFUSoftmaxJobParamsV1) == 64,
+              "Tensor softmax parameter ABI must match golem.SFU");
 
 struct SFUJobDesc {
     uint64_t job_id;
@@ -152,6 +177,33 @@ golem_status_t golemRunStandaloneSoftmaxSfuJobForCore(
     uint32_t flags,
     uint64_t job_id,
     uint64_t tag);
+
+typedef struct {
+    uint64_t launch_start_cycle;
+    uint64_t descriptors_ready_cycle;
+    uint64_t params_write_done_cycle;
+    uint64_t desc_write_done_cycle;
+    uint64_t issue_return_cycle;
+    uint64_t wait_start_cycle;
+    uint64_t wait_return_cycle;
+} golem_softmax_launch_timeline_t;
+
+golem_status_t golemRunTensorSoftmaxSfuJob(
+    const golem_softmax_op_desc_t* op_desc,
+    int executor_core_id,
+    const MatmulRuntimeConfig* cfg,
+    uint64_t input_hbm,
+    uint64_t output_hbm,
+    uint64_t scratch_gm,
+    uint64_t params_gm,
+    uint64_t desc_gm,
+    uint64_t node_stride_bytes,
+    uint32_t rows_per_band,
+    uint32_t row_contexts,
+    uint32_t physical_engines,
+    uint64_t job_id,
+    uint64_t tag,
+    golem_softmax_launch_timeline_t* timeline);
 
 golem_status_t golemRunSoftmaxSfuTileFromLocalAccum(
     const golem_softmax_op_desc_t* op_desc,

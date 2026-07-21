@@ -1268,7 +1268,7 @@ void GlobalMemoryImplement::dma_read_from_host_to_globalmem_impl(uint64_t src_pa
         op.request_id = next_dma_request_id++;
         op.host_addr = src_pa + offset;
         op.gm_dst_addr = gm_dst_addr + offset;
-        op.cb = DmaCallback();
+        op.cb = ctx ? DmaCallback() : cb;
         op.length = xfer;
         op.ctx = ctx;
         op.completion_enabled = ctx ? false : true;

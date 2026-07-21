@@ -1,0 +1,282 @@
+<?xml version="1.0" encoding="utf-8" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN"
+  "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg xmlns:xlink="http://www.w3.org/1999/xlink" width="694.8pt" height="355.787875pt" viewBox="0 0 694.8 355.787875" xmlns="http://www.w3.org/2000/svg" version="1.1">
+ <metadata>
+  <rdf:RDF xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:cc="http://creativecommons.org/ns#" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+   <cc:Work>
+    <dc:type rdf:resource="http://purl.org/dc/dcmitype/StillImage"/>
+    <dc:date>2026-07-21T22:16:07.471162</dc:date>
+    <dc:format>image/svg+xml</dc:format>
+    <dc:creator>
+     <cc:Agent>
+      <dc:title>Matplotlib v3.10.9, https://matplotlib.org/</dc:title>
+     </cc:Agent>
+    </dc:creator>
+   </cc:Work>
+  </rdf:RDF>
+ </metadata>
+ <defs>
+  <style type="text/css">*{stroke-linejoin: round; stroke-linecap: butt}</style>
+ </defs>
+ <g id="figure_1">
+  <g id="patch_1">
+   <path d="M 0 355.787875 
+L 694.8 355.787875 
+L 694.8 0 
+L 0 0 
+z
+" style="fill: #ffffff"/>
+  </g>
+  <g id="axes_1">
+   <g id="patch_2">
+    <path d="M 29.88 316.296 
+L 522.554157 316.296 
+L 522.554157 79.128 
+L 29.88 79.128 
+z
+" style="fill: #ffffff"/>
+   </g>
+   <g id="patch_3">
+    <path d="M 40.083141 163.870162 
+L 478.06707 163.870162 
+L 478.06707 135.255926 
+L 40.083141 135.255926 
+z
+" clip-path="url(#p1148d7465c)" style="fill: #3775ba; stroke: #ffffff; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_4">
+    <path d="M 41.891469 218.897541 
+L 501.151069 218.897541 
+L 501.151069 190.283304 
+L 41.891469 190.283304 
+z
+" clip-path="url(#p1148d7465c)" style="fill: #0f4d92; stroke: #ffffff; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_5">
+    <path d="M 49.103915 273.924919 
+L 502.938531 273.924919 
+L 502.938531 245.310682 
+L 49.103915 245.310682 
+z
+" clip-path="url(#p1148d7465c)" style="fill: #42949e; stroke: #ffffff; stroke-linejoin: miter"/>
+   </g>
+   <g id="matplotlib.axis_1">
+    <g id="xtick_1">
+     <g id="line2d_1">
+      <path d="M 38.226128 316.296 
+L 38.226128 79.128 
+" clip-path="url(#p1148d7465c)" style="fill: none; stroke: #d9d9d9; stroke-width: 0.65; stroke-linecap: square"/>
+     </g>
+     <g id="line2d_2">
+      <defs>
+       <path id="mc179e1fbb0" d="M 0 0 
+L 0 3.5 
+" style="stroke: #000000; stroke-width: 0.8"/>
+      </defs>
+      <g>
+       <use xlink:href="#mc179e1fbb0" x="38.226128" y="316.296" style="stroke: #000000; stroke-width: 0.8"/>
+      </g>
+     </g>
+     <g id="text_1">
+      <text style="font-size: 10px; font-family: 'Noto Sans CJK SC', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: middle" x="38.226128" y="330.894437" transform="rotate(-0 38.226128 330.894437)">0</text>
+     </g>
+    </g>
+    <g id="xtick_2">
+     <g id="line2d_3">
+      <path d="M 107.777194 316.296 
+L 107.777194 79.128 
+" clip-path="url(#p1148d7465c)" style="fill: none; stroke: #d9d9d9; stroke-width: 0.65; stroke-linecap: square"/>
+     </g>
+     <g id="line2d_4">
+      <g>
+       <use xlink:href="#mc179e1fbb0" x="107.777194" y="316.296" style="stroke: #000000; stroke-width: 0.8"/>
+      </g>
+     </g>
+     <g id="text_2">
+      <text style="font-size: 10px; font-family: 'Noto Sans CJK SC', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: middle" x="107.777194" y="330.894437" transform="rotate(-0 107.777194 330.894437)">10000</text>
+     </g>
+    </g>
+    <g id="xtick_3">
+     <g id="line2d_5">
+      <path d="M 177.32826 316.296 
+L 177.32826 79.128 
+" clip-path="url(#p1148d7465c)" style="fill: none; stroke: #d9d9d9; stroke-width: 0.65; stroke-linecap: square"/>
+     </g>
+     <g id="line2d_6">
+      <g>
+       <use xlink:href="#mc179e1fbb0" x="177.32826" y="316.296" style="stroke: #000000; stroke-width: 0.8"/>
+      </g>
+     </g>
+     <g id="text_3">
+      <text style="font-size: 10px; font-family: 'Noto Sans CJK SC', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: middle" x="177.32826" y="330.894437" transform="rotate(-0 177.32826 330.894437)">20000</text>
+     </g>
+    </g>
+    <g id="xtick_4">
+     <g id="line2d_7">
+      <path d="M 246.879326 316.296 
+L 246.879326 79.128 
+" clip-path="url(#p1148d7465c)" style="fill: none; stroke: #d9d9d9; stroke-width: 0.65; stroke-linecap: square"/>
+     </g>
+     <g id="line2d_8">
+      <g>
+       <use xlink:href="#mc179e1fbb0" x="246.879326" y="316.296" style="stroke: #000000; stroke-width: 0.8"/>
+      </g>
+     </g>
+     <g id="text_4">
+      <text style="font-size: 10px; font-family: 'Noto Sans CJK SC', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: middle" x="246.879326" y="330.894437" transform="rotate(-0 246.879326 330.894437)">30000</text>
+     </g>
+    </g>
+    <g id="xtick_5">
+     <g id="line2d_9">
+      <path d="M 316.430392 316.296 
+L 316.430392 79.128 
+" clip-path="url(#p1148d7465c)" style="fill: none; stroke: #d9d9d9; stroke-width: 0.65; stroke-linecap: square"/>
+     </g>
+     <g id="line2d_10">
+      <g>
+       <use xlink:href="#mc179e1fbb0" x="316.430392" y="316.296" style="stroke: #000000; stroke-width: 0.8"/>
+      </g>
+     </g>
+     <g id="text_5">
+      <text style="font-size: 10px; font-family: 'Noto Sans CJK SC', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: middle" x="316.430392" y="330.894437" transform="rotate(-0 316.430392 330.894437)">40000</text>
+     </g>
+    </g>
+    <g id="xtick_6">
+     <g id="line2d_11">
+      <path d="M 385.981458 316.296 
+L 385.981458 79.128 
+" clip-path="url(#p1148d7465c)" style="fill: none; stroke: #d9d9d9; stroke-width: 0.65; stroke-linecap: square"/>
+     </g>
+     <g id="line2d_12">
+      <g>
+       <use xlink:href="#mc179e1fbb0" x="385.981458" y="316.296" style="stroke: #000000; stroke-width: 0.8"/>
+      </g>
+     </g>
+     <g id="text_6">
+      <text style="font-size: 10px; font-family: 'Noto Sans CJK SC', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: middle" x="385.981458" y="330.894437" transform="rotate(-0 385.981458 330.894437)">50000</text>
+     </g>
+    </g>
+    <g id="xtick_7">
+     <g id="line2d_13">
+      <path d="M 455.532524 316.296 
+L 455.532524 79.128 
+" clip-path="url(#p1148d7465c)" style="fill: none; stroke: #d9d9d9; stroke-width: 0.65; stroke-linecap: square"/>
+     </g>
+     <g id="line2d_14">
+      <g>
+       <use xlink:href="#mc179e1fbb0" x="455.532524" y="316.296" style="stroke: #000000; stroke-width: 0.8"/>
+      </g>
+     </g>
+     <g id="text_7">
+      <text style="font-size: 10px; font-family: 'Noto Sans CJK SC', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: middle" x="455.532524" y="330.894437" transform="rotate(-0 455.532524 330.894437)">60000</text>
+     </g>
+    </g>
+    <g id="text_8">
+     <text style="font-size: 12px; font-family: 'Noto Sans CJK SC', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: middle" x="276.217079" y="346.09225" transform="rotate(-0 276.217079 346.09225)">Cycles from descriptor acceptance</text>
+    </g>
+   </g>
+   <g id="matplotlib.axis_2"/>
+   <g id="line2d_15">
+    <path d="M 503.926156 316.296 
+L 503.926156 79.128 
+" clip-path="url(#p1148d7465c)" style="fill: none; stroke-dasharray: 4.44,1.92; stroke-dashoffset: 0; stroke: #272727; stroke-width: 1.2"/>
+   </g>
+   <g id="LineCollection_1">
+    <path d="M 38.226128 293.734775 
+L 503.926156 293.734775 
+" clip-path="url(#p1148d7465c)" style="fill: none; stroke: #a9a9a9; stroke-width: 5"/>
+   </g>
+   <g id="line2d_16">
+    <path d="M 503.926156 293.734775 
+" clip-path="url(#p1148d7465c)" style="fill: none; stroke: #b64342; stroke-width: 1.5; stroke-linecap: square"/>
+    <defs>
+     <path id="m544f054f14" d="M 0 2.5 
+C 0.663008 2.5 1.29895 2.236584 1.767767 1.767767 
+C 2.236584 1.29895 2.5 0.663008 2.5 0 
+C 2.5 -0.663008 2.236584 -1.29895 1.767767 -1.767767 
+C 1.29895 -2.236584 0.663008 -2.5 0 -2.5 
+C -0.663008 -2.5 -1.29895 -2.236584 -1.767767 -1.767767 
+C -2.236584 -1.29895 -2.5 -0.663008 -2.5 0 
+C -2.5 0.663008 -2.236584 1.29895 -1.767767 1.767767 
+C -1.29895 2.236584 -0.663008 2.5 0 2.5 
+z
+" style="stroke: #b64342"/>
+    </defs>
+    <g clip-path="url(#p1148d7465c)">
+     <use xlink:href="#m544f054f14" x="503.926156" y="293.734775" style="fill: #b64342; stroke: #b64342"/>
+    </g>
+   </g>
+   <g id="patch_6">
+    <path d="M 29.88 316.296 
+L 29.88 79.128 
+" style="fill: none; stroke: #000000; stroke-width: 0.9; stroke-linejoin: miter; stroke-linecap: square"/>
+   </g>
+   <g id="patch_7">
+    <path d="M 29.88 316.296 
+L 522.554157 316.296 
+" style="fill: none; stroke: #000000; stroke-width: 0.9; stroke-linejoin: miter; stroke-linecap: square"/>
+   </g>
+   <g id="text_9">
+    <text style="font-weight: 700; font-size: 12px; font-family: 'Noto Sans CJK SC', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: middle; fill: #ffffff" x="259.075106" y="152.827419" transform="rotate(-0 259.075106 152.827419)">Max window: 62,973 cycles</text>
+   </g>
+   <g id="text_10">
+    <text style="font-weight: 700; font-size: 12px; font-family: 'Noto Sans CJK SC', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: middle; fill: #ffffff" x="271.521269" y="207.854797" transform="rotate(-0 271.521269 207.854797)">Exp + sum window: 66,032 cycles</text>
+   </g>
+   <g id="text_11">
+    <text style="font-weight: 700; font-size: 12px; font-family: 'Noto Sans CJK SC', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: middle; fill: #ffffff" x="276.021223" y="262.882175" transform="rotate(-0 276.021223 262.882175)">Normalize window: 65,252 cycles</text>
+   </g>
+   <g id="text_12">
+    <text style="font-size: 11px; font-family: 'Noto Sans CJK SC', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: end; fill: #272727" x="499.753092" y="126.364984" transform="rotate(-0 499.753092 126.364984)">actual completion 66,958</text>
+   </g>
+   <g id="patch_8">
+    <path d="M 246.879326 96.421251 
+Q 246.879326 102.731187 246.879326 109.041122 
+" style="fill: none; stroke: #767676; stroke-width: 1.1; stroke-linecap: round"/>
+    <path d="M 131.379326 115.641122 
+L 131.379326 109.041122 
+L 362.379326 109.041122 
+L 362.379326 115.641122 
+" style="fill: none; stroke: #767676; stroke-width: 1.1; stroke-linecap: round"/>
+   </g>
+   <g id="text_13">
+    <text style="font-size: 11px; font-family: 'Noto Sans CJK SC', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: middle" x="246.879326" y="90.133476" transform="rotate(-0 246.879326 90.133476)">pipeline overlap = 31,755 cycles (32.3% of active work)</text>
+   </g>
+   <g id="text_14">
+    <text style="font-size: 10px; font-family: 'Noto Sans CJK SC', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: end; fill: #767676" x="499.753092" y="296.49415" transform="rotate(-0 499.753092 296.49415)">last output ACK + worker completion</text>
+   </g>
+  </g>
+  <g id="axes_2">
+   <g id="patch_9">
+    <path d="M 553.874157 316.296 
+L 687.6 316.296 
+L 687.6 79.128 
+L 553.874157 79.128 
+z
+" style="fill: #ffffff"/>
+   </g>
+   <g id="matplotlib.axis_3"/>
+   <g id="matplotlib.axis_4"/>
+   <g id="text_15">
+    <text style="font-size: 10px; font-family: 'Noto Sans CJK SC', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: end; fill: #3775ba" x="674.227416" y="152.322419" transform="rotate(-0 674.227416 152.322419)">active 16,384</text>
+   </g>
+   <g id="text_16">
+    <text style="font-size: 10px; font-family: 'Noto Sans CJK SC', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: end; fill: #0f4d92" x="674.227416" y="207.349797" transform="rotate(-0 674.227416 207.349797)">active 65,536</text>
+   </g>
+   <g id="text_17">
+    <text style="font-size: 10px; font-family: 'Noto Sans CJK SC', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: end; fill: #42949e" x="674.227416" y="262.377175" transform="rotate(-0 674.227416 262.377175)">active 16,384</text>
+   </g>
+   <g id="text_18">
+    <text style="font-weight: 700; font-size: 10px; font-family: 'Noto Sans CJK SC', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: end; fill: #767676" x="674.227416" y="107.160906" transform="rotate(-0 674.227416 107.160906)">Active cycles</text>
+   </g>
+  </g>
+  <g id="text_19">
+   <text style="font-weight: 700; font-size: 19px; font-family: 'Noto Sans CJK SC', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #272727" x="7.2" y="21.637031" transform="rotate(-0 7.2 21.637031)">1024 x 4096 Softmax: causal Row Engine pipeline</text>
+  </g>
+ </g>
+ <defs>
+  <clipPath id="p1148d7465c">
+   <rect x="29.88" y="79.128" width="492.674157" height="237.168"/>
+  </clipPath>
+ </defs>
+</svg>

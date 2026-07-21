@@ -43,6 +43,8 @@ enum class ReductionTransportMessageKind {
     MaxResponse,
     SumRequest,
     SumResponse,
+    TensorRowDispatch,
+    TensorRowComplete,
 };
 
 struct ReductionTransportMessage {
@@ -57,6 +59,11 @@ struct ReductionTransportMessage {
     uint32_t expectedCols = 0;
     uint64_t sendCycle = 0;
     double value = 0.0;
+    uint64_t inputAddr = 0;
+    uint64_t outputAddr = 0;
+    uint64_t nodeStrideBytes = 0;
+    uint32_t dataNodeMask = 0;
+    uint32_t rowsPerBand = 0;
 
     void serialize_order(SST::Core::Serialization::serializer& ser) {
         ser & kind;
@@ -70,6 +77,11 @@ struct ReductionTransportMessage {
         ser & expectedCols;
         ser & sendCycle;
         ser & value;
+        ser & inputAddr;
+        ser & outputAddr;
+        ser & nodeStrideBytes;
+        ser & dataNodeMask;
+        ser & rowsPerBand;
     }
 };
 
@@ -180,6 +192,10 @@ public:
     virtual uint64_t getSize() const = 0;
     virtual void dma_write_to_host(uint64_t dst_pa, size_t length, const std::vector<uint8_t>& data, DmaCallback cb) = 0;
     virtual void dma_read_from_host_to_globalmem(uint64_t src_pa, size_t length, uint64_t gm_dst_addr, DmaCallback cb) = 0;
+    virtual uint64_t dma_write_to_host_async(uint64_t dst_pa, size_t length,
+                                             const std::vector<uint8_t>& data) = 0;
+    virtual bool dma_completion_done(uint64_t token) const = 0;
+    virtual void dma_completion_retire(uint64_t token) = 0;
     virtual bool reductionNetworkAvailable() const = 0;
     virtual bool sendReductionMessage(uint32_t destinationCore,
                                       const ReductionTransportMessage& message) = 0;
@@ -266,10 +282,11 @@ public:
     bool sendReductionMessage(uint32_t destinationCore,
                               const ReductionTransportMessage& message) override;
     void setReductionMessageHandler(ReductionMessageHandler handler) override;
-    uint64_t dma_write_to_host_async(uint64_t dst_pa, size_t length, const std::vector<uint8_t>& data);
+    uint64_t dma_write_to_host_async(uint64_t dst_pa, size_t length,
+                                     const std::vector<uint8_t>& data) override;
     uint64_t dma_read_from_host_to_globalmem_async(uint64_t src_pa, size_t length, uint64_t gm_dst_addr);
-    bool dma_completion_done(uint64_t token) const;
-    void dma_completion_retire(uint64_t token);
+    bool dma_completion_done(uint64_t token) const override;
+    void dma_completion_retire(uint64_t token) override;
 
     uint64_t ctrlReadLocalU64(uint64_t addr) const;
     void ctrlWriteLocalU64(uint64_t addr, uint64_t value);
@@ -522,10 +539,11 @@ public:
     bool reductionNetworkAvailable() const override { return false; }
     bool sendReductionMessage(uint32_t, const ReductionTransportMessage&) override { return false; }
     void setReductionMessageHandler(ReductionMessageHandler) override {}
-    uint64_t dma_write_to_host_async(uint64_t dst_pa, size_t length, const std::vector<uint8_t>& data);
+    uint64_t dma_write_to_host_async(uint64_t dst_pa, size_t length,
+                                     const std::vector<uint8_t>& data) override;
     uint64_t dma_read_from_host_to_globalmem_async(uint64_t src_pa, size_t length, uint64_t gm_dst_addr);
-    bool dma_completion_done(uint64_t token) const;
-    void dma_completion_retire(uint64_t token);
+    bool dma_completion_done(uint64_t token) const override;
+    void dma_completion_retire(uint64_t token) override;
 
 
 

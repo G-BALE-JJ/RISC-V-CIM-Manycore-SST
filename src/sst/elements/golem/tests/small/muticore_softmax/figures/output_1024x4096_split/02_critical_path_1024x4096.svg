@@ -1,0 +1,240 @@
+<?xml version="1.0" encoding="utf-8" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN"
+  "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg xmlns:xlink="http://www.w3.org/1999/xlink" width="774.704656pt" height="396.72pt" viewBox="0 0 774.704656 396.72" xmlns="http://www.w3.org/2000/svg" version="1.1">
+ <metadata>
+  <rdf:RDF xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:cc="http://creativecommons.org/ns#" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+   <cc:Work>
+    <dc:type rdf:resource="http://purl.org/dc/dcmitype/StillImage"/>
+    <dc:date>2026-07-21T22:16:08.710260</dc:date>
+    <dc:format>image/svg+xml</dc:format>
+    <dc:creator>
+     <cc:Agent>
+      <dc:title>Matplotlib v3.10.9, https://matplotlib.org/</dc:title>
+     </cc:Agent>
+    </dc:creator>
+   </cc:Work>
+  </rdf:RDF>
+ </metadata>
+ <defs>
+  <style type="text/css">*{stroke-linejoin: round; stroke-linecap: butt}</style>
+ </defs>
+ <g id="figure_1">
+  <g id="patch_1">
+   <path d="M 0 396.72 
+L 774.704656 396.72 
+L 774.704656 0 
+L 0 0 
+z
+" style="fill: #ffffff"/>
+  </g>
+  <g id="axes_1">
+   <g id="patch_2">
+    <path d="M 34.416 186.912 
+L 34.518835 186.912 
+L 34.518835 170.28 
+L 34.416 170.28 
+z
+" clip-path="url(#p7cc2c22f0e)" style="fill: #a9a9a9; stroke: #ffffff; stroke-width: 0.4; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_3">
+    <path d="M 34.518835 186.912 
+L 36.912094 186.912 
+L 36.912094 170.28 
+L 34.518835 170.28 
+z
+" clip-path="url(#p7cc2c22f0e)" style="fill: #bfc4c8; stroke: #ffffff; stroke-width: 0.4; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_4">
+    <path d="M 36.912094 186.912 
+L 659.056489 186.912 
+L 659.056489 170.28 
+L 36.912094 170.28 
+z
+" clip-path="url(#p7cc2c22f0e)" style="fill: #0f4d92; stroke: #ffffff; stroke-width: 0.4; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_5">
+    <path d="M 659.056489 186.912 
+L 659.879172 186.912 
+L 659.879172 170.28 
+L 659.056489 170.28 
+z
+" clip-path="url(#p7cc2c22f0e)" style="fill: #6f8dad; stroke: #ffffff; stroke-width: 0.4; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_6">
+    <path d="M 659.879172 186.912 
+L 660.384 186.912 
+L 660.384 170.28 
+L 659.879172 170.28 
+z
+" clip-path="url(#p7cc2c22f0e)" style="fill: #b64342; stroke: #ffffff; stroke-width: 0.4; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_7">
+    <path d="M 34.416 253.44 
+L 39.8592 253.44 
+L 39.8592 241.6464 
+L 34.416 241.6464 
+z
+" clip-path="url(#p7cc2c22f0e)" style="fill: #a9a9a9"/>
+   </g>
+   <g id="patch_8">
+    <path d="M 34.416 275.2128 
+L 39.8592 275.2128 
+L 39.8592 263.4192 
+L 34.416 263.4192 
+z
+" clip-path="url(#p7cc2c22f0e)" style="fill: #bfc4c8"/>
+   </g>
+   <g id="patch_9">
+    <path d="M 34.416 296.9856 
+L 39.8592 296.9856 
+L 39.8592 285.192 
+L 34.416 285.192 
+z
+" clip-path="url(#p7cc2c22f0e)" style="fill: #0f4d92"/>
+   </g>
+   <g id="patch_10">
+    <path d="M 34.416 318.7584 
+L 39.8592 318.7584 
+L 39.8592 306.9648 
+L 34.416 306.9648 
+z
+" clip-path="url(#p7cc2c22f0e)" style="fill: #6f8dad"/>
+   </g>
+   <g id="patch_11">
+    <path d="M 34.416 340.5312 
+L 39.8592 340.5312 
+L 39.8592 328.7376 
+L 34.416 328.7376 
+z
+" clip-path="url(#p7cc2c22f0e)" style="fill: #b64342"/>
+   </g>
+   <g id="line2d_1">
+    <path d="M 34.416 257.976 
+L 660.384 257.976 
+" clip-path="url(#p7cc2c22f0e)" style="fill: none; stroke: #d9d9d9; stroke-width: 0.6; stroke-linecap: square"/>
+   </g>
+   <g id="line2d_2">
+    <path d="M 34.416 279.7488 
+L 660.384 279.7488 
+" clip-path="url(#p7cc2c22f0e)" style="fill: none; stroke: #d9d9d9; stroke-width: 0.6; stroke-linecap: square"/>
+   </g>
+   <g id="line2d_3">
+    <path d="M 34.416 301.5216 
+L 660.384 301.5216 
+" clip-path="url(#p7cc2c22f0e)" style="fill: none; stroke: #d9d9d9; stroke-width: 0.6; stroke-linecap: square"/>
+   </g>
+   <g id="line2d_4">
+    <path d="M 34.416 323.2944 
+L 660.384 323.2944 
+" clip-path="url(#p7cc2c22f0e)" style="fill: none; stroke: #d9d9d9; stroke-width: 0.6; stroke-linecap: square"/>
+   </g>
+   <g id="line2d_5">
+    <path d="M 34.416 345.0672 
+L 660.384 345.0672 
+" clip-path="url(#p7cc2c22f0e)" style="fill: none; stroke: #d9d9d9; stroke-width: 0.6; stroke-linecap: square"/>
+   </g>
+   <g id="text_1">
+    <text style="font-weight: 700; font-size: 11px; font-family: 'Noto Sans CJK SC', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #767676" x="34.416" y="126.432" transform="rotate(-0 34.416 126.432)">Observed critical path</text>
+   </g>
+   <g id="text_2">
+    <text style="font-weight: 700; font-size: 25px; font-family: 'Noto Sans CJK SC', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #272727" x="34.416" y="153.648" transform="rotate(-0 34.416 153.648)">66,958 cycles</text>
+   </g>
+   <g id="text_3">
+    <text style="font-weight: 700; font-size: 11px; font-family: 'Noto Sans CJK SC', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #767676" x="401.832" y="126.432" transform="rotate(-0 401.832 126.432)">Dominant subtask</text>
+   </g>
+   <g id="text_4">
+    <text style="font-weight: 700; font-size: 17px; font-family: 'Noto Sans CJK SC', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #0f4d92" x="401.832" y="153.648" transform="rotate(-0 401.832 153.648)">DMA-fed row pipeline: 66,549 (99.4%)</text>
+   </g>
+   <g id="text_5">
+    <text style="font-size: 10px; font-family: 'Noto Sans CJK SC', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #767676" x="34.416" y="200.52" transform="rotate(-0 34.416 200.52)">Descriptor accepted</text>
+   </g>
+   <g id="text_6">
+    <text style="font-weight: 700; font-size: 10px; font-family: 'Noto Sans CJK SC', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: end; fill: #b64342" x="660.384" y="200.52" transform="rotate(-0 660.384 200.52)">Actual accelerator completion</text>
+   </g>
+   <g id="text_7">
+    <text style="font-weight: 700; font-size: 10px; font-family: 'Noto Sans CJK SC', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #767676" x="41.22" y="229.248" transform="rotate(-0 41.22 229.248)">Step</text>
+   </g>
+   <g id="text_8">
+    <text style="font-weight: 700; font-size: 10px; font-family: 'Noto Sans CJK SC', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #767676" x="95.652" y="229.248" transform="rotate(-0 95.652 229.248)">Critical-path subtask</text>
+   </g>
+   <g id="text_9">
+    <text style="font-weight: 700; font-size: 10px; font-family: 'Noto Sans CJK SC', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: end; fill: #767676" x="537.912" y="229.248" transform="rotate(-0 537.912 229.248)">Span</text>
+   </g>
+   <g id="text_10">
+    <text style="font-weight: 700; font-size: 10px; font-family: 'Noto Sans CJK SC', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: end; fill: #767676" x="653.58" y="229.248" transform="rotate(-0 653.58 229.248)">Share</text>
+   </g>
+   <g id="text_11">
+    <text style="font-size: 10px; font-family: 'Noto Sans CJK SC', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #767676" x="48.024" y="250.151375" transform="rotate(-0 48.024 250.151375)">01</text>
+   </g>
+   <g id="text_12">
+    <text style="font-size: 12px; font-family: 'Noto Sans CJK SC', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #272727" x="95.652" y="250.70325" transform="rotate(-0 95.652 250.70325)">Band to first worker</text>
+   </g>
+   <g id="text_13">
+    <text style="font-weight: 700; font-size: 12px; font-family: 'Noto Sans CJK SC', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: end; fill: #a9a9a9" x="537.912" y="250.70325" transform="rotate(-0 537.912 250.70325)">11</text>
+   </g>
+   <g id="text_14">
+    <text style="font-size: 11px; font-family: 'Noto Sans CJK SC', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: end; fill: #767676" x="653.58" y="250.427312" transform="rotate(-0 653.58 250.427312)">0.0%</text>
+   </g>
+   <g id="text_15">
+    <text style="font-size: 10px; font-family: 'Noto Sans CJK SC', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #767676" x="48.024" y="271.924175" transform="rotate(-0 48.024 271.924175)">02</text>
+   </g>
+   <g id="text_16">
+    <text style="font-size: 12px; font-family: 'Noto Sans CJK SC', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #272727" x="95.652" y="272.47605" transform="rotate(-0 95.652 272.47605)">First input DMA</text>
+   </g>
+   <g id="text_17">
+    <text style="font-weight: 700; font-size: 12px; font-family: 'Noto Sans CJK SC', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: end; fill: #767676" x="537.912" y="272.47605" transform="rotate(-0 537.912 272.47605)">256</text>
+   </g>
+   <g id="text_18">
+    <text style="font-size: 11px; font-family: 'Noto Sans CJK SC', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: end; fill: #767676" x="653.58" y="272.200112" transform="rotate(-0 653.58 272.200112)">0.4%</text>
+   </g>
+   <g id="text_19">
+    <text style="font-size: 10px; font-family: 'Noto Sans CJK SC', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #767676" x="48.024" y="293.696975" transform="rotate(-0 48.024 293.696975)">03</text>
+   </g>
+   <g id="text_20">
+    <text style="font-weight: 700; font-size: 12px; font-family: 'Noto Sans CJK SC', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #272727" x="95.652" y="294.24885" transform="rotate(-0 95.652 294.24885)">DMA-fed row pipeline</text>
+   </g>
+   <g id="text_21">
+    <text style="font-weight: 700; font-size: 12px; font-family: 'Noto Sans CJK SC', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: end; fill: #0f4d92" x="537.912" y="294.24885" transform="rotate(-0 537.912 294.24885)">66,549</text>
+   </g>
+   <g id="text_22">
+    <text style="font-size: 11px; font-family: 'Noto Sans CJK SC', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: end; fill: #767676" x="653.58" y="293.972912" transform="rotate(-0 653.58 293.972912)">99.4%</text>
+   </g>
+   <g id="text_23">
+    <text style="font-size: 10px; font-family: 'Noto Sans CJK SC', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #767676" x="48.024" y="315.469775" transform="rotate(-0 48.024 315.469775)">04</text>
+   </g>
+   <g id="text_24">
+    <text style="font-size: 12px; font-family: 'Noto Sans CJK SC', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #272727" x="95.652" y="316.02165" transform="rotate(-0 95.652 316.02165)">Final output DMA</text>
+   </g>
+   <g id="text_25">
+    <text style="font-weight: 700; font-size: 12px; font-family: 'Noto Sans CJK SC', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: end; fill: #6f8dad" x="537.912" y="316.02165" transform="rotate(-0 537.912 316.02165)">88</text>
+   </g>
+   <g id="text_26">
+    <text style="font-size: 11px; font-family: 'Noto Sans CJK SC', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: end; fill: #767676" x="653.58" y="315.745712" transform="rotate(-0 653.58 315.745712)">0.1%</text>
+   </g>
+   <g id="text_27">
+    <text style="font-size: 10px; font-family: 'Noto Sans CJK SC', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #767676" x="48.024" y="337.242575" transform="rotate(-0 48.024 337.242575)">05</text>
+   </g>
+   <g id="text_28">
+    <text style="font-size: 12px; font-family: 'Noto Sans CJK SC', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #272727" x="95.652" y="337.79445" transform="rotate(-0 95.652 337.79445)">Completion delivery</text>
+   </g>
+   <g id="text_29">
+    <text style="font-weight: 700; font-size: 12px; font-family: 'Noto Sans CJK SC', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: end; fill: #b64342" x="537.912" y="337.79445" transform="rotate(-0 537.912 337.79445)">54</text>
+   </g>
+   <g id="text_30">
+    <text style="font-size: 11px; font-family: 'Noto Sans CJK SC', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: end; fill: #767676" x="653.58" y="337.518512" transform="rotate(-0 653.58 337.518512)">0.1%</text>
+   </g>
+  </g>
+  <g id="text_31">
+   <text style="font-weight: 700; font-size: 19px; font-family: 'Noto Sans CJK SC', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #272727" x="14.76" y="21.637031" transform="rotate(-0 14.76 21.637031)">1024 x 4096 Softmax: observed issue-to-completion critical path</text>
+  </g>
+  <g id="text_32">
+   <text style="font-size: 10px; font-family: 'Noto Sans CJK SC', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #767676" x="14.76" y="33.12" transform="rotate(-0 14.76 33.12)">Five causal subsegments sum exactly to the measured 66,958-cycle latency</text>
+  </g>
+ </g>
+ <defs>
+  <clipPath id="p7cc2c22f0e">
+   <rect x="7.2" y="87.12" width="680.4" height="302.4"/>
+  </clipPath>
+ </defs>
+</svg>

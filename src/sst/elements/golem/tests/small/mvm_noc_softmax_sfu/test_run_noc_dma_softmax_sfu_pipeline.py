@@ -18,6 +18,9 @@ ARCH_SHIM = os.path.abspath(
 BASE_ARCHIVE = os.path.abspath(
     os.path.join(SCRIPT_DIR, "..", "..", "architecture", "archive", "ncores_selfcom_dma.py")
 )
+BASE_RUNNER = os.path.abspath(
+    os.path.join(SCRIPT_DIR, "..", "..", "run_noc_dma_pipeline.sh")
+)
 
 
 class SfuSoftmaxPipelineWrapperTest(unittest.TestCase):
@@ -169,6 +172,12 @@ class SfuSoftmaxPipelineWrapperTest(unittest.TestCase):
         self.assertIn("test_noc_dma_softmax_sfu", result.stdout)
         self.assertIn("GOLEM_SFU_ENABLE=1", result.stdout)
         self.assertIn("GOLEM_MATMUL_DTYPE=fp32", result.stdout)
+        self.assertIn("GOLEM_SKIP_DEFAULT_GUEST_BUILD=1", result.stdout)
+        self.assertNotIn("cd small/mvm_noc_int_array && make clean", result.stdout)
+        self.assertNotIn(
+            "reuse small/mvm_noc_int_array/riscv64/test_noc_dma",
+            result.stdout,
+        )
 
     def test_wrapper_preserves_skip_build_for_base_pipeline(self):
         result = self.run_wrapper_with_env(
@@ -217,6 +226,16 @@ class SfuSoftmaxPipelineWrapperTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn("GOLEM_SFU_PERF_PROFILE=1", result.stdout)
         self.assertIn("GOLEM_SKIP_BUILD=0", result.stdout)
+        self.assertNotIn("cd small/mvm_noc_int_array && make clean", result.stdout)
+
+    def test_base_runner_requires_explicit_custom_guest_build_isolation(self):
+        with open(BASE_RUNNER, "r", encoding="utf-8") as source_file:
+            source = source_file.read()
+
+        self.assertIn('GOLEM_SKIP_DEFAULT_GUEST_BUILD="${GOLEM_SKIP_DEFAULT_GUEST_BUILD:-0}"', source)
+        self.assertIn('if [[ "$GOLEM_SKIP_DEFAULT_GUEST_BUILD" -eq 1 ]]', source)
+        self.assertIn('[[ -z "${VANADIS_EXE:-}" || ! -x "$VANADIS_EXE" ]]', source)
+        self.assertIn("skip default GEMM guest build", source)
 
     def test_wrapper_exports_softmax_row_block_env(self):
         result = self.run_wrapper_with_env(
@@ -361,6 +380,8 @@ class SfuSoftmaxPipelineWrapperTest(unittest.TestCase):
 
         self.assertIn("golem_softmax_sfu_runtime.cpp", source)
         self.assertIn("golem_softmax_sfu_runtime.h", source)
+        self.assertIn("golem_softmax_runtime.cpp", source)
+        self.assertIn("golem_softmax_runtime.h", source)
         self.assertIn("test_noc_dma_softmax_sfu.cpp", source)
         self.assertIn("gemm_matmul_op.h", source)
         self.assertIn("test_noc_dma_softmax_sfu.build.env", source)
