@@ -2,6 +2,9 @@
 #define _H_GOLEM_SFU
 
 #include <cstdint>
+#include <array>
+#include <functional>
+#include <limits>
 #include <map>
 #include <string>
 #include <tuple>
@@ -26,19 +29,31 @@ enum class TensorRowEngineStage : uint8_t {
     Normalize,
 };
 
+enum class TensorRowEngineEventKind : uint8_t {
+    ResourceDone,
+    LocalReadRetry,
+    LocalWriteRetry,
+    AttentionStart,
+};
+
 class TensorRowEngineEvent : public SST::Event {
 public:
     TensorRowEngineEvent() = default;
     TensorRowEngineEvent(uint64_t tag,
                          uint32_t bandRow,
                          uint32_t context,
-                         TensorRowEngineStage stage)
-        : tag_(tag), bandRow_(bandRow), context_(context), stage_(stage) {}
+                         TensorRowEngineStage stage,
+                         TensorRowEngineEventKind kind,
+                         uint64_t localTag)
+        : tag_(tag), bandRow_(bandRow), context_(context), stage_(stage),
+          kind_(kind), localTag_(localTag) {}
 
     uint64_t tag() const { return tag_; }
     uint32_t bandRow() const { return bandRow_; }
     uint32_t context() const { return context_; }
     TensorRowEngineStage stage() const { return stage_; }
+    TensorRowEngineEventKind kind() const { return kind_; }
+    uint64_t localTag() const { return localTag_; }
 
     void serialize_order(SST::Core::Serialization::serializer& ser) override {
         Event::serialize_order(ser);
@@ -46,6 +61,8 @@ public:
         ser & bandRow_;
         ser & context_;
         ser & stage_;
+        ser & kind_;
+        ser & localTag_;
     }
 
     ImplementSerializable(SST::Golem::TensorRowEngineEvent);
@@ -55,6 +72,8 @@ private:
     uint32_t bandRow_ = 0;
     uint32_t context_ = 0;
     TensorRowEngineStage stage_ = TensorRowEngineStage::Max;
+    TensorRowEngineEventKind kind_ = TensorRowEngineEventKind::ResourceDone;
+    uint64_t localTag_ = 0;
 };
 
 struct SFUSoftmaxTileDesc {
@@ -145,10 +164,19 @@ constexpr uint32_t SFU_JOB_FLAG_DISTRIBUTED_COLUMNS = 0x1u;
 constexpr uint32_t SFU_JOB_FLAG_DISTRIBUTED_ABORT = 0x2u;
 constexpr uint32_t SFU_JOB_FLAG_ROW_ENGINE_MODEL = 0x4u;
 constexpr uint32_t SFU_JOB_FLAG_TENSOR_ROW_ENGINE = 0x8u;
+constexpr uint32_t SFU_JOB_DTYPE_FP32 = 1u;
 
 constexpr uint32_t SFU_SOFTMAX_JOB_PARAMS_MAGIC = 0x53465531u;
 constexpr uint16_t SFU_SOFTMAX_JOB_PARAMS_VERSION = 1u;
+constexpr uint16_t SFU_SOFTMAX_JOB_PARAMS_VERSION_ATTENTION = 2u;
+constexpr uint16_t SFU_SOFTMAX_JOB_PARAMS_VERSION_MANAGER = 3u;
+constexpr uint32_t SFU_SOFTMAX_PARAMS_FLAG_ATTENTION = 0x1u;
+constexpr uint32_t SFU_SOFTMAX_PARAMS_FLAG_CAUSAL = 0x2u;
 constexpr uint32_t SFU_SOFTMAX_HBM_LAYOUT_BAND_STRIPED = 1u;
+constexpr uint32_t SFU_SOFTMAX_MAPPING_EXPLICIT_TOPOLOGY = 2u;
+constexpr uint32_t SFU_WORKER_TOPOLOGY_MAP_MAGIC = 0x574d4150u;
+constexpr uint16_t SFU_WORKER_TOPOLOGY_MAP_VERSION = 1u;
+constexpr uint32_t SFU_WORKER_TOPOLOGY_MAX_WORKERS = 16u;
 
 struct SFUSoftmaxJobParamsV1 {
     uint32_t magic;
@@ -169,6 +197,18 @@ struct SFUSoftmaxJobParamsV1 {
 
 static_assert(sizeof(SFUSoftmaxJobParamsV1) == 64,
               "Tensor softmax parameter ABI must stay fixed");
+
+struct SFUWorkerTopologyMapV1 {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t size_bytes;
+    uint32_t worker_count;
+    uint32_t reserved0;
+    uint32_t worker_core_ids[SFU_WORKER_TOPOLOGY_MAX_WORKERS];
+};
+
+static_assert(sizeof(SFUWorkerTopologyMapV1) == 80,
+              "Worker topology map ABI must stay fixed");
 
 struct SFUJobDesc {
     uint64_t job_id;
@@ -213,6 +253,26 @@ struct SFUTileRowStats {
     double tile_l;
 };
 
+struct AttentionTileRequest {
+    uint64_t tag = 0;
+    uint64_t jobId = 0;
+    uint64_t localScoreAddr = 0;
+    uint32_t globalRowBegin = 0;
+    uint32_t keyBegin = 0;
+    uint32_t rows = 0;
+    uint32_t cols = 0;
+    uint32_t headDim = 0;
+    uint32_t keyTile = 0;
+    uint32_t keyTiles = 1;
+    bool causal = false;
+    bool firstTileForJob = false;
+};
+
+struct AttentionTileResult {
+    uint32_t rows = 0;
+    std::array<float, 16> oldOutputScale = {};
+};
+
 class SFUAPI : public SST::SubComponent {
 public:
     SST_ELI_REGISTER_SUBCOMPONENT_API(SST::Golem::SFUAPI)
@@ -224,10 +284,13 @@ public:
     virtual bool issuePrimitive(uint64_t descAddr, uint64_t tag) = 0;
     virtual bool issuePrimitiveBatch(uint64_t descAddr, uint64_t tag) = 0;
     virtual bool issueJob(uint64_t descAddr, uint64_t tag) = 0;
+    virtual bool issueAttentionTile(const AttentionTileRequest& request,
+                                    std::function<void(bool, const AttentionTileResult&)> callback) = 0;
     virtual bool completionTick(uint64_t tag, uint64_t* tick) const = 0;
     virtual bool wait(uint64_t tag, uint64_t* status) = 0;
     virtual void bindGlobalMemory(GlobalMemoryAPI* globalMem) = 0;
     virtual void setCoreInfo(uint32_t coreId, uint32_t activeWorkerCores) = 0;
+    virtual void receiveReductionMessage(const ReductionTransportMessage& message) = 0;
 };
 
 class SFU : public SFUAPI {
@@ -253,6 +316,7 @@ public:
         {"reduction_tree_latency", "Row Engine reduction tree latency in accelerator cycles", "4"},
         {"exp_latency", "Row Engine EXP pipeline latency in accelerator cycles", "8"},
         {"reciprocal_latency", "Row Engine reciprocal latency in accelerator cycles", "1"},
+        {"rsqrt_latency", "Attention scale RSQRT latency in accelerator cycles", "8"},
         {"row_contexts", "Row contexts per physical Row Engine", "4"},
         {"scratchpad_bytes", "Row Engine scratchpad capacity", "65536"},
         {"distributed_reduction_transport", "Distributed softmax reduction transport: shared, modeled_noc, or explicit_noc", "shared"},
@@ -297,6 +361,12 @@ public:
         {"sfu_tensor_output_dma_ack_tick", "SST tick for each tensor output DMA ACK", "ticks", 1},
         {"sfu_tensor_completion_received_tick", "SST tick when the coordinator receives a band completion", "ticks", 1},
         {"sfu_tensor_guest_wait_observed_tick", "SST tick when the SFU wait returns tensor completion", "ticks", 1},
+        {"sfu_attention_jobs", "Attention-aware tensor softmax jobs", "jobs", 1},
+        {"sfu_attention_rsqrt_ready_tick", "SST tick when attention RSQRT(D) is ready", "ticks", 1},
+        {"sfu_attention_scale_mask_start_tick", "SST tick when attention SCALE/MASK starts", "ticks", 1},
+        {"sfu_attention_scale_mask_done_tick", "SST tick when attention SCALE/MASK completes", "ticks", 1},
+        {"sfu_attention_scaled_elements", "Attention score elements scaled", "elements", 1},
+        {"sfu_attention_masked_elements", "Future attention score elements masked", "elements", 1},
         {"sfu_primitive_elems", "Logical primitive elements processed by SFU", "elements", 1},
         {"sfu_partial_submits", "Softmax partial stats submitted", "partials", 1},
         {"sfu_partial_done", "Softmax partial stats completed", "partials", 1},
@@ -321,10 +391,13 @@ public:
     bool issuePrimitive(uint64_t descAddr, uint64_t tag) override;
     bool issuePrimitiveBatch(uint64_t descAddr, uint64_t tag) override;
     bool issueJob(uint64_t descAddr, uint64_t tag) override;
+    bool issueAttentionTile(const AttentionTileRequest& request,
+                            std::function<void(bool, const AttentionTileResult&)> callback) override;
     bool completionTick(uint64_t tag, uint64_t* tick) const override;
     bool wait(uint64_t tag, uint64_t* status) override;
     void bindGlobalMemory(GlobalMemoryAPI* globalMem) override;
     void setCoreInfo(uint32_t coreId, uint32_t activeWorkerCores) override;
+    void receiveReductionMessage(const ReductionTransportMessage& message) override;
 
 private:
     enum class SoftmaxJobStage : uint8_t {
@@ -388,6 +461,11 @@ private:
         SFUSoftmaxJobParamsV1 tensorParams;
         uint32_t tensorRowsCompleted;
         bool tensorDmaComplete;
+        bool tensorStarted;
+        bool attentionMode;
+        bool attentionCausal;
+        float attentionScale;
+        uint64_t attentionRsqrtReadyTick;
         std::vector<uint8_t> tensorCompletionSeen;
         SoftmaxJobStage stage;
         uint32_t workerSlot;
@@ -405,16 +483,38 @@ private:
             uint32_t row = 0;
             uint64_t scratchAddr = 0;
             bool busy = false;
+            TensorRowEngineStage stage = TensorRowEngineStage::Max;
+            uint32_t chunkBegin = 0;
+            uint64_t pendingLocalTag = 0;
             float rowMax = 0.0f;
             double rowSum = 0.0;
-            std::vector<float> values;
+            float invSum = 0.0f;
+            float oldOutputScale = 0.0f;
+            float tileWeightScale = 1.0f;
+            std::vector<float> laneValues;
         };
 
         ReductionTransportMessage dispatch;
         uint64_t scratchAddr;
         uint32_t nextRow;
         uint32_t rowsCompleted;
+        bool localTileMode = false;
+        uint64_t attentionJobId = 0;
+        uint32_t attentionKeyTile = 0;
+        uint32_t attentionKeyTiles = 1;
+        uint32_t attentionKeyBegin = 0;
+        bool attentionFirstTileForJob = false;
+        AttentionTileResult attentionResult;
+        std::function<void(bool, const AttentionTileResult&)> localTileCallback;
         std::vector<Context> contexts;
+    };
+
+    struct AttentionOnlineRowContext {
+        bool valid = false;
+        uint64_t jobId = 0;
+        uint32_t globalRow = 0;
+        double m = -std::numeric_limits<double>::infinity();
+        double l = 0.0;
     };
 
     using TensorWorkerKey = std::pair<uint64_t, uint32_t>;
@@ -456,6 +556,16 @@ private:
     void rejectTensorRowDispatch(const ReductionTransportMessage& message);
     void handleTensorRowComplete(const ReductionTransportMessage& message);
     void issueTensorInputDma(const TensorWorkerKey& key, uint32_t contextIndex);
+    void beginTensorRowStage(const TensorWorkerKey& key,
+                             uint32_t contextIndex,
+                             TensorRowEngineStage stage);
+    void issueTensorLocalRead(const TensorWorkerKey& key, uint32_t contextIndex);
+    void issueTensorLocalWrite(const TensorWorkerKey& key, uint32_t contextIndex);
+    void advanceTensorRowChunk(const TensorWorkerKey& key, uint32_t contextIndex);
+    void completeTensorRow(const TensorWorkerKey& key, uint32_t contextIndex);
+    void scheduleTensorLocalRetry(const TensorWorkerKey& key,
+                                  uint32_t contextIndex,
+                                  TensorRowEngineEventKind kind);
     void scheduleTensorRowStage(const TensorWorkerKey& key,
                                 uint32_t contextIndex,
                                 TensorRowEngineStage stage);
@@ -488,12 +598,22 @@ private:
     uint32_t rowEngineReductionTreeLatency_;
     uint32_t rowEngineExpLatency_;
     uint32_t rowEngineReciprocalLatency_;
+    uint32_t rowEngineRsqrtLatency_;
     uint32_t rowEngineContexts_;
     uint64_t rowEngineScratchpadBytes_;
     uint64_t rowEngineTimebaseTicksPerSecond_;
     uint64_t rowEngineFreeTick_;
     uint64_t rowEngineVectorFreeCycle_;
     uint64_t rowEngineExpFreeCycle_;
+    uint64_t nextTensorLocalTag_ = 1;
+    uint64_t tensorLaneBufferHighWater_ = 0;
+    uint64_t tensorMaxLocalReadBytes_ = 0;
+    uint64_t tensorMaxLocalWriteBytes_ = 0;
+    uint64_t tensorExpSumLocalReadBytes_ = 0;
+    uint64_t tensorExpSumLocalWriteBytes_ = 0;
+    uint64_t tensorNormalizeLocalReadBytes_ = 0;
+    uint64_t tensorNormalizeLocalWriteBytes_ = 0;
+    uint64_t tensorLocalRetryEvents_ = 0;
     uint32_t inflight_;
     int verbose_;
     DistributedReductionTransport distributedReductionTransport_;
@@ -508,6 +628,7 @@ private:
     std::unordered_map<uint64_t, PrimitiveBatchOpState> pendingPrimitiveBatchOps_;
     std::unordered_map<uint64_t, JobOpState> pendingJobOps_;
     std::map<TensorWorkerKey, TensorWorkerState> tensorWorkerOps_;
+    std::vector<AttentionOnlineRowContext> attentionOnlineContexts_;
     SST::Link* rowEngineSelfLink_;
 
     Statistic<uint64_t>* statOpsIssued_;
@@ -548,6 +669,12 @@ private:
     Statistic<uint64_t>* statTensorOutputDmaAckTick_;
     Statistic<uint64_t>* statTensorCompletionReceivedTick_;
     Statistic<uint64_t>* statTensorGuestWaitObservedTick_;
+    Statistic<uint64_t>* statAttentionJobs_;
+    Statistic<uint64_t>* statAttentionRsqrtReadyTick_;
+    Statistic<uint64_t>* statAttentionScaleMaskStartTick_;
+    Statistic<uint64_t>* statAttentionScaleMaskDoneTick_;
+    Statistic<uint64_t>* statAttentionScaledElements_;
+    Statistic<uint64_t>* statAttentionMaskedElements_;
     Statistic<uint64_t>* statPrimitiveElems_;
     Statistic<uint64_t>* statPartialSubmits_;
     Statistic<uint64_t>* statPartialDone_;

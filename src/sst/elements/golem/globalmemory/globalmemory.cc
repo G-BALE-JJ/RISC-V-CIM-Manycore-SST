@@ -30,6 +30,10 @@ bool envFlagDefault(const char* name, bool defaultValue) {
     return value == "1" || value == "true" || value == "yes" || value == "on";
 }
 
+uint64_t ceilDivLocalAccess(uint64_t value, uint64_t divisor) {
+    return (value + divisor - 1) / divisor;
+}
+
 std::vector<uint8_t> parseMemoryRoutersParam(const std::string& raw, SST::Output* output, const std::string& compName) {
     std::vector<uint8_t> routers;
     if (raw.empty()) {
@@ -80,6 +84,22 @@ GlobalMemoryImplement::GlobalMemoryImplement(ComponentId_t id, Params& params)
     assert(size > 0 && "GlobalMemory size must be > 0");
     storage.resize(size, 0x00);
     globalMemTransLatency = params.find<UnitAlgebra>("globalMemTransLatency", "30ns");
+    const std::string localAccessClock =
+        params.find<std::string>("local_access_clock", "1GHz");
+    localAccessBaseLatencyCycles_ =
+        params.find<uint32_t>("local_access_base_latency_cycles", 1);
+    localAccessBytesPerCycle_ = params.find<uint32_t>("local_access_bytes_per_cycle", 64);
+    localAccessReadPorts_ = params.find<uint32_t>("local_access_read_ports", 1);
+    localAccessWritePorts_ = params.find<uint32_t>("local_access_write_ports", 1);
+    localAccessQueueDepth_ = params.find<uint32_t>("local_access_queue_depth", 32);
+    localAccessMaxRequestBytes_ =
+        params.find<uint32_t>("local_access_max_request_bytes", 4096);
+    if (localAccessBaseLatencyCycles_ == 0 || localAccessBytesPerCycle_ == 0 ||
+        localAccessReadPorts_ == 0 || localAccessWritePorts_ == 0 ||
+        localAccessQueueDepth_ == 0 || localAccessMaxRequestBytes_ == 0) {
+        output->fatal(CALL_INFO, -1,
+                      "GlobalMemory local-access parameters must be positive\n");
+    }
     dma_read_retry_ticks = params.find<uint32_t>("dma_read_retry_ticks", 96);
     dma_read_max_retries = params.find<uint32_t>("dma_read_max_retries", 8);
     dma_read_max_inflight = params.find<uint32_t>("dma_read_max_inflight", 8);
@@ -222,6 +242,11 @@ GlobalMemoryImplement::GlobalMemoryImplement(ComponentId_t id, Params& params)
     latencyTC = getTimeConverter(globalMemTransLatency);
     selfLink = configureSelfLink("Self", *latencyTC, new Event::Handler2<GlobalMemoryImplement,&GlobalMemoryImplement::handleSelfEvent>(this));
     selfLink->setDefaultTimeBase(*latencyTC);
+    localAccessSelfLink_ = configureSelfLink(
+        "LocalAccessSelf",
+        localAccessClock,
+        new Event::Handler2<GlobalMemoryImplement,
+                            &GlobalMemoryImplement::handleLocalAccessEvent>(this));
 
     // 注册接收通知回调，当网络收到数据包时调用 handle_receives()
     link_control->setNotifyOnReceive(
@@ -547,6 +572,250 @@ void GlobalMemoryImplement::rd_from_globalmem(uint64_t rd_addr, size_t length, s
     uint64_t offset = rd_addr - baseAddr;
     // 从本地 storage 中读取指定范围的数据复制到 rd_data
     rd_data.assign(storage.begin() + offset, storage.begin() + offset + length);
+}
+
+bool GlobalMemoryImplement::localAccessValid(uint64_t addr, size_t length) const
+{
+    if (length == 0 || length > localAccessMaxRequestBytes_ || addr < baseAddr) {
+        return false;
+    }
+    const uint64_t offset = addr - baseAddr;
+    return offset <= size && length <= size - offset;
+}
+
+bool GlobalMemoryImplement::localReadAsync(uint64_t addr,
+                                           size_t length,
+                                           LocalMemoryClient client,
+                                           uint64_t tag,
+                                           LocalReadCallback cb)
+{
+    if (!cb || !localAccessValid(addr, length) ||
+        localAccessPending_.size() >= localAccessQueueDepth_) {
+        ++localQueueRejected_;
+        return false;
+    }
+
+    PendingLocalAccess request;
+    request.kind = PendingLocalAccess::Kind::Read;
+    request.requestId = nextLocalAccessRequestId_++;
+    request.addr = addr;
+    request.length = length;
+    request.client = client;
+    request.tag = tag;
+    request.submitCycle = getCurrentSimCycle();
+    request.readCallback = std::move(cb);
+    const uint64_t requestId = request.requestId;
+    localAccessPending_.emplace(requestId, std::move(request));
+    localReadQueue_.push_back(requestId);
+    ++localReadRequests_;
+
+    const uint64_t depth = localAccessPending_.size();
+    if (depth > localAccessQueueHighWater_) {
+        localAccessQueueHighWater_ = depth;
+    }
+    tryIssueLocalAccesses();
+    return true;
+}
+
+bool GlobalMemoryImplement::localWriteAsync(uint64_t addr,
+                                            const std::vector<uint8_t>& data,
+                                            LocalMemoryClient client,
+                                            uint64_t tag,
+                                            LocalWriteCallback cb)
+{
+    if (!cb || !localAccessValid(addr, data.size()) ||
+        localAccessPending_.size() >= localAccessQueueDepth_) {
+        ++localQueueRejected_;
+        return false;
+    }
+
+    PendingLocalAccess request;
+    request.kind = PendingLocalAccess::Kind::Write;
+    request.requestId = nextLocalAccessRequestId_++;
+    request.addr = addr;
+    request.length = data.size();
+    request.client = client;
+    request.tag = tag;
+    request.submitCycle = getCurrentSimCycle();
+    request.writeData = data;
+    request.writeCallback = std::move(cb);
+    const uint64_t requestId = request.requestId;
+    localAccessPending_.emplace(requestId, std::move(request));
+    localWriteQueue_.push_back(requestId);
+    ++localWriteRequests_;
+
+    const uint64_t depth = localAccessPending_.size();
+    if (depth > localAccessQueueHighWater_) {
+        localAccessQueueHighWater_ = depth;
+    }
+    tryIssueLocalAccesses();
+    return true;
+}
+
+uint64_t GlobalMemoryImplement::localAccessDelayCycles(size_t length) const
+{
+    return static_cast<uint64_t>(localAccessBaseLatencyCycles_) +
+           ceilDivLocalAccess(length, localAccessBytesPerCycle_);
+}
+
+void GlobalMemoryImplement::issueLocalAccess(uint64_t requestId)
+{
+    auto it = localAccessPending_.find(requestId);
+    if (it == localAccessPending_.end()) {
+        return;
+    }
+    const PendingLocalAccess& request = it->second;
+    const uint64_t queueCycles = getCurrentSimCycle() - request.submitCycle;
+    if (request.kind == PendingLocalAccess::Kind::Read) {
+        localReadQueueCycles_ += queueCycles;
+    } else {
+        localWriteQueueCycles_ += queueCycles;
+    }
+    localAccessSelfLink_->send(localAccessDelayCycles(request.length),
+                               new LocalMemoryAccessEvent(requestId));
+}
+
+void GlobalMemoryImplement::tryIssueLocalAccesses()
+{
+    while (localReadsInFlight_ < localAccessReadPorts_ && !localReadQueue_.empty()) {
+        const uint64_t requestId = localReadQueue_.front();
+        localReadQueue_.pop_front();
+        ++localReadsInFlight_;
+        issueLocalAccess(requestId);
+    }
+    while (localWritesInFlight_ < localAccessWritePorts_ && !localWriteQueue_.empty()) {
+        const uint64_t requestId = localWriteQueue_.front();
+        localWriteQueue_.pop_front();
+        ++localWritesInFlight_;
+        issueLocalAccess(requestId);
+    }
+}
+
+void GlobalMemoryImplement::handleLocalAccessEvent(Event* ev)
+{
+    auto* accessEvent = dynamic_cast<LocalMemoryAccessEvent*>(ev);
+    if (accessEvent == nullptr) {
+        delete ev;
+        return;
+    }
+    const uint64_t requestId = accessEvent->requestId();
+    delete accessEvent;
+
+    auto it = localAccessPending_.find(requestId);
+    if (it == localAccessPending_.end()) {
+        return;
+    }
+    PendingLocalAccess request = std::move(it->second);
+    localAccessPending_.erase(it);
+
+    if (request.kind == PendingLocalAccess::Kind::Read) {
+        if (localReadsInFlight_ > 0) {
+            --localReadsInFlight_;
+        }
+        std::vector<uint8_t> data;
+        const uint64_t offset = request.addr - baseAddr;
+        data.assign(storage.begin() + offset,
+                    storage.begin() + offset + request.length);
+        localReadBytes_ += request.length;
+        tryIssueLocalAccesses();
+        request.readCallback(true, request.tag, data);
+        return;
+    }
+
+    if (localWritesInFlight_ > 0) {
+        --localWritesInFlight_;
+    }
+    const uint64_t offset = request.addr - baseAddr;
+    std::copy(request.writeData.begin(), request.writeData.end(),
+              storage.begin() + offset);
+    localWriteBytes_ += request.length;
+    tryIssueLocalAccesses();
+    request.writeCallback(true, request.tag);
+}
+
+void GlobalMemoryImplement::completeDmaReadToLocalMemory(
+    PendingDmaOp op, const std::vector<uint8_t>& data)
+{
+    const uint64_t landingTag = nextLocalDmaTag_++;
+    PendingDmaLanding landing;
+    landing.op = std::move(op);
+    landing.data = data;
+    pendingDmaLandings_.emplace(landingTag, std::move(landing));
+    issueNextDmaLandingChunk(landingTag);
+}
+
+void GlobalMemoryImplement::issueNextDmaLandingChunk(uint64_t landingTag)
+{
+    auto it = pendingDmaLandings_.find(landingTag);
+    if (it == pendingDmaLandings_.end()) {
+        return;
+    }
+    PendingDmaLanding& landing = it->second;
+    if (landing.offset >= landing.data.size()) {
+        finishDmaReadLanding(landing.op, true);
+        pendingDmaLandings_.erase(it);
+        return;
+    }
+
+    const size_t chunkBytes = std::min<size_t>(
+        localAccessMaxRequestBytes_, landing.data.size() - landing.offset);
+    std::vector<uint8_t> chunk(
+        landing.data.begin() + landing.offset,
+        landing.data.begin() + landing.offset + chunkBytes);
+    const uint64_t chunkAddr = landing.op.gm_dst_addr + landing.offset;
+    const bool accepted = localWriteAsync(
+        chunkAddr, chunk, LocalMemoryClient::Dma, landingTag,
+        [this, chunkBytes](bool ok, uint64_t tag) {
+            auto landingIt = pendingDmaLandings_.find(tag);
+            if (landingIt == pendingDmaLandings_.end()) {
+                return;
+            }
+            if (!ok) {
+                finishDmaReadLanding(landingIt->second.op, false);
+                pendingDmaLandings_.erase(landingIt);
+                return;
+            }
+            landingIt->second.offset += chunkBytes;
+            issueNextDmaLandingChunk(tag);
+        });
+    if (!accepted) {
+        finishDmaReadLanding(landing.op, false);
+        pendingDmaLandings_.erase(it);
+    }
+}
+
+void GlobalMemoryImplement::finishDmaReadLanding(PendingDmaOp& op, bool ok)
+{
+    ++dma_read_completion_count;
+    if (op.ctx) {
+        op.ctx->ok = op.ctx->ok && ok;
+        if (op.ctx->remaining > 0) {
+            --op.ctx->remaining;
+        }
+        if (op.ctx->remaining != 0) {
+            return;
+        }
+        if (op.ctx->completion_enabled) {
+            write_u64_to_storage(op.ctx->completion_flag_addr, op.ctx->completion_value);
+        }
+        if (op.ctx->completion_token != 0) {
+            dma_completion_tokens[op.ctx->completion_token] = true;
+        }
+        if (op.ctx->cb) {
+            op.ctx->cb(op.ctx->ok);
+        }
+        return;
+    }
+
+    if (op.completion_enabled) {
+        write_u64_to_storage(op.completion_flag_addr, op.completion_value);
+    }
+    if (op.completion_token != 0) {
+        dma_completion_tokens[op.completion_token] = true;
+    }
+    if (op.cb) {
+        op.cb(ok);
+    }
 }
 
 void GlobalMemoryImplement::wr_to_network(uint64_t wr_addr, size_t length, std::vector<uint8_t>& wr_data)
@@ -948,6 +1217,24 @@ void GlobalMemoryImplement::complete(unsigned int phase) {
 }
 
 void GlobalMemoryImplement::finish() {
+    output->output(
+        "GOLEM_LOCAL_GM_STATS core=%d gmem_local_read_requests=%" PRIu64
+        " gmem_local_write_requests=%" PRIu64
+        " gmem_local_read_bytes=%" PRIu64
+        " gmem_local_write_bytes=%" PRIu64
+        " gmem_local_queue_rejected=%" PRIu64
+        " gmem_local_queue_high_water=%" PRIu64
+        " gmem_local_read_queue_cycles=%" PRIu64
+        " gmem_local_write_queue_cycles=%" PRIu64 "\n",
+        core_id,
+        localReadRequests_,
+        localWriteRequests_,
+        localReadBytes_,
+        localWriteBytes_,
+        localQueueRejected_,
+        localAccessQueueHighWater_,
+        localReadQueueCycles_,
+        localWriteQueueCycles_);
     uint64_t avg_rtt_ticks = (dma_read_rtt_samples > 0)
                                  ? (dma_read_rtt_ticks_sum / dma_read_rtt_samples)
                                  : 0;
@@ -1048,6 +1335,81 @@ void GlobalMemoryImplement::StdMemHandlers::handle(SST::Interfaces::StandardMem:
 void GlobalMemoryImplement::dma_write_to_host(uint64_t dst_pa, size_t length, const std::vector<uint8_t>& data, DmaCallback cb)
 {
     dma_write_to_host_impl(dst_pa, length, data, cb, 0);
+}
+
+void GlobalMemoryImplement::dma_write_from_globalmem_to_host(uint64_t gm_src_addr,
+                                                              uint64_t dst_pa,
+                                                              size_t length,
+                                                              DmaCallback cb)
+{
+    struct TransferState {
+        uint64_t gmSrc = 0;
+        uint64_t hostDst = 0;
+        size_t length = 0;
+        size_t offset = 0;
+        DmaCallback callback;
+    };
+
+    if (!cb || length == 0 || gm_src_addr < baseAddr ||
+        gm_src_addr - baseAddr > size || length > size - (gm_src_addr - baseAddr)) {
+        if (cb) {
+            cb(false);
+        }
+        return;
+    }
+
+    auto state = std::make_shared<TransferState>();
+    state->gmSrc = gm_src_addr;
+    state->hostDst = dst_pa;
+    state->length = length;
+    state->callback = std::move(cb);
+    auto pump = std::make_shared<std::function<void()>>();
+    *pump = [this, state, pump]() {
+        const size_t remaining = state->length - state->offset;
+        const size_t chunkBytes = std::min<size_t>(remaining, localAccessMaxRequestBytes_);
+        const uint64_t localTag = nextLocalDmaTag_++;
+        const bool accepted = localReadAsync(
+            state->gmSrc + state->offset,
+            chunkBytes,
+            LocalMemoryClient::Dma,
+            localTag,
+            [this, state, pump, chunkBytes](bool ok,
+                                            uint64_t,
+                                            const std::vector<uint8_t>& data) {
+                if (!ok || data.size() != chunkBytes) {
+                    auto callback = std::move(state->callback);
+                    *pump = {};
+                    callback(false);
+                    return;
+                }
+                dma_write_to_host(
+                    state->hostDst + state->offset,
+                    chunkBytes,
+                    data,
+                    [state, pump, chunkBytes](bool writeOk) {
+                        if (!writeOk) {
+                            auto callback = std::move(state->callback);
+                            *pump = {};
+                            callback(false);
+                            return;
+                        }
+                        state->offset += chunkBytes;
+                        if (state->offset == state->length) {
+                            auto callback = std::move(state->callback);
+                            *pump = {};
+                            callback(true);
+                            return;
+                        }
+                        (*pump)();
+                    });
+            });
+        if (!accepted) {
+            auto callback = std::move(state->callback);
+            *pump = {};
+            callback(false);
+        }
+    };
+    (*pump)();
 }
 
 uint64_t GlobalMemoryImplement::allocate_dma_completion_token()
@@ -1468,7 +1830,6 @@ bool GlobalMemoryImplement::handle_receives(int vn) {
                 dma_pending.erase(it);
 
                 if (op.kind == PendingDmaOp::READ_TO_GM) {
-                    dma_read_completion_count++;
                     if (op.request_sent) {
                         const uint64_t completeCycle = getCurrentSimCycle();
                         const uint64_t last_try_rtt_ticks = dma_retry_tick_counter - op.last_send_tick;
@@ -1504,34 +1865,7 @@ bool GlobalMemoryImplement::handle_receives(int vn) {
                             }
                         }
                     }
-                    // 写入数据到本地 GlobalMemory
-                    wr_to_globalmem(op.gm_dst_addr, ev->getData().size(), ev->getData());
-
-                    // 处理 burst 上下文
-                    if (op.ctx) {
-                        if (op.ctx->remaining > 0) op.ctx->remaining--;
-                        if (op.ctx->remaining == 0) {
-                            if (op.ctx->completion_enabled) {
-                                write_u64_to_storage(op.ctx->completion_flag_addr, op.ctx->completion_value);
-                            }
-                            if (op.ctx->completion_token != 0) {
-                                dma_completion_tokens[op.ctx->completion_token] = true;
-                            }
-                            if (op.ctx->cb) {
-                                op.ctx->cb(op.ctx->ok);
-                            }
-                        }
-                    } else {
-                        if (op.completion_enabled) {
-                            write_u64_to_storage(op.completion_flag_addr, op.completion_value);
-                        }
-                        if (op.completion_token != 0) {
-                            dma_completion_tokens[op.completion_token] = true;
-                        }
-                        if (op.cb) {
-                            op.cb(true);
-                        }
-                    }
+                    completeDmaReadToLocalMemory(std::move(op), ev->getData());
                 }
             } else {
                 auto req_it = request_pending.find(ev->getRequestId());
@@ -2019,6 +2353,37 @@ void GlobalMemoryLocal::rd_from_globalmem(uint64_t rd_addr, size_t length, std::
     rd_data.assign(storage.begin() + (rd_addr - baseAddr), storage.begin() + (rd_addr - baseAddr) + length);
 }
 
+bool GlobalMemoryLocal::localReadAsync(uint64_t addr,
+                                       size_t length,
+                                       LocalMemoryClient,
+                                       uint64_t tag,
+                                       LocalReadCallback cb)
+{
+    if (!cb || length == 0 || addr < baseAddr || addr - baseAddr > size ||
+        length > size - (addr - baseAddr)) {
+        return false;
+    }
+    std::vector<uint8_t> data;
+    rd_from_globalmem(addr, length, data);
+    cb(true, tag, data);
+    return true;
+}
+
+bool GlobalMemoryLocal::localWriteAsync(uint64_t addr,
+                                        const std::vector<uint8_t>& data,
+                                        LocalMemoryClient,
+                                        uint64_t tag,
+                                        LocalWriteCallback cb)
+{
+    if (!cb || data.empty() || addr < baseAddr || addr - baseAddr > size ||
+        data.size() > size - (addr - baseAddr)) {
+        return false;
+    }
+    wr_to_globalmem(addr, data.size(), data);
+    cb(true, tag);
+    return true;
+}
+
 void GlobalMemoryLocal::wr_to_network(uint64_t, size_t, std::vector<uint8_t>&)
 {
     // No network in local mode; ignore.
@@ -2032,6 +2397,16 @@ void GlobalMemoryLocal::rd_to_network(uint64_t, size_t, uint64_t)
 void GlobalMemoryLocal::dma_write_to_host(uint64_t, size_t, const std::vector<uint8_t>&, DmaCallback)
 {
     assert(false && "GlobalMemoryLocal does not support dma_write_to_host (no StandardMem interface wired)");
+}
+
+void GlobalMemoryLocal::dma_write_from_globalmem_to_host(uint64_t,
+                                                          uint64_t,
+                                                          size_t,
+                                                          DmaCallback cb)
+{
+    if (cb) {
+        cb(false);
+    }
 }
 
 void GlobalMemoryLocal::dma_read_from_host_to_globalmem(uint64_t, size_t, uint64_t, DmaCallback)

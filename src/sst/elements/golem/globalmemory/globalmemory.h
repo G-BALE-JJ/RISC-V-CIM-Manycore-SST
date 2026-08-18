@@ -38,6 +38,36 @@ static constexpr uint8_t MEMORY_ROUTERS[4] = {16, 17, 18, 19};
 
 using DmaCallback = std::function<void(bool)>;
 
+enum class LocalMemoryClient : uint8_t {
+    Dma,
+    RoCC,
+    SFU,
+    WCP,
+    Control,
+};
+
+using LocalReadCallback =
+    std::function<void(bool, uint64_t, const std::vector<uint8_t>&)>;
+using LocalWriteCallback = std::function<void(bool, uint64_t)>;
+
+class LocalMemoryAccessEvent : public SST::Event {
+public:
+    LocalMemoryAccessEvent() = default;
+    explicit LocalMemoryAccessEvent(uint64_t requestId) : requestId_(requestId) {}
+
+    uint64_t requestId() const { return requestId_; }
+
+    void serialize_order(SST::Core::Serialization::serializer& ser) override {
+        Event::serialize_order(ser);
+        ser & requestId_;
+    }
+
+    ImplementSerializable(SST::Golem::LocalMemoryAccessEvent);
+
+private:
+    uint64_t requestId_ = 0;
+};
+
 enum class ReductionTransportMessageKind {
     MaxRequest,
     MaxResponse,
@@ -45,6 +75,9 @@ enum class ReductionTransportMessageKind {
     SumResponse,
     TensorRowDispatch,
     TensorRowComplete,
+    AttentionDispatch,
+    AttentionComplete,
+    AttentionManagerComplete,
 };
 
 struct ReductionTransportMessage {
@@ -53,6 +86,7 @@ struct ReductionTransportMessage {
     uint64_t tag = 0;
     uint32_t ownerCore = 0;
     uint32_t workerSlot = 0;
+    uint32_t workerCore = 0;
     uint32_t row = 0;
     uint32_t expectedWorkers = 0;
     uint32_t expectedRows = 0;
@@ -64,6 +98,14 @@ struct ReductionTransportMessage {
     uint64_t nodeStrideBytes = 0;
     uint32_t dataNodeMask = 0;
     uint32_t rowsPerBand = 0;
+    uint32_t headDim = 0;
+    uint32_t queryBlockRows = 0;
+    uint32_t keyBlockRows = 0;
+    uint32_t flags = 0;
+    uint64_t qAddr = 0;
+    uint64_t kAddr = 0;
+    uint64_t vAddr = 0;
+    uint64_t oAddr = 0;
 
     void serialize_order(SST::Core::Serialization::serializer& ser) {
         ser & kind;
@@ -71,6 +113,7 @@ struct ReductionTransportMessage {
         ser & tag;
         ser & ownerCore;
         ser & workerSlot;
+        ser & workerCore;
         ser & row;
         ser & expectedWorkers;
         ser & expectedRows;
@@ -82,6 +125,14 @@ struct ReductionTransportMessage {
         ser & nodeStrideBytes;
         ser & dataNodeMask;
         ser & rowsPerBand;
+        ser & headDim;
+        ser & queryBlockRows;
+        ser & keyBlockRows;
+        ser & flags;
+        ser & qAddr;
+        ser & kAddr;
+        ser & vAddr;
+        ser & oAddr;
     }
 };
 
@@ -182,15 +233,27 @@ public:
 
     // 定义虚函数
     using DmaCallback = ::SST::Golem::DmaCallback;
+    using LocalReadCallback = ::SST::Golem::LocalReadCallback;
+    using LocalWriteCallback = ::SST::Golem::LocalWriteCallback;
     using ReductionMessageHandler = std::function<void(const ReductionTransportMessage&)>;
     virtual void wr_to_globalmem(uint64_t wr_addr, size_t length, const std::vector<uint8_t>& wr_data) = 0;
     virtual void rd_from_globalmem(uint64_t rd_addr, size_t length, std::vector<uint8_t>& rd_data) = 0;
+    virtual bool localReadAsync(uint64_t addr, size_t length, LocalMemoryClient client,
+                                uint64_t tag, LocalReadCallback cb) = 0;
+    virtual bool localWriteAsync(uint64_t addr, const std::vector<uint8_t>& data,
+                                 LocalMemoryClient client, uint64_t tag,
+                                 LocalWriteCallback cb) = 0;
+    virtual size_t localMaxRequestBytes() const = 0;
     virtual void wr_to_network(uint64_t wr_addr, size_t length, std::vector<uint8_t>& wr_data) = 0;
     virtual void rd_to_network(uint64_t rd_addr, size_t length, uint64_t returnAddr) = 0;
     virtual void setBaseAddr(uint64_t addr) = 0;
     virtual uint64_t getBaseAddr() const = 0;
     virtual uint64_t getSize() const = 0;
     virtual void dma_write_to_host(uint64_t dst_pa, size_t length, const std::vector<uint8_t>& data, DmaCallback cb) = 0;
+    virtual void dma_write_from_globalmem_to_host(uint64_t gm_src_addr,
+                                                   uint64_t dst_pa,
+                                                   size_t length,
+                                                   DmaCallback cb) = 0;
     virtual void dma_read_from_host_to_globalmem(uint64_t src_pa, size_t length, uint64_t gm_dst_addr, DmaCallback cb) = 0;
     virtual uint64_t dma_write_to_host_async(uint64_t dst_pa, size_t length,
                                              const std::vector<uint8_t>& data) = 0;
@@ -230,6 +293,13 @@ public:
         {"dump_data", "Enable detailed data hex dump logs", "0"},
         {"link_bw",  "Bandwidth of the router link (e.g., \"1GB/s\")."},
         {"globalMemTransLatency", "Latency per bytes transferred in global memory operation", "5ns"},
+        {"local_access_clock", "Clock used by the modeled local-memory scheduler", "1GHz"},
+        {"local_access_base_latency_cycles", "Base cycles for an accepted local-memory request", "1"},
+        {"local_access_bytes_per_cycle", "Transfer bandwidth per local-memory port", "64"},
+        {"local_access_read_ports", "Number of modeled local-memory read ports", "1"},
+        {"local_access_write_ports", "Number of modeled local-memory write ports", "1"},
+        {"local_access_queue_depth", "Maximum queued plus in-flight local-memory requests", "32"},
+        {"local_access_max_request_bytes", "Maximum bytes accepted by one local-memory request", "4096"},
         {"identityWindowBase", "Base address of Identity Window for DMA access to main memory", "0x04000000"},
         {"dma_read_retry_ticks", "Retry timeout ticks per DMA READ chunk (in selfLink ticks)", "96"},
         {"dma_read_max_retries", "Maximum retry attempts per DMA READ chunk", "8"},
@@ -264,6 +334,12 @@ public:
     void wr_to_globalmem(uint64_t wr_addr, size_t length, const std::vector<uint8_t>& wr_data) override;
     // 从本地 GlobalMemory 读取数据
     void rd_from_globalmem(uint64_t rd_addr, size_t length, std::vector<uint8_t>& rd_data) override;
+    bool localReadAsync(uint64_t addr, size_t length, LocalMemoryClient client,
+                        uint64_t tag, LocalReadCallback cb) override;
+    bool localWriteAsync(uint64_t addr, const std::vector<uint8_t>& data,
+                         LocalMemoryClient client, uint64_t tag,
+                         LocalWriteCallback cb) override;
+    size_t localMaxRequestBytes() const override { return localAccessMaxRequestBytes_; }
     // 发起对远端 GlobalMemory 节点的写请求
     void wr_to_network(uint64_t wr_addr, size_t length, std::vector<uint8_t>& wr_data) override;
     // 发起对远端 GlobalMemory 节点的读请求
@@ -277,6 +353,10 @@ public:
     uint64_t getSize() const override;
 
     void dma_write_to_host(uint64_t dst_pa, size_t length, const std::vector<uint8_t>& data, DmaCallback cb) override;
+    void dma_write_from_globalmem_to_host(uint64_t gm_src_addr,
+                                           uint64_t dst_pa,
+                                           size_t length,
+                                           DmaCallback cb) override;
     void dma_read_from_host_to_globalmem(uint64_t src_pa, size_t length, uint64_t gm_dst_addr, DmaCallback cb) override;
     bool reductionNetworkAvailable() const override;
     bool sendReductionMessage(uint32_t destinationCore,
@@ -310,6 +390,7 @@ public:
 
     virtual SimTime_t getLatency(uint32_t arrayID);
     virtual void handleSelfEvent(Event* ev);
+    void handleLocalAccessEvent(Event* ev);
     //globalmemory传递数据的延迟参数
     SST::Link* selfLink = nullptr;
     UnitAlgebra globalMemTransLatency;
@@ -381,6 +462,26 @@ private:
         uint64_t submit_cycle = 0;
     };
 
+    struct PendingLocalAccess {
+        enum class Kind : uint8_t { Read, Write };
+        Kind kind = Kind::Read;
+        uint64_t requestId = 0;
+        uint64_t addr = 0;
+        size_t length = 0;
+        LocalMemoryClient client = LocalMemoryClient::Control;
+        uint64_t tag = 0;
+        uint64_t submitCycle = 0;
+        std::vector<uint8_t> writeData;
+        LocalReadCallback readCallback;
+        LocalWriteCallback writeCallback;
+    };
+
+    struct PendingDmaLanding {
+        PendingDmaOp op;
+        std::vector<uint8_t> data;
+        size_t offset = 0;
+    };
+
     uint64_t baseAddr = 0;
     uint64_t size = 0;
     uint64_t globalBase = 0;
@@ -408,6 +509,39 @@ private:
     std::unordered_map<uint64_t, PendingReadRequest> request_pending;
     uint64_t next_dma_completion_token = 1;
     uint64_t next_dma_request_id = 1;
+
+    bool localAccessValid(uint64_t addr, size_t length) const;
+    void tryIssueLocalAccesses();
+    void issueLocalAccess(uint64_t requestId);
+    uint64_t localAccessDelayCycles(size_t length) const;
+    void completeDmaReadToLocalMemory(PendingDmaOp op,
+                                      const std::vector<uint8_t>& data);
+    void issueNextDmaLandingChunk(uint64_t landingTag);
+    void finishDmaReadLanding(PendingDmaOp& op, bool ok);
+
+    SST::Link* localAccessSelfLink_ = nullptr;
+    uint32_t localAccessBaseLatencyCycles_ = 1;
+    uint32_t localAccessBytesPerCycle_ = 64;
+    uint32_t localAccessReadPorts_ = 1;
+    uint32_t localAccessWritePorts_ = 1;
+    uint32_t localAccessQueueDepth_ = 32;
+    uint32_t localAccessMaxRequestBytes_ = 4096;
+    uint32_t localReadsInFlight_ = 0;
+    uint32_t localWritesInFlight_ = 0;
+    uint64_t nextLocalAccessRequestId_ = 1;
+    uint64_t nextLocalDmaTag_ = 1;
+    uint64_t localAccessQueueHighWater_ = 0;
+    uint64_t localReadRequests_ = 0;
+    uint64_t localWriteRequests_ = 0;
+    uint64_t localReadBytes_ = 0;
+    uint64_t localWriteBytes_ = 0;
+    uint64_t localQueueRejected_ = 0;
+    uint64_t localReadQueueCycles_ = 0;
+    uint64_t localWriteQueueCycles_ = 0;
+    std::deque<uint64_t> localReadQueue_;
+    std::deque<uint64_t> localWriteQueue_;
+    std::unordered_map<uint64_t, PendingLocalAccess> localAccessPending_;
+    std::unordered_map<uint64_t, PendingDmaLanding> pendingDmaLandings_;
 
     void handleDmaMemEvent(SST::Interfaces::StandardMem::Request* req);
 
@@ -529,12 +663,19 @@ public:
 
     void wr_to_globalmem(uint64_t wr_addr, size_t length, const std::vector<uint8_t>& wr_data) override;
     void rd_from_globalmem(uint64_t rd_addr, size_t length, std::vector<uint8_t>& rd_data) override;
+    bool localReadAsync(uint64_t addr, size_t length, LocalMemoryClient client,
+                        uint64_t tag, LocalReadCallback cb) override;
+    bool localWriteAsync(uint64_t addr, const std::vector<uint8_t>& data,
+                         LocalMemoryClient client, uint64_t tag,
+                         LocalWriteCallback cb) override;
+    size_t localMaxRequestBytes() const override { return size; }
     void wr_to_network(uint64_t wr_addr, size_t length, std::vector<uint8_t>& wr_data) override;
     void rd_to_network(uint64_t rd_addr, size_t length, uint64_t returnAddr) override;
     void setBaseAddr(uint64_t addr) override { baseAddr = addr; }
     uint64_t getBaseAddr() const override { return baseAddr; }
     uint64_t getSize() const override { return size; }
     void dma_write_to_host(uint64_t, size_t, const std::vector<uint8_t>&, DmaCallback) override;
+    void dma_write_from_globalmem_to_host(uint64_t, uint64_t, size_t, DmaCallback) override;
     void dma_read_from_host_to_globalmem(uint64_t, size_t, uint64_t, DmaCallback) override;
     bool reductionNetworkAvailable() const override { return false; }
     bool sendReductionMessage(uint32_t, const ReductionTransportMessage&) override { return false; }

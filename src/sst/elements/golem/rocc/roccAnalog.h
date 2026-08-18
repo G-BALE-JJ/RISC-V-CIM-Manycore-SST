@@ -30,10 +30,16 @@
 #include <sst/elements/golem/globalmemory/globalmemory.h>
 
 
+#include <array>
 #include <cinttypes>
+#include <algorithm>
+#include <cmath>
+#include <cstring>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <queue>
+#include <unordered_map>
 #include <vector>
 #include <iostream>
 
@@ -63,6 +69,48 @@ constexpr uint8_t GOLEM_ROCC_FUNC7_SFU_PRIMITIVE_BATCH = 0x1b;
 constexpr uint8_t GOLEM_ROCC_FUNC7_SFU_PRIMITIVE_BATCH_WAIT = 0x1c;
 constexpr uint8_t GOLEM_ROCC_FUNC7_SFU_JOB = 0x1d;
 constexpr uint8_t GOLEM_ROCC_FUNC7_REMOTE_STORE_WAIT = 0x1e;
+constexpr uint8_t GOLEM_ROCC_FUNC7_TENSOR_MANAGER_JOB = 0x1f;
+constexpr uint8_t GOLEM_ROCC_FUNC7_TENSOR_MANAGER_WAIT = 0x20;
+constexpr uint8_t GOLEM_ROCC_FUNC7_ATTENTION_MANAGER_JOB = 0x21;
+constexpr uint8_t GOLEM_ROCC_FUNC7_ATTENTION_MANAGER_WAIT = 0x22;
+constexpr uint32_t GOLEM_ATTENTION_DESC_MAGIC = 0x41545431u;
+constexpr uint16_t GOLEM_ATTENTION_DESC_VERSION = 1u;
+constexpr uint32_t GOLEM_ATTENTION_FLAG_CAUSAL = 0x1u;
+constexpr uint64_t ATTENTION_C1_WINDOW_BYTES = 26752;
+constexpr uint64_t ATTENTION_D1_WINDOW_BYTES = 43136;
+constexpr uint64_t ATTENTION_D3_WINDOW_BYTES = 46208;
+constexpr uint64_t ATTENTION_E1_WINDOW_BYTES = ATTENTION_C1_WINDOW_BYTES;
+constexpr uint64_t ATTENTION_E3_WINDOW_BYTES = 51328;
+
+struct GolemAttentionDescV1 {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t size_bytes;
+    uint64_t job_id;
+    uint64_t q_addr;
+    uint64_t k_addr;
+    uint64_t v_addr;
+    uint64_t output_addr;
+    uint64_t topology_gm_addr;
+    uint32_t queries;
+    uint32_t keys;
+    uint32_t head_dim;
+    uint32_t query_block_rows;
+    uint32_t key_block_rows;
+    uint32_t worker_count;
+    uint32_t flags;
+    uint32_t query_row_begin;
+    uint32_t kv_rows_per_node;
+    uint64_t kv_node_stride_bytes;
+    uint32_t tensor_root_core;
+    uint32_t tensor_manager_slot;
+    uint32_t tensor_manager_count;
+    uint32_t reserved0;
+    uint64_t reserved[1];
+};
+
+static_assert(sizeof(GolemAttentionDescV1) == 128,
+              "GolemAttentionDescV1 ABI must remain fixed");
 
 template <typename T>
 class RoCCAnalog : public SST::Vanadis::VanadisRoCCInterface {
@@ -84,6 +132,30 @@ public:
         stat_cycles_mvm_gm2imat = registerStatistic<uint64_t>("cycles_mvm_gm2imat");
         stat_cycles_remote_st = registerStatistic<uint64_t>("cycles_remote_st");
         stat_cycles_remote_ld = registerStatistic<uint64_t>("cycles_remote_ld");
+        statTensorManagerJobsIssued_ = registerStatistic<uint64_t>("tensor_manager_jobs_issued");
+        statTensorManagerWorkersMapped_ = registerStatistic<uint64_t>("tensor_manager_workers_mapped");
+        statTensorManagerRowsDispatched_ = registerStatistic<uint64_t>("tensor_manager_rows_dispatched");
+        statTensorManagerRowsCompleted_ = registerStatistic<uint64_t>("tensor_manager_rows_completed");
+        statTensorManagerJobsCompleted_ = registerStatistic<uint64_t>("tensor_manager_jobs_completed");
+        statTensorManagerDescriptorAcceptTick_ = registerStatistic<uint64_t>("tensor_manager_descriptor_accept_tick");
+        statTensorManagerBandDispatchTick_ = registerStatistic<uint64_t>("tensor_manager_band_dispatch_tick");
+        statTensorManagerCompletionReceivedTick_ = registerStatistic<uint64_t>("tensor_manager_completion_received_tick");
+        statTensorManagerCompleteTick_ = registerStatistic<uint64_t>("tensor_manager_complete_tick");
+        statTensorManagerWaitObservedTick_ = registerStatistic<uint64_t>("tensor_manager_wait_observed_tick");
+        statAttentionManagerJobsIssued_ = registerStatistic<uint64_t>("attention_manager_jobs_issued");
+        statAttentionManagerJobsCompleted_ = registerStatistic<uint64_t>("attention_manager_jobs_completed");
+        statAttentionManagerBandsCompleted_ = registerStatistic<uint64_t>("attention_manager_bands_completed");
+        statAttentionManagerBandCompletionsReceived_ = registerStatistic<uint64_t>("attention_manager_band_completions_received");
+        statAttentionTensorJobsCompleted_ = registerStatistic<uint64_t>("attention_tensor_jobs_completed");
+        statAttentionManagerDescriptorAcceptTick_ = registerStatistic<uint64_t>("attention_manager_descriptor_accept_tick");
+        statAttentionManagerDispatchTick_ = registerStatistic<uint64_t>("attention_manager_dispatch_tick");
+        statAttentionManagerLocalCompleteTick_ = registerStatistic<uint64_t>("attention_manager_local_complete_tick");
+        statAttentionManagerBandCompletionReceivedTick_ = registerStatistic<uint64_t>("attention_manager_band_completion_received_tick");
+        statAttentionTensorCompleteTick_ = registerStatistic<uint64_t>("attention_tensor_complete_tick");
+        statAttentionManagerWaitObservedTick_ = registerStatistic<uint64_t>("attention_manager_wait_observed_tick");
+        statAttentionQkArrayOps_ = registerStatistic<uint64_t>("attention_qk_array_ops");
+        statAttentionPvArrayOps_ = registerStatistic<uint64_t>("attention_pv_array_ops");
+        statAttentionSpHbmBytes_ = registerStatistic<uint64_t>("attention_sp_hbm_bytes");
 
         latency_mvm_ovec2gm = params.find<uint64_t>("latency_mvm_ovec2gm", 10);
         latency_mvm_gm2ivec = params.find<uint64_t>("latency_mvm_gm2ivec", 15);
@@ -131,6 +203,8 @@ public:
         numArrays = params.find<uint64_t>("numArrays", 1);
         inputOperandSize = params.find<uint64_t>("inputOperandSize", 4);
         outputOperandSize = params.find<uint64_t>("outputOperandSize", 4);
+        attentionWindowOffset_ = params.find<uint64_t>("attention_window_offset", 0xC0000);
+        attentionWindowBytes_ = params.find<uint64_t>("attention_window_bytes", 0x10000);
 
         remoteTransferLength = defaultRemoteLength();
   
@@ -209,6 +283,10 @@ public:
                 static_cast<uint32_t>(coreID),
                 params.find<uint32_t>("active_worker_cores", 1));
         }
+        globalMem->setReductionMessageHandler(
+            [this](const ReductionTransportMessage& message) {
+                handleReductionTransportMessage(message);
+            });
 
         groupCtrl = nullptr;
         if (params.find<int>("groupCtrlEnable", 0) != 0) {
@@ -400,6 +478,9 @@ public:
         // Keep draining async array-load commands even while a synchronous command is in flight.
         tryIssueAsyncArrayLoadCommand(cycle);
         tryCompleteAsyncArrayLoads(cycle);
+        progressManagerTensorJobs();
+        progressManagerAttentionJobs();
+        progressAttentionWorker();
         if (workerCommandProcessor != nullptr && workerCommandProcessor->isBusy()) {
             workerCommandProcessor->tick(cycle);
         }
@@ -577,6 +658,32 @@ public:
             if (next_cmd != nullptr && next_cmd->inst != nullptr && next_cmd->inst->func7 == GOLEM_ROCC_FUNC7_SFU_JOB) {
                 roccCmd_q.pop_front();
                 if (!tryIssueSfuJobCommand(next_cmd)) {
+                    roccCmd_q.push_front(next_cmd);
+                }
+                return;
+            }
+            if (next_cmd->inst->func7 == GOLEM_ROCC_FUNC7_TENSOR_MANAGER_JOB) {
+                roccCmd_q.pop_front();
+                if (!tryIssueManagerTensorJobCommand(next_cmd)) {
+                    roccCmd_q.push_front(next_cmd);
+                }
+                return;
+            }
+            if (next_cmd->inst->func7 == GOLEM_ROCC_FUNC7_TENSOR_MANAGER_WAIT) {
+                roccCmd_q.pop_front();
+                if (!tryWaitManagerTensorJobCommand(next_cmd)) {
+                    roccCmd_q.push_front(next_cmd);
+                }
+                return;
+            }
+            if (next_cmd->inst->func7 == GOLEM_ROCC_FUNC7_ATTENTION_MANAGER_JOB) {
+                roccCmd_q.pop_front();
+                tryIssueManagerAttentionJobCommand(next_cmd);
+                return;
+            }
+            if (next_cmd->inst->func7 == GOLEM_ROCC_FUNC7_ATTENTION_MANAGER_WAIT) {
+                roccCmd_q.pop_front();
+                if (!tryWaitManagerAttentionJobCommand(next_cmd)) {
                     roccCmd_q.push_front(next_cmd);
                 }
                 return;
@@ -965,15 +1072,14 @@ public:
         for (uint64_t idx = 0; idx < count; ++idx) {
             const uint32_t array_id = static_cast<uint32_t>(idx);
             auto& state = is_matrix ? async_matrix_loads[array_id] : async_vector_loads[array_id];
-            state.inflight = true;
-            state.ready = false;
-            state.failed = false;
-            state.array_id = array_id;
-            state.base_addr = is_matrix ? base_addr : (base_addr + idx * vector_stride);
-            state.total_size = is_matrix
+            const uint64_t address =
+                is_matrix ? base_addr : (base_addr + idx * vector_stride);
+            const uint64_t total_size = is_matrix
                 ? static_cast<uint64_t>(arrayInputSize) * static_cast<uint64_t>(arrayOutputSize) * static_cast<uint64_t>(inputOperandSize)
                 : vector_stride;
-            state.ready_cycle = cycle + (is_matrix ? latency_mvm_gm2imat : latency_mvm_gm2ivec);
+            initializeAsyncArrayLoad(
+                state, array_id, address, total_size, false, 0);
+            progressAsyncArrayLoad(array_id, is_matrix);
         }
 
         enqueueResponse(new SST::Vanadis::RoCCResponse(cmd->inst->rd, 0, cmd->cmd_id, cmd->hw_thread));
@@ -1144,6 +1250,1394 @@ public:
             cmd->inst->rd, 0, cmd->cmd_id, cmd->hw_thread));
         delete cmd;
         return true;
+    }
+
+    enum class AttentionWorkerPhase : uint8_t {
+        Idle,
+        LoadingKv,
+        LoadingQ,
+        QkProgramMatrix,
+        QkProgramInputs,
+        QkCompute,
+        QkReadOutputs,
+        Softmax,
+        PvProgramMatrix,
+        PvProgramInputs,
+        PvRestoreOutput,
+        PvCompute,
+        PvReadOutputs,
+        OutputDma,
+        Complete,
+    };
+
+    struct AttentionWorkerState {
+        ReductionTransportMessage dispatch = {};
+        AttentionWorkerPhase phase = AttentionWorkerPhase::Idle;
+        uint64_t qLocal = 0;
+        uint64_t kLocal = 0;
+        uint64_t vLocal = 0;
+        uint64_t spLocal = 0;
+        uint64_t oLocal = 0;
+        uint32_t queryBlock = 0;
+        uint32_t keyTile = 0;
+        uint32_t panel = 0;
+        uint32_t index = 0;
+        uint32_t lane = 0;
+        uint32_t arraysPending = 0;
+        std::vector<uint8_t> transferBytes;
+        std::vector<double> arrayPayload;
+        std::vector<uint8_t> readOutputBytes;
+        std::vector<float> outputScales;
+        uint64_t localAddr = 0;
+        size_t localLength = 0;
+        size_t localOffset = 0;
+        bool localInflight = false;
+        bool localWrite = false;
+        std::function<void(bool, const std::vector<uint8_t>&)> localCallback;
+    };
+
+    uint64_t attentionTransferTag() { return allocateLocalTransferTag(); }
+
+    bool attentionCausal(const AttentionWorkerState& state) const {
+        return (state.dispatch.flags & GOLEM_ATTENTION_FLAG_CAUSAL) != 0;
+    }
+
+    uint32_t attentionQueryRows(const AttentionWorkerState& state) const {
+        const uint32_t begin = state.queryBlock * state.dispatch.queryBlockRows;
+        return std::min(state.dispatch.queryBlockRows,
+                        state.dispatch.expectedRows - begin);
+    }
+
+    uint32_t attentionKeyCols(const AttentionWorkerState& state) const {
+        const uint32_t begin = state.keyTile * state.dispatch.keyBlockRows;
+        return std::min(state.dispatch.keyBlockRows,
+                        state.dispatch.expectedCols - begin);
+    }
+
+    uint32_t attentionQueryBlocks(const AttentionWorkerState& state) const {
+        return (state.dispatch.expectedRows + state.dispatch.queryBlockRows - 1) /
+            state.dispatch.queryBlockRows;
+    }
+
+    uint32_t attentionKeyPanels(const AttentionWorkerState& state) const {
+        return (attentionKeyCols(state) + 15) / 16;
+    }
+
+    uint32_t attentionDimensionPanels(const AttentionWorkerState& state) const {
+        return (state.dispatch.headDim + 15) / 16;
+    }
+
+    uint32_t attentionPanelKeys(const AttentionWorkerState& state) const {
+        return std::min<uint32_t>(16, attentionKeyCols(state) - state.panel * 16);
+    }
+
+    uint32_t attentionKeyTilesForQueryBlock(const AttentionWorkerState& state) const {
+        const uint32_t totalKeyTiles =
+            (state.dispatch.expectedCols + state.dispatch.keyBlockRows - 1) /
+            state.dispatch.keyBlockRows;
+        if (!attentionCausal(state)) return totalKeyTiles;
+        const uint32_t queryEnd = state.dispatch.row + std::min(
+            state.dispatch.expectedRows,
+            (state.queryBlock + 1) * state.dispatch.queryBlockRows) - 1;
+        return std::min(totalKeyTiles, queryEnd / state.dispatch.keyBlockRows + 1);
+    }
+
+    bool attentionStreamKv(const AttentionWorkerState& state) const {
+        return state.dispatch.nodeStrideBytes != 0 && state.dispatch.rowsPerBand != 0;
+    }
+
+    uint64_t attentionKvHostAddr(const AttentionWorkerState& state,
+                                 uint64_t tensorBase) const {
+        const uint32_t keyBegin = state.keyTile * state.dispatch.keyBlockRows;
+        const uint32_t nodeBand = keyBegin / state.dispatch.rowsPerBand;
+        const uint32_t rowInBand = keyBegin % state.dispatch.rowsPerBand;
+        return tensorBase + static_cast<uint64_t>(nodeBand) *
+            state.dispatch.nodeStrideBytes + static_cast<uint64_t>(rowInBand) *
+            state.dispatch.headDim * sizeof(float);
+    }
+
+    uint32_t attentionKvLocalKey(const AttentionWorkerState& state,
+                                 uint32_t keyInTile) const {
+        return attentionStreamKv(state) ? keyInTile :
+            state.keyTile * state.dispatch.keyBlockRows + keyInTile;
+    }
+
+    void finishAttentionWorker(bool ok) {
+        if (!attentionWorker_) return;
+        if (!ok) {
+            output->output(
+                "Attention worker failure core=%" PRIu64 " phase=%u query_block=%u "
+                "key_tile=%u panel=%u index=%u\n",
+                coreID, static_cast<unsigned>(attentionWorker_->phase),
+                attentionWorker_->queryBlock, attentionWorker_->keyTile,
+                attentionWorker_->panel, attentionWorker_->index);
+        }
+        ReductionTransportMessage completion = attentionWorker_->dispatch;
+        completion.kind = ReductionTransportMessageKind::AttentionComplete;
+        completion.sendCycle = getCurrentSimCycle();
+        completion.value = ok ? 1.0 : 0.0;
+        attentionWorker_.reset();
+        std::fill(attentionArrayPending_.begin(), attentionArrayPending_.end(), 0);
+        if (!globalMem->sendReductionMessage(completion.ownerCore, completion)) {
+            output->verbose(CALL_INFO, 1, 0, "Attention completion send failed\n");
+        }
+    }
+
+    void issueAttentionLocalTransferChunk() {
+        if (!attentionWorker_ || attentionWorker_->localInflight ||
+            !attentionWorker_->localCallback) return;
+        AttentionWorkerState& state = *attentionWorker_;
+        const size_t remaining = state.localLength - state.localOffset;
+        if (remaining == 0) {
+            auto callback = std::move(state.localCallback);
+            const std::vector<uint8_t> bytes = state.transferBytes;
+            callback(true, bytes);
+            return;
+        }
+        const size_t chunk = std::min(remaining, globalMem->localMaxRequestBytes());
+        const uint64_t tag = attentionTransferTag();
+        bool accepted = false;
+        if (!state.localWrite) {
+            accepted = globalMem->localReadAsync(
+                state.localAddr + state.localOffset, chunk, LocalMemoryClient::RoCC, tag,
+                [this, tag, chunk](bool ok, uint64_t callbackTag,
+                                   const std::vector<uint8_t>& bytes) {
+                    if (!attentionWorker_) return;
+                    AttentionWorkerState& callbackState = *attentionWorker_;
+                    callbackState.localInflight = false;
+                    if (!ok || callbackTag != tag || bytes.size() != chunk) {
+                        auto callback = std::move(callbackState.localCallback);
+                        callback(false, {});
+                        return;
+                    }
+                    callbackState.transferBytes.insert(
+                        callbackState.transferBytes.end(), bytes.begin(), bytes.end());
+                    callbackState.localOffset += chunk;
+                    issueAttentionLocalTransferChunk();
+                });
+        } else {
+            std::vector<uint8_t> bytes(
+                state.transferBytes.begin() + state.localOffset,
+                state.transferBytes.begin() + state.localOffset + chunk);
+            accepted = globalMem->localWriteAsync(
+                state.localAddr + state.localOffset, bytes, LocalMemoryClient::RoCC, tag,
+                [this, tag, chunk](bool ok, uint64_t callbackTag) {
+                    if (!attentionWorker_) return;
+                    AttentionWorkerState& callbackState = *attentionWorker_;
+                    callbackState.localInflight = false;
+                    if (!ok || callbackTag != tag) {
+                        auto callback = std::move(callbackState.localCallback);
+                        callback(false, {});
+                        return;
+                    }
+                    callbackState.localOffset += chunk;
+                    issueAttentionLocalTransferChunk();
+                });
+        }
+        if (accepted) state.localInflight = true;
+    }
+
+    void attentionLocalRead(uint64_t addr, size_t length,
+                            std::function<void(bool, const std::vector<uint8_t>&)> callback) {
+        AttentionWorkerState& state = *attentionWorker_;
+        state.localAddr = addr;
+        state.localLength = length;
+        state.localOffset = 0;
+        state.localInflight = false;
+        state.localWrite = false;
+        state.transferBytes.clear();
+        state.localCallback = std::move(callback);
+        issueAttentionLocalTransferChunk();
+    }
+
+    void attentionLocalWrite(uint64_t addr, const std::vector<uint8_t>& bytes,
+                             std::function<void(bool)> callback) {
+        AttentionWorkerState& state = *attentionWorker_;
+        state.localAddr = addr;
+        state.localLength = bytes.size();
+        state.localOffset = 0;
+        state.localInflight = false;
+        state.localWrite = true;
+        state.transferBytes = bytes;
+        state.localCallback = [callback = std::move(callback)](
+                                  bool ok, const std::vector<uint8_t>&) { callback(ok); };
+        issueAttentionLocalTransferChunk();
+    }
+
+    std::vector<double> attentionBytesToDoubles(const std::vector<uint8_t>& bytes) const {
+        const size_t count = bytes.size() / sizeof(float);
+        std::vector<double> values(count, 0.0);
+        for (size_t i = 0; i < count; ++i) {
+            float value = 0.0f;
+            std::memcpy(&value, bytes.data() + i * sizeof(float), sizeof(float));
+            values[i] = value;
+        }
+        return values;
+    }
+
+    std::vector<uint8_t> attentionDoublesToBytes(const std::vector<double>& values) const {
+        std::vector<uint8_t> bytes(values.size() * sizeof(float));
+        for (size_t i = 0; i < values.size(); ++i) {
+            const float value = static_cast<float>(values[i]);
+            std::memcpy(bytes.data() + i * sizeof(float), &value, sizeof(float));
+        }
+        return bytes;
+    }
+
+    void beginAttentionQueryBlock() {
+        if (!attentionWorker_) return;
+        AttentionWorkerState& state = *attentionWorker_;
+        state.phase = AttentionWorkerPhase::LoadingQ;
+        state.panel = 0;
+        state.keyTile = 0;
+        const uint64_t qBytes = static_cast<uint64_t>(attentionQueryRows(state)) *
+            state.dispatch.headDim * sizeof(float);
+        globalMem->dma_read_from_host_to_globalmem(
+            state.dispatch.qAddr + static_cast<uint64_t>(state.queryBlock) *
+                state.dispatch.queryBlockRows * state.dispatch.headDim * sizeof(float),
+            qBytes, state.qLocal,
+            [this](bool ok) {
+                if (!attentionWorker_ || !ok) { finishAttentionWorker(false); return; }
+                loadAttentionKeyTile();
+            });
+    }
+
+    void beginAttentionKeyTile() {
+        if (!attentionWorker_) return;
+        attentionLocalRead(attentionWorker_->qLocal,
+            static_cast<uint64_t>(attentionQueryRows(*attentionWorker_)) *
+                attentionWorker_->dispatch.headDim * sizeof(float),
+            [this](bool readOk, const std::vector<uint8_t>& bytes) {
+                if (!attentionWorker_ || !readOk) { finishAttentionWorker(false); return; }
+                const std::vector<double> q = attentionBytesToDoubles(bytes);
+                attentionWorker_->arrayPayload.assign(
+                    static_cast<size_t>(arrayOutputSize) * arrayInputSize, 0.0);
+                std::copy(q.begin(), q.end(), attentionWorker_->arrayPayload.begin());
+                attentionWorker_->phase = AttentionWorkerPhase::QkProgramMatrix;
+                attentionWorker_->panel = 0;
+                attentionWorker_->index = 0;
+                beginAttentionQkPanel();
+            });
+    }
+
+    void loadAttentionKeyTile() {
+        if (!attentionWorker_) return;
+        AttentionWorkerState& state = *attentionWorker_;
+        if (!attentionStreamKv(state)) {
+            beginAttentionKeyTile();
+            return;
+        }
+        const uint64_t tileBytes = static_cast<uint64_t>(attentionKeyCols(state)) *
+            state.dispatch.headDim * sizeof(float);
+        globalMem->dma_read_from_host_to_globalmem(
+            attentionKvHostAddr(state, state.dispatch.kAddr), tileBytes, state.kLocal,
+            [this, tileBytes](bool ok) {
+                if (!attentionWorker_ || !ok) { finishAttentionWorker(false); return; }
+                globalMem->dma_read_from_host_to_globalmem(
+                    attentionKvHostAddr(*attentionWorker_, attentionWorker_->dispatch.vAddr),
+                    tileBytes, attentionWorker_->vLocal,
+                    [this](bool vOk) {
+                        if (!attentionWorker_ || !vOk) {
+                            finishAttentionWorker(false); return;
+                        }
+                        beginAttentionKeyTile();
+                    });
+            });
+    }
+
+    void beginAttentionQkPanel() {
+        if (!attentionWorker_) return;
+        AttentionWorkerState& state = *attentionWorker_;
+        if (state.phase == AttentionWorkerPhase::QkProgramMatrix) {
+            if (state.index == attentionPanelKeys(state)) {
+                state.phase = AttentionWorkerPhase::QkProgramInputs;
+                state.index = 0;
+                programAttentionQkInput();
+                return;
+            }
+            const uint32_t arrayId = state.index;
+            const uint64_t tag = attentionTransferTag();
+            if (!array->programMatrixAsync(arrayId, state.arrayPayload, sizeof(float), tag,
+                    [this, tag](bool ok, uint64_t callbackTag) {
+                        if (!attentionWorker_ || !ok || callbackTag != tag) {
+                            finishAttentionWorker(false); return;
+                        }
+                        attentionWorker_->index += 1;
+                        beginAttentionQkPanel();
+                    })) finishAttentionWorker(false);
+            return;
+        }
+    }
+
+    void programAttentionQkInput() {
+        if (!attentionWorker_) return;
+        AttentionWorkerState& state = *attentionWorker_;
+        const uint32_t activeArrays = attentionPanelKeys(state);
+        if (state.index == activeArrays) {
+            state.phase = AttentionWorkerPhase::QkCompute;
+            state.arraysPending = activeArrays;
+            if (attentionArrayPending_.size() < 16) attentionArrayPending_.resize(16, 0);
+            for (uint32_t arrayId = 0; arrayId < activeArrays; ++arrayId) {
+                array->configureOutputMode(arrayId, 0);
+                attentionArrayPending_[arrayId] = 1;
+                arrayStates[arrayId] = 1;
+                array->beginComputation(arrayId);
+                statAttentionQkArrayOps_->addData(1);
+            }
+            return;
+        }
+        const uint32_t arrayId = state.index;
+        const uint32_t key = attentionKvLocalKey(state, state.panel * 16 + arrayId);
+        attentionLocalRead(state.kLocal + static_cast<uint64_t>(key) *
+                state.dispatch.headDim * sizeof(float),
+            state.dispatch.headDim * sizeof(float),
+            [this, arrayId](bool ok, const std::vector<uint8_t>& bytes) {
+                if (!attentionWorker_ || !ok) { finishAttentionWorker(false); return; }
+                const std::vector<double> input = attentionBytesToDoubles(bytes);
+                const uint64_t tag = attentionTransferTag();
+                if (!array->programInputAsync(arrayId, input, sizeof(float), tag,
+                        [this, tag](bool programOk, uint64_t callbackTag) {
+                            if (!attentionWorker_ || !programOk || callbackTag != tag) {
+                                finishAttentionWorker(false); return;
+                            }
+                            attentionWorker_->index += 1;
+                            programAttentionQkInput();
+                        })) finishAttentionWorker(false);
+            });
+    }
+
+    void readAttentionQkOutput() {
+        if (!attentionWorker_) return;
+        AttentionWorkerState& state = *attentionWorker_;
+        if (state.index == attentionPanelKeys(state)) {
+            if (++state.panel < attentionKeyPanels(state)) {
+                state.phase = AttentionWorkerPhase::QkProgramInputs;
+                state.index = 0;
+                programAttentionQkInput();
+            } else {
+                beginAttentionSoftmax();
+            }
+            return;
+        }
+        const uint32_t arrayId = state.index;
+        const uint64_t tag = attentionTransferTag();
+        if (!array->readOutputAsync(arrayId, sizeof(float), tag,
+                [this, tag, arrayId](bool ok, uint64_t callbackTag,
+                                     const std::vector<double>& values) {
+                    if (!attentionWorker_ || !ok || callbackTag != tag || values.size() != 16) {
+                        finishAttentionWorker(false); return;
+                    }
+                    attentionWorker_->readOutputBytes = attentionDoublesToBytes(values);
+                    attentionWorker_->lane = 0;
+                    const auto issueLane = [this, arrayId](auto&& self) -> void {
+                        if (!attentionWorker_) return;
+                        AttentionWorkerState& laneState = *attentionWorker_;
+                        if (laneState.lane == attentionQueryRows(laneState)) {
+                            laneState.index += 1;
+                            readAttentionQkOutput();
+                            return;
+                        }
+                        const uint32_t query = laneState.lane;
+                        const uint32_t key = laneState.panel * 16 + arrayId;
+                        std::vector<uint8_t> scalar(
+                            laneState.readOutputBytes.begin() + query * sizeof(float),
+                            laneState.readOutputBytes.begin() + (query + 1) * sizeof(float));
+                        const uint64_t addr = laneState.spLocal +
+                            (static_cast<uint64_t>(query) * attentionKeyCols(laneState) + key) *
+                                sizeof(float);
+                        attentionLocalWrite(addr, scalar, [this, self](bool writeOk) mutable {
+                            if (!attentionWorker_ || !writeOk) {
+                                finishAttentionWorker(false); return;
+                            }
+                            attentionWorker_->lane += 1;
+                            self(self);
+                        });
+                    };
+                    issueLane(issueLane);
+                })) finishAttentionWorker(false);
+    }
+
+    void beginAttentionSoftmax() {
+        if (!attentionWorker_ || sfu == nullptr) { finishAttentionWorker(false); return; }
+        AttentionWorkerState& state = *attentionWorker_;
+        state.phase = AttentionWorkerPhase::Softmax;
+        AttentionTileRequest request;
+        request.tag = state.dispatch.tag +
+            state.queryBlock * ((state.dispatch.expectedCols +
+                state.dispatch.keyBlockRows - 1) / state.dispatch.keyBlockRows) +
+            state.keyTile + 1;
+        request.jobId = state.dispatch.jobId;
+        request.localScoreAddr = state.spLocal;
+        request.globalRowBegin = state.dispatch.row +
+            state.queryBlock * state.dispatch.queryBlockRows;
+        request.keyBegin = state.keyTile * state.dispatch.keyBlockRows;
+        request.rows = attentionQueryRows(state);
+        request.cols = attentionKeyCols(state);
+        request.headDim = state.dispatch.headDim;
+        request.keyTile = state.keyTile;
+        request.keyTiles = attentionKeyTilesForQueryBlock(state);
+        request.causal = attentionCausal(state);
+        request.firstTileForJob = state.queryBlock == 0 && state.keyTile == 0;
+        if (!sfu->issueAttentionTile(request, [this](
+                bool ok, const AttentionTileResult& result) {
+                if (!attentionWorker_ || !ok) { finishAttentionWorker(false); return; }
+                attentionWorker_->outputScales.assign(
+                    result.oldOutputScale.begin(),
+                    result.oldOutputScale.begin() + result.rows);
+                attentionWorker_->panel = 0;
+                beginAttentionPvPanel();
+            })) finishAttentionWorker(false);
+    }
+
+    void beginAttentionPvPanel() {
+        if (!attentionWorker_) return;
+        AttentionWorkerState& state = *attentionWorker_;
+        state.phase = AttentionWorkerPhase::PvProgramMatrix;
+        const uint32_t keyCols = attentionKeyCols(state);
+        attentionLocalRead(
+            state.vLocal + (attentionStreamKv(state) ? 0 :
+                static_cast<uint64_t>(state.keyTile) *
+                    state.dispatch.keyBlockRows * state.dispatch.headDim * sizeof(float)),
+            static_cast<uint64_t>(keyCols) * state.dispatch.headDim * sizeof(float),
+            [this](bool ok, const std::vector<uint8_t>& bytes) {
+                if (!attentionWorker_ || !ok) { finishAttentionWorker(false); return; }
+                const std::vector<double> v = attentionBytesToDoubles(bytes);
+                AttentionWorkerState& callbackState = *attentionWorker_;
+                callbackState.arrayPayload.assign(
+                    static_cast<size_t>(arrayOutputSize) * arrayInputSize, 0.0);
+                for (uint32_t dim = 0; dim < 16; ++dim) {
+                    for (uint32_t key = 0; key < attentionKeyCols(callbackState); ++key) {
+                        callbackState.arrayPayload[dim * arrayInputSize + key] =
+                            v[key * callbackState.dispatch.headDim +
+                              callbackState.panel * 16 + dim];
+                    }
+                }
+                callbackState.index = 0;
+                const auto programMatrix = [this](auto&& self) -> void {
+                    if (!attentionWorker_) return;
+                    AttentionWorkerState& matrixState = *attentionWorker_;
+                    if (matrixState.index == attentionQueryRows(matrixState)) {
+                        matrixState.phase = AttentionWorkerPhase::PvProgramInputs;
+                        matrixState.index = 0;
+                        programAttentionPvInput();
+                        return;
+                    }
+                    const uint32_t arrayId = matrixState.index;
+                    const uint64_t tag = attentionTransferTag();
+                    if (!array->programMatrixAsync(arrayId, matrixState.arrayPayload,
+                            sizeof(float), tag, [this, tag, self](bool programOk,
+                                                                 uint64_t callbackTag) mutable {
+                                if (!attentionWorker_ || !programOk || callbackTag != tag) {
+                                    finishAttentionWorker(false); return;
+                                }
+                                attentionWorker_->index += 1;
+                                self(self);
+                            })) finishAttentionWorker(false);
+                };
+                programMatrix(programMatrix);
+            });
+    }
+
+    void programAttentionPvInput() {
+        if (!attentionWorker_) return;
+        AttentionWorkerState& state = *attentionWorker_;
+        if (state.index == attentionQueryRows(state)) {
+            state.phase = AttentionWorkerPhase::PvRestoreOutput;
+            state.index = 0;
+            prepareAttentionPvOutput();
+            return;
+        }
+        const uint32_t arrayId = state.index;
+        const uint32_t keyCols = attentionKeyCols(state);
+        attentionLocalRead(state.spLocal + static_cast<uint64_t>(arrayId) * keyCols * sizeof(float),
+            keyCols * sizeof(float), [this, arrayId](bool ok, const std::vector<uint8_t>& bytes) {
+                if (!attentionWorker_ || !ok) { finishAttentionWorker(false); return; }
+                std::vector<double> input(arrayInputSize, 0.0);
+                const std::vector<double> p = attentionBytesToDoubles(bytes);
+                std::copy(p.begin(), p.end(), input.begin());
+                const uint64_t tag = attentionTransferTag();
+                if (!array->programInputAsync(arrayId, input, sizeof(float), tag,
+                        [this, tag](bool programOk, uint64_t callbackTag) {
+                            if (!attentionWorker_ || !programOk || callbackTag != tag) {
+                                finishAttentionWorker(false); return;
+                            }
+                            attentionWorker_->index += 1;
+                            programAttentionPvInput();
+                        })) finishAttentionWorker(false);
+            });
+    }
+
+    void startAttentionPvComputation() {
+        if (!attentionWorker_) return;
+        AttentionWorkerState& state = *attentionWorker_;
+        state.phase = AttentionWorkerPhase::PvCompute;
+        const uint32_t activeArrays = attentionQueryRows(state);
+        state.arraysPending = activeArrays;
+        for (uint32_t arrayId = 0; arrayId < activeArrays; ++arrayId) {
+            attentionArrayPending_[arrayId] = 1;
+            arrayStates[arrayId] = 1;
+            array->beginComputation(arrayId);
+            statAttentionPvArrayOps_->addData(1);
+        }
+    }
+
+    void prepareAttentionPvOutput() {
+        if (!attentionWorker_) return;
+        AttentionWorkerState& state = *attentionWorker_;
+        if (state.keyTile == 0) {
+            for (uint32_t arrayId = 0; arrayId < attentionQueryRows(state); ++arrayId) {
+                array->configureOutputMode(arrayId, 0);
+            }
+            startAttentionPvComputation();
+            return;
+        }
+        if (state.index == attentionQueryRows(state)) {
+            startAttentionPvComputation();
+            return;
+        }
+        const uint32_t arrayId = state.index;
+        const uint64_t addr = state.oLocal +
+            (static_cast<uint64_t>(arrayId) * state.dispatch.headDim +
+             state.panel * 16) * sizeof(float);
+        attentionLocalRead(addr, 16 * sizeof(float),
+            [this, arrayId](bool ok, const std::vector<uint8_t>& bytes) {
+                if (!attentionWorker_ || !ok ||
+                    attentionWorker_->outputScales.size() !=
+                        attentionQueryRows(*attentionWorker_)) {
+                    finishAttentionWorker(false); return;
+                }
+                std::vector<double> output = attentionBytesToDoubles(bytes);
+                const double scale = attentionWorker_->outputScales[arrayId];
+                for (double& value : output) value *= scale;
+                const uint64_t tag = attentionTransferTag();
+                if (!array->writeOutputAsync(arrayId, output, sizeof(float), tag,
+                        [this, tag, arrayId](bool writeOk, uint64_t callbackTag) {
+                            if (!attentionWorker_ || !writeOk || callbackTag != tag) {
+                                finishAttentionWorker(false); return;
+                            }
+                            array->configureOutputMode(arrayId, 1);
+                            attentionWorker_->index += 1;
+                            prepareAttentionPvOutput();
+                        })) finishAttentionWorker(false);
+            });
+    }
+
+    void readAttentionPvOutput() {
+        if (!attentionWorker_) return;
+        AttentionWorkerState& state = *attentionWorker_;
+        if (state.index == attentionQueryRows(state)) {
+            if (++state.panel < attentionDimensionPanels(state)) {
+                beginAttentionPvPanel();
+            } else {
+                const uint32_t keyTiles = attentionKeyTilesForQueryBlock(state);
+                if (++state.keyTile < keyTiles) {
+                    loadAttentionKeyTile();
+                    return;
+                }
+                state.phase = AttentionWorkerPhase::OutputDma;
+                const uint64_t blockBytes = static_cast<uint64_t>(attentionQueryRows(state)) *
+                    state.dispatch.headDim * sizeof(float);
+                globalMem->dma_write_from_globalmem_to_host(
+                    state.oLocal, state.dispatch.oAddr +
+                        static_cast<uint64_t>(state.queryBlock) *
+                            state.dispatch.queryBlockRows * state.dispatch.headDim * sizeof(float),
+                    blockBytes, [this](bool ok) {
+                        if (!attentionWorker_ || !ok) { finishAttentionWorker(false); return; }
+                        AttentionWorkerState& state = *attentionWorker_;
+                        const uint32_t queryBlocks = attentionQueryBlocks(state);
+                        if (++state.queryBlock < queryBlocks) beginAttentionQueryBlock();
+                        else finishAttentionWorker(true);
+                    });
+            }
+            return;
+        }
+        const uint32_t arrayId = state.index;
+        const uint64_t tag = attentionTransferTag();
+        if (!array->readOutputAsync(arrayId, sizeof(float), tag,
+                [this, tag, arrayId](bool ok, uint64_t callbackTag,
+                                     const std::vector<double>& values) {
+                    if (!attentionWorker_ || !ok || callbackTag != tag || values.size() != 16) {
+                        finishAttentionWorker(false); return;
+                    }
+                    const std::vector<uint8_t> bytes = attentionDoublesToBytes(values);
+                    const uint64_t addr = attentionWorker_->oLocal +
+                        (static_cast<uint64_t>(arrayId) *
+                             attentionWorker_->dispatch.headDim +
+                         attentionWorker_->panel * 16) * sizeof(float);
+                    attentionLocalWrite(addr, bytes, [this](bool writeOk) {
+                        if (!attentionWorker_ || !writeOk) {
+                            finishAttentionWorker(false); return;
+                        }
+                        attentionWorker_->index += 1;
+                        readAttentionPvOutput();
+                    });
+                })) finishAttentionWorker(false);
+    }
+
+    bool handleAttentionArrayDone(uint32_t arrayId) {
+        if (!attentionWorker_ || arrayId >= attentionArrayPending_.size() ||
+            attentionArrayPending_[arrayId] == 0) return false;
+        attentionArrayPending_[arrayId] = 0;
+        arrayStates[arrayId] = 0;
+        AttentionWorkerState& state = *attentionWorker_;
+        if (state.arraysPending == 0) { finishAttentionWorker(false); return true; }
+        state.arraysPending -= 1;
+        if (state.arraysPending == 0) {
+            state.index = 0;
+            if (state.phase == AttentionWorkerPhase::QkCompute) {
+                state.phase = AttentionWorkerPhase::QkReadOutputs;
+                readAttentionQkOutput();
+            } else if (state.phase == AttentionWorkerPhase::PvCompute) {
+                state.phase = AttentionWorkerPhase::PvReadOutputs;
+                readAttentionPvOutput();
+            } else {
+                finishAttentionWorker(false);
+            }
+        }
+        return true;
+    }
+
+    void startAttentionWorker(const ReductionTransportMessage& message) {
+        const bool c1Shape = message.expectedRows == 32 && message.expectedCols == 32;
+        const bool d1Shape = message.expectedRows == 64 && message.expectedCols == 64;
+        const bool d3Shape = message.expectedRows == 20 && message.expectedCols == 70;
+        const bool e1Shape = message.expectedRows == 16 && message.expectedCols == 256 &&
+            message.rowsPerBand == 64 && message.headDim == 64 &&
+            message.nodeStrideBytes != 0;
+        const bool e3Shape = message.expectedRows == 64 && message.expectedCols == 1024 &&
+            message.rowsPerBand == 256 && message.headDim == 128 &&
+            message.nodeStrideBytes != 0;
+        const bool e4Shape = message.expectedRows == 128 && message.expectedCols == 2048 &&
+            message.rowsPerBand == 512 && message.headDim == 128 &&
+            message.nodeStrideBytes != 0;
+        const uint64_t requiredWindow = d3Shape ? ATTENTION_D3_WINDOW_BYTES :
+            (d1Shape ? ATTENTION_D1_WINDOW_BYTES :
+             ((e3Shape || e4Shape) ? ATTENTION_E3_WINDOW_BYTES :
+              (e1Shape ? ATTENTION_E1_WINDOW_BYTES : ATTENTION_C1_WINDOW_BYTES)));
+        if (attentionWorker_ || globalMem == nullptr || array == nullptr || sfu == nullptr ||
+            message.workerCore != coreID ||
+            (!c1Shape && !d1Shape && !d3Shape && !e1Shape && !e3Shape && !e4Shape) ||
+            ((!(e3Shape || e4Shape) && message.headDim != 64) ||
+             ((e3Shape || e4Shape) && message.headDim != 128)) ||
+            message.queryBlockRows != 16 || message.keyBlockRows != 32 ||
+            (message.flags & ~GOLEM_ATTENTION_FLAG_CAUSAL) != 0 ||
+            numArrays < 16 || arrayInputSize != static_cast<int>(message.headDim) ||
+            arrayOutputSize != 16 || attentionWindowBytes_ < requiredWindow ||
+            attentionWindowOffset_ + requiredWindow > globalMem->getSize()) {
+            ReductionTransportMessage rejected = message;
+            rejected.kind = ReductionTransportMessageKind::AttentionComplete;
+            rejected.value = 0.0;
+            globalMem->sendReductionMessage(message.ownerCore, rejected);
+            return;
+        }
+        attentionWorker_ = std::make_unique<AttentionWorkerState>();
+        AttentionWorkerState& state = *attentionWorker_;
+        state.dispatch = message;
+        state.phase = AttentionWorkerPhase::LoadingKv;
+        const uint64_t base = globalMem->getBaseAddr() + attentionWindowOffset_;
+        state.qLocal = base;
+        const uint64_t qTileBytes = static_cast<uint64_t>(message.queryBlockRows) *
+            message.headDim * sizeof(float);
+        state.kLocal = state.qLocal + qTileBytes;
+        const uint64_t kvBytes = (e1Shape || e3Shape || e4Shape) ?
+            static_cast<uint64_t>(message.keyBlockRows) * message.headDim * sizeof(float) :
+            static_cast<uint64_t>(message.expectedCols) * message.headDim * sizeof(float);
+        state.vLocal = state.kLocal + kvBytes;
+        state.spLocal = state.vLocal + kvBytes;
+        state.oLocal = state.spLocal + static_cast<uint64_t>(message.queryBlockRows) *
+            message.keyBlockRows * sizeof(float);
+        attentionArrayPending_.assign(numArrays, 0);
+        if (e1Shape || e3Shape || e4Shape) {
+            beginAttentionQueryBlock();
+            return;
+        }
+        globalMem->dma_read_from_host_to_globalmem(
+            message.kAddr, kvBytes, state.kLocal,
+            [this](bool ok) {
+                if (!attentionWorker_ || !ok) { finishAttentionWorker(false); return; }
+                globalMem->dma_read_from_host_to_globalmem(
+                    attentionWorker_->dispatch.vAddr,
+                    static_cast<uint64_t>(attentionWorker_->dispatch.expectedCols) *
+                        attentionWorker_->dispatch.headDim * sizeof(float),
+                    attentionWorker_->vLocal, [this](bool vOk) {
+                        if (!attentionWorker_ || !vOk) { finishAttentionWorker(false); return; }
+                        beginAttentionQueryBlock();
+                    });
+            });
+    }
+
+    void progressAttentionWorker() {
+        if (attentionWorker_ && attentionWorker_->localCallback &&
+            !attentionWorker_->localInflight &&
+            attentionWorker_->localOffset < attentionWorker_->localLength) {
+            issueAttentionLocalTransferChunk();
+        }
+    }
+
+    enum class ManagerAttentionJobPhase : uint8_t {
+        ReadDescriptor,
+        ReadTopology,
+        Dispatch,
+        Running,
+        Complete,
+    };
+
+    struct ManagerAttentionJobState {
+        uint64_t tag = 0;
+        uint64_t descAddr = 0;
+        GolemAttentionDescV1 desc = {};
+        std::array<uint32_t, SFU_WORKER_TOPOLOGY_MAX_WORKERS> workerCoreIds = {};
+        uint32_t workersDispatched = 0;
+        uint32_t workersCompleted = 0;
+        uint32_t completionBitmap = 0;
+        uint32_t managersCompleted = 0;
+        uint32_t managerCompletionBitmap = 0;
+        SFUStatus status = SFUStatus::Pending;
+        ManagerAttentionJobPhase phase = ManagerAttentionJobPhase::ReadDescriptor;
+        bool readInflight = false;
+        uint64_t readTag = 0;
+    };
+
+    void failManagerAttentionJob(ManagerAttentionJobState& state, SFUStatus status) {
+        state.status = status;
+        state.readInflight = false;
+        state.phase = ManagerAttentionJobPhase::Complete;
+    }
+
+    bool tryIssueManagerAttentionJobCommand(SST::Vanadis::RoCCCommand* cmd) {
+        if (cmd == nullptr || cmd->inst == nullptr) return true;
+        const uint64_t tag = cmd->rs2;
+        uint64_t response = 0;
+        if (globalMem == nullptr || managerAttentionJobs_.count(tag) != 0) {
+            response = static_cast<uint64_t>(SFUStatus::InvalidDescriptor);
+        } else {
+            ManagerAttentionJobState state;
+            state.tag = tag;
+            state.descAddr = cmd->rs1;
+            managerAttentionJobs_.emplace(tag, std::move(state));
+            statAttentionManagerJobsIssued_->addData(1);
+            statAttentionManagerDescriptorAcceptTick_->addData(getCurrentSimCycle());
+        }
+        enqueueResponse(new SST::Vanadis::RoCCResponse(
+            cmd->inst->rd, response, cmd->cmd_id, cmd->hw_thread));
+        delete cmd;
+        return true;
+    }
+
+    bool tryWaitManagerAttentionJobCommand(SST::Vanadis::RoCCCommand* cmd) {
+        if (cmd == nullptr || cmd->inst == nullptr) return true;
+        auto it = managerAttentionJobs_.find(cmd->rs1);
+        if (it == managerAttentionJobs_.end()) {
+            enqueueResponse(new SST::Vanadis::RoCCResponse(
+                cmd->inst->rd, static_cast<uint64_t>(SFUStatus::InvalidDescriptor),
+                cmd->cmd_id, cmd->hw_thread));
+            delete cmd;
+            return true;
+        }
+        if (it->second.phase != ManagerAttentionJobPhase::Complete) return false;
+        const uint64_t status = static_cast<uint64_t>(it->second.status);
+        statAttentionManagerWaitObservedTick_->addData(getCurrentSimCycle());
+        managerAttentionJobs_.erase(it);
+        enqueueResponse(new SST::Vanadis::RoCCResponse(
+            cmd->inst->rd, status, cmd->cmd_id, cmd->hw_thread));
+        delete cmd;
+        return true;
+    }
+
+    bool validateManagerAttentionDescriptor(const GolemAttentionDescV1& desc) const {
+        const bool c1Shape = desc.queries == 32 && desc.keys == 32;
+        const bool d1Shape = desc.queries == 64 && desc.keys == 64;
+        const bool d3Shape = desc.queries == 20 && desc.keys == 70;
+        const bool e1Shape = desc.queries == 64 && desc.keys == 256 &&
+            desc.worker_count == 4 && desc.query_row_begin % 64 == 0 &&
+            desc.query_row_begin < 256 && desc.kv_rows_per_node == 64 &&
+            desc.kv_node_stride_bytes != 0 && desc.flags == 0 &&
+            desc.tensor_root_core == 0 && desc.tensor_manager_count == 4 &&
+            desc.tensor_manager_slot < desc.tensor_manager_count &&
+            desc.tensor_manager_slot == coreID;
+        const bool e3Shape = desc.queries == 256 && desc.keys == 1024 &&
+            desc.head_dim == 128 && desc.worker_count == 4 &&
+            desc.query_row_begin % 256 == 0 && desc.query_row_begin < 1024 &&
+            desc.kv_rows_per_node == 256 && desc.kv_node_stride_bytes != 0 &&
+            desc.flags == 0 && desc.tensor_root_core == 0 &&
+            desc.tensor_manager_count == 4 &&
+            desc.tensor_manager_slot < desc.tensor_manager_count &&
+            desc.tensor_manager_slot == coreID;
+        const bool e4Shape = desc.queries == 512 && desc.keys == 2048 &&
+            desc.head_dim == 128 && desc.worker_count == 4 &&
+            desc.query_row_begin % 512 == 0 && desc.query_row_begin < 2048 &&
+            desc.kv_rows_per_node == 512 && desc.kv_node_stride_bytes != 0 &&
+            desc.flags == 0 && desc.tensor_root_core == 0 &&
+            desc.tensor_manager_count == 4 &&
+            desc.tensor_manager_slot < desc.tensor_manager_count &&
+            desc.tensor_manager_slot == coreID;
+        const uint64_t requiredWindow = d3Shape ? ATTENTION_D3_WINDOW_BYTES :
+            (d1Shape ? ATTENTION_D1_WINDOW_BYTES :
+             ((e3Shape || e4Shape) ? ATTENTION_E3_WINDOW_BYTES :
+              (e1Shape ? ATTENTION_E1_WINDOW_BYTES : ATTENTION_C1_WINDOW_BYTES)));
+        return desc.magic == GOLEM_ATTENTION_DESC_MAGIC &&
+            desc.version == GOLEM_ATTENTION_DESC_VERSION &&
+            desc.size_bytes == sizeof(GolemAttentionDescV1) &&
+            (c1Shape || d1Shape || d3Shape || e1Shape || e3Shape || e4Shape) &&
+            ((!(e3Shape || e4Shape) && desc.head_dim == 64) ||
+             ((e3Shape || e4Shape) && desc.head_dim == 128)) &&
+            desc.query_block_rows == 16 && desc.key_block_rows == 32 &&
+            (((e1Shape || e3Shape || e4Shape) && desc.worker_count == 4) ||
+             (!e1Shape && !e3Shape && !e4Shape && desc.worker_count == 1)) &&
+            (desc.flags & ~GOLEM_ATTENTION_FLAG_CAUSAL) == 0 &&
+            desc.q_addr != 0 && desc.k_addr != 0 && desc.v_addr != 0 &&
+            desc.output_addr != 0 && desc.topology_gm_addr != 0 &&
+            attentionWindowBytes_ >= requiredWindow;
+    }
+
+    void progressManagerAttentionJobs() {
+        if (globalMem == nullptr) return;
+        for (auto& entry : managerAttentionJobs_) {
+            ManagerAttentionJobState& state = entry.second;
+            if (state.readInflight || state.phase == ManagerAttentionJobPhase::Running ||
+                state.phase == ManagerAttentionJobPhase::Complete) continue;
+            if (state.phase == ManagerAttentionJobPhase::ReadDescriptor) {
+                const uint64_t jobTag = state.tag;
+                const uint64_t readTag = allocateLocalTransferTag();
+                const bool accepted = globalMem->localReadAsync(
+                    state.descAddr, sizeof(GolemAttentionDescV1), LocalMemoryClient::Control,
+                    readTag, [this, jobTag, readTag](bool ok, uint64_t tag,
+                                                     const std::vector<uint8_t>& bytes) {
+                        auto it = managerAttentionJobs_.find(jobTag);
+                        if (it == managerAttentionJobs_.end()) return;
+                        ManagerAttentionJobState& callbackState = it->second;
+                        callbackState.readInflight = false;
+                        if (!ok || tag != readTag || bytes.size() != sizeof(GolemAttentionDescV1)) {
+                            failManagerAttentionJob(callbackState, SFUStatus::InvalidDescriptor);
+                            return;
+                        }
+                        std::memcpy(&callbackState.desc, bytes.data(), sizeof(callbackState.desc));
+                        if (!validateManagerAttentionDescriptor(callbackState.desc)) {
+                            failManagerAttentionJob(callbackState, SFUStatus::InvalidDescriptor);
+                            return;
+                        }
+                        callbackState.phase = ManagerAttentionJobPhase::ReadTopology;
+                    });
+                if (accepted) {
+                    state.readInflight = true;
+                    state.readTag = readTag;
+                }
+            } else if (state.phase == ManagerAttentionJobPhase::ReadTopology) {
+                const uint64_t jobTag = state.tag;
+                const uint64_t readTag = allocateLocalTransferTag();
+                const bool accepted = globalMem->localReadAsync(
+                    state.desc.topology_gm_addr, sizeof(SFUWorkerTopologyMapV1),
+                    LocalMemoryClient::Control, readTag,
+                    [this, jobTag, readTag](bool ok, uint64_t tag,
+                                            const std::vector<uint8_t>& bytes) {
+                        auto it = managerAttentionJobs_.find(jobTag);
+                        if (it == managerAttentionJobs_.end()) return;
+                        ManagerAttentionJobState& callbackState = it->second;
+                        callbackState.readInflight = false;
+                        SFUWorkerTopologyMapV1 topology = {};
+                        if (!ok || tag != readTag || bytes.size() != sizeof(topology)) {
+                            failManagerAttentionJob(callbackState, SFUStatus::InvalidDescriptor);
+                            return;
+                        }
+                        std::memcpy(&topology, bytes.data(), sizeof(topology));
+                        if (topology.magic != SFU_WORKER_TOPOLOGY_MAP_MAGIC ||
+                            topology.version != SFU_WORKER_TOPOLOGY_MAP_VERSION ||
+                            topology.size_bytes != sizeof(topology) ||
+                            topology.worker_count != callbackState.desc.worker_count ||
+                            topology.worker_count == 0 ||
+                            topology.worker_count > SFU_WORKER_TOPOLOGY_MAX_WORKERS) {
+                            failManagerAttentionJob(callbackState, SFUStatus::InvalidDescriptor);
+                            return;
+                        }
+                        for (uint32_t slot = 0; slot < topology.worker_count; ++slot) {
+                            const uint32_t workerCore = topology.worker_core_ids[slot];
+                            if (workerCore == coreID) {
+                                failManagerAttentionJob(
+                                    callbackState, SFUStatus::InvalidDescriptor);
+                                return;
+                            }
+                            for (uint32_t prior = 0; prior < slot; ++prior) {
+                                if (topology.worker_core_ids[prior] == workerCore) {
+                                    failManagerAttentionJob(
+                                        callbackState, SFUStatus::InvalidDescriptor);
+                                    return;
+                                }
+                            }
+                            callbackState.workerCoreIds[slot] = workerCore;
+                        }
+                        callbackState.phase = ManagerAttentionJobPhase::Dispatch;
+                    });
+                if (accepted) {
+                    state.readInflight = true;
+                    state.readTag = readTag;
+                }
+            } else if (state.phase == ManagerAttentionJobPhase::Dispatch) {
+                const uint32_t workerSlot = state.workersDispatched;
+                if (workerSlot >= state.desc.worker_count) {
+                    state.phase = ManagerAttentionJobPhase::Running;
+                    continue;
+                }
+                const uint32_t workerCore = state.workerCoreIds[workerSlot];
+                const uint32_t rowsPerWorker = state.desc.worker_count == 1 ?
+                    state.desc.queries :
+                    (state.desc.queries + state.desc.worker_count - 1) /
+                        state.desc.worker_count;
+                const uint32_t localQueryBegin = workerSlot * rowsPerWorker;
+                const uint32_t workerRows = state.desc.worker_count == 1 ? state.desc.queries :
+                    std::min(rowsPerWorker,
+                             state.desc.queries - localQueryBegin);
+                ReductionTransportMessage message = {};
+                message.kind = ReductionTransportMessageKind::AttentionDispatch;
+                message.jobId = state.desc.job_id;
+                message.tag = state.tag;
+                message.ownerCore = static_cast<uint32_t>(coreID);
+                message.workerSlot = workerSlot;
+                message.workerCore = workerCore;
+                message.row = state.desc.query_row_begin + localQueryBegin;
+                message.expectedWorkers = state.desc.worker_count;
+                message.expectedRows = workerRows;
+                message.expectedCols = state.desc.keys;
+                message.headDim = state.desc.head_dim;
+                message.queryBlockRows = state.desc.query_block_rows;
+                message.keyBlockRows = state.desc.key_block_rows;
+                message.flags = state.desc.flags;
+                message.nodeStrideBytes = state.desc.kv_node_stride_bytes;
+                message.rowsPerBand = state.desc.kv_rows_per_node;
+                message.qAddr = state.desc.q_addr +
+                    static_cast<uint64_t>(localQueryBegin) * state.desc.head_dim * sizeof(float);
+                message.kAddr = state.desc.k_addr;
+                message.vAddr = state.desc.v_addr;
+                message.oAddr = state.desc.output_addr +
+                    static_cast<uint64_t>(localQueryBegin) * state.desc.head_dim * sizeof(float);
+                message.sendCycle = getCurrentSimCycle();
+                if (!globalMem->sendReductionMessage(workerCore, message)) {
+                    failManagerAttentionJob(state, SFUStatus::GlobalMemoryUnavailable);
+                } else {
+                    state.workersDispatched += 1;
+                    if (state.workersDispatched == state.desc.worker_count) {
+                        state.phase = ManagerAttentionJobPhase::Running;
+                        statAttentionManagerDispatchTick_->addData(getCurrentSimCycle());
+                    }
+                }
+            }
+        }
+    }
+
+    bool handleManagerAttentionCompletion(const ReductionTransportMessage& message) {
+        if (message.kind != ReductionTransportMessageKind::AttentionComplete ||
+            message.ownerCore != coreID) return false;
+        auto it = managerAttentionJobs_.find(message.tag);
+        if (it == managerAttentionJobs_.end()) return false;
+        ManagerAttentionJobState& state = it->second;
+        const uint32_t workerSlot = message.workerSlot;
+        const bool validPhase = state.phase == ManagerAttentionJobPhase::Dispatch ||
+            state.phase == ManagerAttentionJobPhase::Running;
+        if (!validPhase || message.jobId != state.desc.job_id ||
+            message.expectedWorkers != state.desc.worker_count ||
+            workerSlot >= state.desc.worker_count ||
+            message.workerCore != state.workerCoreIds[workerSlot] ||
+            (state.completionBitmap & (1u << workerSlot)) != 0 || message.value != 1.0) {
+            failManagerAttentionJob(state, SFUStatus::InvalidDescriptor);
+            return true;
+        }
+        state.completionBitmap |= 1u << workerSlot;
+        state.workersCompleted += 1;
+        if (state.workersCompleted == state.desc.worker_count) {
+            statAttentionManagerBandsCompleted_->addData(1);
+            statAttentionManagerLocalCompleteTick_->addData(getCurrentSimCycle());
+            if (state.desc.tensor_manager_count <= 1) {
+                state.status = SFUStatus::Success;
+                state.phase = ManagerAttentionJobPhase::Complete;
+                statAttentionManagerJobsCompleted_->addData(1);
+                statAttentionTensorJobsCompleted_->addData(1);
+                statAttentionTensorCompleteTick_->addData(getCurrentSimCycle());
+            } else {
+                ReductionTransportMessage managerCompletion = {};
+                managerCompletion.kind =
+                    ReductionTransportMessageKind::AttentionManagerComplete;
+                managerCompletion.jobId = state.desc.job_id;
+                managerCompletion.tag = state.tag;
+                managerCompletion.ownerCore = state.desc.tensor_root_core;
+                managerCompletion.workerSlot = state.desc.tensor_manager_slot;
+                managerCompletion.workerCore = static_cast<uint32_t>(coreID);
+                managerCompletion.expectedWorkers = state.desc.tensor_manager_count;
+                managerCompletion.sendCycle = getCurrentSimCycle();
+                managerCompletion.value = 1.0;
+                if (coreID == state.desc.tensor_root_core) {
+                    handleAttentionManagerBandCompletion(managerCompletion);
+                } else if (!globalMem->sendReductionMessage(
+                               state.desc.tensor_root_core, managerCompletion)) {
+                    failManagerAttentionJob(
+                        state, SFUStatus::GlobalMemoryUnavailable);
+                } else {
+                    state.status = SFUStatus::Success;
+                    state.phase = ManagerAttentionJobPhase::Complete;
+                    statAttentionManagerJobsCompleted_->addData(1);
+                }
+            }
+        }
+        return true;
+    }
+
+    bool handleAttentionManagerBandCompletion(
+        const ReductionTransportMessage& message) {
+        if (message.kind != ReductionTransportMessageKind::AttentionManagerComplete) {
+            return false;
+        }
+        auto it = managerAttentionJobs_.find(message.tag);
+        if (it == managerAttentionJobs_.end()) return true;
+        ManagerAttentionJobState& state = it->second;
+        const uint32_t managerSlot = message.workerSlot;
+        if (coreID != state.desc.tensor_root_core || message.ownerCore != coreID ||
+            message.jobId != state.desc.job_id ||
+            message.expectedWorkers != state.desc.tensor_manager_count ||
+            managerSlot >= state.desc.tensor_manager_count ||
+            message.workerCore != managerSlot ||
+            (state.managerCompletionBitmap & (1u << managerSlot)) != 0 ||
+            message.value != 1.0) {
+            failManagerAttentionJob(state, SFUStatus::InvalidDescriptor);
+            return true;
+        }
+        state.managerCompletionBitmap |= 1u << managerSlot;
+        state.managersCompleted += 1;
+        statAttentionManagerBandCompletionsReceived_->addData(1);
+        statAttentionManagerBandCompletionReceivedTick_->addData(getCurrentSimCycle());
+        if (state.managersCompleted == state.desc.tensor_manager_count) {
+            state.status = SFUStatus::Success;
+            state.phase = ManagerAttentionJobPhase::Complete;
+            statAttentionManagerJobsCompleted_->addData(1);
+            statAttentionTensorJobsCompleted_->addData(1);
+            statAttentionTensorCompleteTick_->addData(getCurrentSimCycle());
+        }
+        return true;
+    }
+
+    enum class ManagerTensorJobPhase : uint8_t {
+        ReadDescriptor,
+        ReadParams,
+        ReadTopology,
+        Dispatch,
+        Running,
+        Complete,
+    };
+
+    struct ManagerTensorJobState {
+        uint64_t tag = 0;
+        uint64_t descAddr = 0;
+        SFUJobDesc desc = {};
+        SFUSoftmaxJobParamsV1 params = {};
+        std::vector<uint32_t> workerCoreIds;
+        std::vector<uint8_t> completionSeen;
+        uint32_t rowsCompleted = 0;
+        SFUStatus status = SFUStatus::Pending;
+        ManagerTensorJobPhase phase = ManagerTensorJobPhase::ReadDescriptor;
+        bool readInflight = false;
+        uint64_t readTag = 0;
+    };
+
+    bool tryIssueManagerTensorJobCommand(SST::Vanadis::RoCCCommand* cmd) {
+        if (cmd == nullptr || cmd->inst == nullptr) {
+            return true;
+        }
+        const uint64_t tag = cmd->rs2;
+        if (globalMem == nullptr || managerTensorJobs_.find(tag) != managerTensorJobs_.end()) {
+            enqueueResponse(new SST::Vanadis::RoCCResponse(
+                cmd->inst->rd, 1, cmd->cmd_id, cmd->hw_thread));
+            delete cmd;
+            return true;
+        }
+        ManagerTensorJobState state;
+        state.tag = tag;
+        state.descAddr = cmd->rs1;
+        managerTensorJobs_.emplace(tag, std::move(state));
+        statTensorManagerJobsIssued_->addData(1);
+        statTensorManagerDescriptorAcceptTick_->addData(getCurrentSimCycle());
+        enqueueResponse(new SST::Vanadis::RoCCResponse(
+            cmd->inst->rd, 0, cmd->cmd_id, cmd->hw_thread));
+        delete cmd;
+        return true;
+    }
+
+    bool tryWaitManagerTensorJobCommand(SST::Vanadis::RoCCCommand* cmd) {
+        if (cmd == nullptr || cmd->inst == nullptr) {
+            return true;
+        }
+        auto it = managerTensorJobs_.find(cmd->rs1);
+        if (it == managerTensorJobs_.end()) {
+            enqueueResponse(new SST::Vanadis::RoCCResponse(
+                cmd->inst->rd, static_cast<uint64_t>(SFUStatus::InvalidDescriptor),
+                cmd->cmd_id, cmd->hw_thread));
+            delete cmd;
+            return true;
+        }
+        if (it->second.phase != ManagerTensorJobPhase::Complete) {
+            return false;
+        }
+        const uint64_t status = static_cast<uint64_t>(it->second.status);
+        statTensorManagerWaitObservedTick_->addData(getCurrentSimCycle());
+        managerTensorJobs_.erase(it);
+        enqueueResponse(new SST::Vanadis::RoCCResponse(
+            cmd->inst->rd, status, cmd->cmd_id, cmd->hw_thread));
+        delete cmd;
+        return true;
+    }
+
+    void failManagerTensorJob(ManagerTensorJobState& state, SFUStatus status) {
+        state.status = status;
+        state.readInflight = false;
+        state.phase = ManagerTensorJobPhase::Complete;
+    }
+
+    template <typename Metadata>
+    void issueManagerMetadataRead(ManagerTensorJobState& state,
+                                  uint64_t address,
+                                  ManagerTensorJobPhase nextPhase,
+                                  Metadata ManagerTensorJobState::* destination) {
+        if (state.readInflight || sizeof(Metadata) > globalMem->localMaxRequestBytes()) {
+            if (sizeof(Metadata) > globalMem->localMaxRequestBytes()) {
+                failManagerTensorJob(state, SFUStatus::InvalidDescriptor);
+            }
+            return;
+        }
+        const uint64_t tag = allocateLocalTransferTag();
+        const uint64_t jobTag = state.tag;
+        const bool accepted = globalMem->localReadAsync(
+            address, sizeof(Metadata), LocalMemoryClient::Control, tag,
+            [this, jobTag, tag, nextPhase, destination](
+                bool success, uint64_t callbackTag, const std::vector<uint8_t>& bytes) {
+                auto it = managerTensorJobs_.find(jobTag);
+                if (it == managerTensorJobs_.end()) {
+                    return;
+                }
+                ManagerTensorJobState& callbackState = it->second;
+                if (!callbackState.readInflight || callbackState.readTag != callbackTag ||
+                    callbackTag != tag || !success || bytes.size() != sizeof(Metadata)) {
+                    failManagerTensorJob(callbackState, SFUStatus::InvalidDescriptor);
+                    return;
+                }
+                std::memcpy(&(callbackState.*destination), bytes.data(), sizeof(Metadata));
+                callbackState.readInflight = false;
+                callbackState.phase = nextPhase;
+            });
+        if (accepted) {
+            state.readInflight = true;
+            state.readTag = tag;
+        }
+    }
+
+    bool validateManagerDescriptor(const ManagerTensorJobState& state) const {
+        const SFUJobDesc& desc = state.desc;
+        return desc.owner_core == coreID && desc.input0_addr != 0 && desc.output_addr != 0 &&
+            desc.params_addr != 0 && desc.rows != 0 && desc.cols != 0 &&
+            desc.chunk_elems != 0 && desc.worker_cores != 0 &&
+            desc.worker_cores <= SFU_WORKER_TOPOLOGY_MAX_WORKERS &&
+            desc.dtype == SFU_JOB_DTYPE_FP32 &&
+            desc.op_type == static_cast<uint32_t>(SFUJobOp::SOFTMAX_ROW) &&
+            (desc.flags & (SFU_JOB_FLAG_ROW_ENGINE_MODEL |
+                           SFU_JOB_FLAG_TENSOR_ROW_ENGINE)) ==
+                (SFU_JOB_FLAG_ROW_ENGINE_MODEL | SFU_JOB_FLAG_TENSOR_ROW_ENGINE);
+    }
+
+    bool validateManagerParams(const ManagerTensorJobState& state) const {
+        const SFUSoftmaxJobParamsV1& params = state.params;
+        return params.magic == SFU_SOFTMAX_JOB_PARAMS_MAGIC &&
+            params.version == SFU_SOFTMAX_JOB_PARAMS_VERSION_MANAGER &&
+            params.size_bytes == sizeof(SFUSoftmaxJobParamsV1) &&
+            params.mapping_policy == SFU_SOFTMAX_MAPPING_EXPLICIT_TOPOLOGY &&
+            params.hbm_layout == SFU_SOFTMAX_HBM_LAYOUT_BAND_STRIPED &&
+            params.data_node_mask != 0 && params.node_stride_bytes != 0 &&
+            params.rows_per_band != 0 && params.coordinator_core == coreID &&
+            params.completion_addr != 0;
+    }
+
+    bool validateAndInstallManagerTopology(ManagerTensorJobState& state,
+                                           const SFUWorkerTopologyMapV1& topology) {
+        if (topology.magic != SFU_WORKER_TOPOLOGY_MAP_MAGIC ||
+            topology.version != SFU_WORKER_TOPOLOGY_MAP_VERSION ||
+            topology.size_bytes != sizeof(SFUWorkerTopologyMapV1) ||
+            topology.worker_count != state.desc.worker_cores) {
+            return false;
+        }
+        state.workerCoreIds.clear();
+        for (uint32_t slot = 0; slot < topology.worker_count; ++slot) {
+            const uint32_t workerCore = topology.worker_core_ids[slot];
+            if (workerCore == coreID ||
+                std::find(state.workerCoreIds.begin(), state.workerCoreIds.end(), workerCore) !=
+                    state.workerCoreIds.end()) {
+                return false;
+            }
+            state.workerCoreIds.push_back(workerCore);
+        }
+        statTensorManagerWorkersMapped_->addData(state.workerCoreIds.size());
+        return true;
+    }
+
+    void dispatchManagerTensorJob(ManagerTensorJobState& state) {
+        const uint32_t rowsPerBand = state.params.rows_per_band;
+        const uint32_t bands = (state.desc.rows + rowsPerBand - 1) / rowsPerBand;
+        if (bands == 0 || bands > state.workerCoreIds.size()) {
+            failManagerTensorJob(state, SFUStatus::InvalidShape);
+            return;
+        }
+        state.completionSeen.assign(bands, 0);
+        for (uint32_t band = 0; band < bands; ++band) {
+            const uint32_t workerSlot = band % state.desc.worker_cores;
+            const uint32_t workerCore = state.workerCoreIds[workerSlot];
+            ReductionTransportMessage dispatch = {};
+            dispatch.kind = ReductionTransportMessageKind::TensorRowDispatch;
+            dispatch.jobId = state.desc.job_id;
+            dispatch.tag = state.tag;
+            dispatch.ownerCore = static_cast<uint32_t>(coreID);
+            dispatch.workerSlot = workerSlot;
+            dispatch.workerCore = workerCore;
+            dispatch.row = band * rowsPerBand;
+            dispatch.expectedWorkers = state.desc.worker_cores;
+            dispatch.expectedRows = std::min(rowsPerBand, state.desc.rows - dispatch.row);
+            dispatch.expectedCols = state.desc.cols;
+            dispatch.inputAddr = state.desc.input0_addr;
+            dispatch.outputAddr = state.desc.output_addr;
+            dispatch.nodeStrideBytes = state.params.node_stride_bytes;
+            dispatch.dataNodeMask = state.params.data_node_mask;
+            dispatch.rowsPerBand = rowsPerBand;
+            if ((state.params.flags & SFU_SOFTMAX_PARAMS_FLAG_ATTENTION) != 0) {
+                const uint64_t headDim = state.params.reserved0;
+                if (headDim == 0) {
+                    failManagerTensorJob(state, SFUStatus::InvalidShape);
+                    return;
+                }
+                const double scale = 1.0 / std::sqrt(static_cast<double>(headDim));
+                dispatch.value =
+                    (state.params.flags & SFU_SOFTMAX_PARAMS_FLAG_CAUSAL) != 0
+                        ? -scale : scale;
+            }
+            if (!globalMem->sendReductionMessage(workerCore, dispatch)) {
+                failManagerTensorJob(state, SFUStatus::GlobalMemoryUnavailable);
+                return;
+            }
+            statTensorManagerBandDispatchTick_->addData(getCurrentSimCycle());
+        }
+        statTensorManagerRowsDispatched_->addData(state.desc.rows);
+        state.phase = ManagerTensorJobPhase::Running;
+    }
+
+    void progressManagerTensorJobs() {
+        for (auto& entry : managerTensorJobs_) {
+            ManagerTensorJobState& state = entry.second;
+            if (state.phase == ManagerTensorJobPhase::ReadDescriptor) {
+                issueManagerMetadataRead(state, state.descAddr,
+                    ManagerTensorJobPhase::ReadParams, &ManagerTensorJobState::desc);
+            } else if (state.phase == ManagerTensorJobPhase::ReadParams && !state.readInflight) {
+                if (!validateManagerDescriptor(state)) {
+                    failManagerTensorJob(state, SFUStatus::InvalidDescriptor);
+                } else {
+                    issueManagerMetadataRead(state, state.desc.params_addr,
+                        ManagerTensorJobPhase::ReadTopology, &ManagerTensorJobState::params);
+                }
+            } else if (state.phase == ManagerTensorJobPhase::ReadTopology &&
+                       !state.readInflight) {
+                if (!validateManagerParams(state)) {
+                    failManagerTensorJob(state, SFUStatus::InvalidDescriptor);
+                    continue;
+                }
+                if (sizeof(SFUWorkerTopologyMapV1) > globalMem->localMaxRequestBytes()) {
+                    failManagerTensorJob(state, SFUStatus::InvalidDescriptor);
+                    continue;
+                }
+                const uint64_t jobTag = state.tag;
+                const uint64_t readTag = allocateLocalTransferTag();
+                const bool accepted = globalMem->localReadAsync(
+                    state.params.completion_addr, sizeof(SFUWorkerTopologyMapV1),
+                    LocalMemoryClient::Control, readTag,
+                    [this, jobTag, readTag](bool success, uint64_t callbackTag,
+                                            const std::vector<uint8_t>& bytes) {
+                        auto it = managerTensorJobs_.find(jobTag);
+                        if (it == managerTensorJobs_.end()) return;
+                        ManagerTensorJobState& callbackState = it->second;
+                        if (!callbackState.readInflight || callbackTag != readTag ||
+                            callbackState.readTag != callbackTag || !success ||
+                            bytes.size() != sizeof(SFUWorkerTopologyMapV1)) {
+                            failManagerTensorJob(callbackState, SFUStatus::InvalidDescriptor);
+                            return;
+                        }
+                        SFUWorkerTopologyMapV1 topology = {};
+                        std::memcpy(&topology, bytes.data(), sizeof(topology));
+                        callbackState.readInflight = false;
+                        if (!validateAndInstallManagerTopology(callbackState, topology)) {
+                            failManagerTensorJob(callbackState, SFUStatus::InvalidDescriptor);
+                            return;
+                        }
+                        callbackState.phase = ManagerTensorJobPhase::Dispatch;
+                    });
+                if (accepted) {
+                    state.readInflight = true;
+                    state.readTag = readTag;
+                }
+            } else if (state.phase == ManagerTensorJobPhase::Dispatch) {
+                dispatchManagerTensorJob(state);
+            }
+        }
+    }
+
+    bool handleManagerTensorCompletion(const ReductionTransportMessage& message) {
+        if (message.kind != ReductionTransportMessageKind::TensorRowComplete ||
+            message.ownerCore != coreID) {
+            return false;
+        }
+        auto it = managerTensorJobs_.find(message.tag);
+        if (it == managerTensorJobs_.end()) {
+            return false;
+        }
+        ManagerTensorJobState& state = it->second;
+        const uint32_t rowsPerBand = state.params.rows_per_band;
+        if (state.phase != ManagerTensorJobPhase::Running || rowsPerBand == 0 ||
+            message.jobId != state.desc.job_id || message.row % rowsPerBand != 0) {
+            failManagerTensorJob(state, SFUStatus::InvalidDescriptor);
+            return true;
+        }
+        const uint32_t band = message.row / rowsPerBand;
+        const uint32_t expectedSlot = band % state.desc.worker_cores;
+        const uint32_t expectedRows = std::min(rowsPerBand, state.desc.rows - message.row);
+        if (band >= state.completionSeen.size() || message.workerSlot != expectedSlot ||
+            message.workerCore != state.workerCoreIds[expectedSlot] ||
+            message.expectedWorkers != state.desc.worker_cores ||
+            message.expectedRows != expectedRows || message.expectedCols != state.desc.cols ||
+            message.rowsPerBand != rowsPerBand || state.completionSeen[band] != 0 ||
+            message.value != 1.0) {
+            failManagerTensorJob(state, SFUStatus::InvalidDescriptor);
+            return true;
+        }
+        state.completionSeen[band] = 1;
+        statTensorManagerCompletionReceivedTick_->addData(getCurrentSimCycle());
+        statTensorManagerRowsCompleted_->addData(expectedRows);
+        state.rowsCompleted += expectedRows;
+        if (state.rowsCompleted == state.desc.rows &&
+            std::all_of(state.completionSeen.begin(), state.completionSeen.end(),
+                        [](uint8_t seen) { return seen != 0; })) {
+            state.status = SFUStatus::Success;
+            state.phase = ManagerTensorJobPhase::Complete;
+            statTensorManagerJobsCompleted_->addData(1);
+            statTensorManagerCompleteTick_->addData(getCurrentSimCycle());
+        }
+        return true;
+    }
+
+    void handleReductionTransportMessage(const ReductionTransportMessage& message) {
+        if (message.kind == ReductionTransportMessageKind::AttentionDispatch) {
+            startAttentionWorker(message);
+            return;
+        }
+        if (handleManagerAttentionCompletion(message)) {
+            return;
+        }
+        if (handleAttentionManagerBandCompletion(message)) {
+            return;
+        }
+        if (handleManagerTensorCompletion(message)) {
+            return;
+        }
+        if (sfu != nullptr) {
+            sfu->receiveReductionMessage(message);
+        }
     }
 
     bool isArrayComputeInflight(uint32_t array_id) const {
@@ -1328,132 +2822,27 @@ public:
         completeRoCC(0);
     }
 
-    void OutputvectorStore(uint64_t cycle) {
-        uint64_t cycles_elapsed = (cycle >= StartTickCycle) ? (cycle - StartTickCycle + 1) : 0;
-
-        if (cycles_elapsed < latency_mvm_ovec2gm) {
+    void OutputvectorStore(uint64_t) {
+        if (curr_cmd == nullptr || curr_cmd->rs2 >= static_cast<uint64_t>(numArrays)) {
+            completeRoCC(1);
             return;
         }
-        // 将阵列 rs2 的输出向量写入 GlobalMemory 本地地址 rs1
-        uint64_t dest_addr = curr_cmd->rs1;  // 本地GlobalMemory目标物理地址
-        uint64_t array_id  = curr_cmd->rs2;  // 阵列ID（源计算阵列编号）
-        // 计算输出向量总字节数 = 输出元素个数 × 每个元素字节大小
-        size_t vector_length = arrayOutputSize * outputOperandSize;
-        outputPayload.resize(vector_length);
-        // 获取阵列 rs2 的输出向量引用，并填充到字节缓冲区
-        auto& outputVector = *static_cast<std::vector<T>*>(array->getOutputVector(array_id));
-        for (size_t i = 0; i < static_cast<size_t>(arrayOutputSize); ++i) {
-            T value = outputVector[i];
-            uint8_t* byte_ptr = reinterpret_cast<uint8_t*>(&value);
-            for (size_t j = 0; j < static_cast<size_t>(outputOperandSize); ++j) {
-                outputPayload[i * outputOperandSize + j] = byte_ptr[j];
-            }
+        if (!legacy_output_store_.active) {
+            legacy_output_store_ = LegacyOutputStoreState{};
+            legacy_output_store_.active = true;
+            legacy_output_store_.command_id = curr_cmd->cmd_id;
+            legacy_output_store_.dest_addr = curr_cmd->rs1;
+            legacy_output_store_.array_id = static_cast<uint32_t>(curr_cmd->rs2);
         }
-        // 输出调试信息：打印存储的向量内容
-        output->verbose(CALL_INFO, 9, 0, 
-                        "Local store vector from array %" PRIu64 " to local address 0x%" PRIx64 ":\n", 
-                        array_id, dest_addr);
-        for (size_t i = 0; i < static_cast<size_t>(arrayOutputSize); ++i) {
-            if constexpr (std::is_same<T, float>::value || std::is_same<T, double>::value) {
-                output->verbose(CALL_INFO, 9, 0, "%f ", static_cast<double>(outputVector[i]));
-            } else {
-                output->verbose(CALL_INFO, 9, 0, "%lld ", static_cast<long long>(outputVector[i]));
-            }
-        }
-        output->verbose(CALL_INFO, 9, 0, "\n");
-        // 调用 GlobalMemory 接口将字节数据写入本地 GlobalMemory 存储
-        globalMem->wr_to_globalmem(dest_addr, vector_length, outputPayload);
-        // 完成指令执行（rd 寄存器返回值 0 表示成功）
-        completeRoCC(0);
+        progressLegacyOutputStore();
     }
 
-    void IntputvectorLoad(uint64_t cycle) {
-        uint64_t cycles_elapsed = (cycle >= StartTickCycle) ? (cycle - StartTickCycle + 1) : 0;
-
-        if (cycles_elapsed < latency_mvm_gm2ivec) {
-            return;
-        }
-        // 从本地 GlobalMemory 地址 rs1 加载数据到阵列 rs2 的输入向量
-        uint64_t src_addr = curr_cmd->rs1;   // 本地GlobalMemory源物理地址
-        uint64_t array_id = curr_cmd->rs2;   // 阵列ID（目标计算阵列编号）
-        // 计算输入向量总字节数 = 输入元素个数 × 每个元素字节大小
-        size_t vector_length = arrayInputSize * inputOperandSize;
-        std::vector<uint8_t> inputData;
-        inputData.reserve(vector_length);
-        // 从本地 GlobalMemory 读取指定长度的数据到字节缓冲区
-        globalMem->rd_from_globalmem(src_addr, vector_length, inputData);
-        // 将读取的字节数据解析为 T 类型元素，设置给阵列 rs2 的输入向量
-        for (size_t i = 0; i < vector_length; i += inputOperandSize) {
-            T value = 0;
-            memcpy(&value, &inputData[i], inputOperandSize);
-            size_t index = i / inputOperandSize;
-            array->setVectorItem(array_id, static_cast<int>(index), value);
-        }
-        // 输出调试信息：打印加载的向量内容
-        auto& inputVector = *static_cast<std::vector<T>*>(array->getInputVector(array_id));
-        output->verbose(CALL_INFO, 9, 0, 
-                        "Local load vector to array %" PRIu64 " from local address 0x%" PRIx64 ":\n", 
-                        array_id, src_addr);
-        for (int i = 0; i < arrayInputSize; ++i) {
-            if constexpr (std::is_same<T, float>::value || std::is_same<T, double>::value) {
-                output->verbose(CALL_INFO, 9, 0, "%f ", static_cast<double>(inputVector[i]));
-            } else {
-                output->verbose(CALL_INFO, 9, 0, "%ld ", static_cast<long>(inputVector[i]));
-            }
-        }
-        output->verbose(CALL_INFO, 9, 0, "\n");
-        if (array_id < async_vector_loads.size()) {
-            markArrayLoadReady(static_cast<uint32_t>(array_id), false);
-        }
-        // 指令执行完成
-        completeRoCC(0);
+    void IntputvectorLoad(uint64_t) {
+        beginBlockingArrayLoad(false);
     }
 
-    void InputMatrixLoad(uint64_t cycle) {
-        uint64_t cycles_elapsed = (cycle >= StartTickCycle) ? (cycle - StartTickCycle + 1) : 0;
-        if (cycles_elapsed < latency_mvm_gm2imat) {
-            return;
-        }
-
-        // 2. 解析指令参数
-        uint64_t src_addr = curr_cmd->rs1;   // GlobalMemory 源地址
-        uint64_t array_id = curr_cmd->rs2;   // 目标阵列 ID
-
-        // 3. 计算矩阵总字节数
-        // 矩阵大小 = 行数(InputSize) * 列数(OutputSize) * 元素大小
-        size_t matrix_size = arrayInputSize * arrayOutputSize * inputOperandSize;
-
-        // 4. 准备接收缓冲区
-        std::vector<uint8_t> matrixData;
-        matrixData.reserve(matrix_size);
-
-        // 5. 从 GlobalMemory 读取数据 (同步/阻塞式读取，或者假设数据立即可用)
-        // 注意：根据你原有的 IntputvectorLoad 实现，这里似乎假设 rd_from_globalmem 是立即完成填充 vector 的
-        globalMem->rd_from_globalmem(src_addr, matrix_size, matrixData);
-
-        // 6. 将数据填入计算阵列 (Set Matrix Item)
-        // 这里的逻辑参考了 handle() 中 case 0x0 的逻辑
-        for (size_t i = 0; i < matrix_size; i += inputOperandSize) {
-            T value = 0;
-            // 字节转类型 T (int64_t 或 float)
-            memcpy(&value, &matrixData[i], inputOperandSize);
-            
-            // 计算 flat index (扁平化索引)
-            size_t index = i / inputOperandSize;
-            
-            // 写入阵列
-            array->setMatrixItem(static_cast<uint32_t>(array_id), static_cast<int>(index), value);
-        }
-
-        // 7. 打印调试信息
-        output->verbose(CALL_INFO, 9, 0, 
-                        "mvm.g2m: Loaded matrix to array %" PRIu64 " from GM addr 0x%" PRIx64 "\n", 
-                        array_id, src_addr);
-        if (array_id < async_matrix_loads.size()) {
-            markArrayLoadReady(static_cast<uint32_t>(array_id), true);
-        }
-        // 8. 完成指令
-        completeRoCC(0);
+    void InputMatrixLoad(uint64_t) {
+        beginBlockingArrayLoad(true);
     }
     void SetRemoteLength() {
         size_t fallback = defaultRemoteLength();
@@ -1764,6 +3153,10 @@ public:
     void handleArrayEvent(Event *ev) {
         Golem::ArrayEvent *aev = static_cast<Golem::ArrayEvent *>(ev);
         uint32_t arrayID = aev->getArrayID();
+        if (handleAttentionArrayDone(arrayID)) {
+            delete ev;
+            return;
+        }
         if (workerCommandProcessor != nullptr && workerCommandProcessor->handleArrayDone(arrayID, LastTickCycle)) {
             recordWcpArrayCompletion(arrayID);
             delete ev;
@@ -2037,10 +3430,28 @@ private:
         bool inflight = false;
         uint64_t base_addr = 0;
         uint64_t total_size = 0;
-        uint64_t ready_cycle = 0;
+        uint64_t offset = 0;
+        uint64_t request_tag = 0;
+        uint64_t command_id = 0;
         uint32_t array_id = 0;
         bool ready = false;
         bool failed = false;
+        bool local_request_inflight = false;
+        bool array_request_inflight = false;
+        bool completes_command = false;
+        std::vector<uint8_t> payload;
+    };
+
+    struct LegacyOutputStoreState {
+        bool active = false;
+        bool array_request_inflight = false;
+        bool local_request_inflight = false;
+        uint64_t command_id = 0;
+        uint64_t dest_addr = 0;
+        uint64_t offset = 0;
+        uint64_t request_tag = 0;
+        uint32_t array_id = 0;
+        std::vector<uint8_t> payload;
     };
 
     bool isAsyncArrayLoadCommand(const SST::Vanadis::RoCCCommand* cmd) const {
@@ -2073,9 +3484,8 @@ private:
             return;
         }
         auto& state = is_matrix ? async_matrix_loads[array_id] : async_vector_loads[array_id];
-        state.inflight = false;
+        state = AsyncArrayLoadState{};
         state.ready = true;
-        state.failed = false;
     }
 
     void markAsyncLoadFailed(uint32_t array_id, bool is_matrix) {
@@ -2083,56 +3493,158 @@ private:
             return;
         }
         auto& state = is_matrix ? async_matrix_loads[array_id] : async_vector_loads[array_id];
-        state.inflight = false;
-        state.ready = false;
+        const bool completes_command = state.completes_command;
+        const uint64_t command_id = state.command_id;
+        state = AsyncArrayLoadState{};
         state.failed = true;
         output->verbose(CALL_INFO, 0, 0,
             "[RoCC ERROR] async %s load failed on array=%" PRIu32 "\n",
             is_matrix ? "matrix" : "vector",
             array_id);
+        if (completes_command && curr_cmd != nullptr &&
+            curr_cmd->cmd_id == command_id) {
+            completeRoCC(1);
+        }
     }
 
-    void completeAsyncLocalArrayLoad(uint32_t array_id, bool is_matrix) {
-        if (array_id >= async_matrix_loads.size() || array_id >= async_vector_loads.size()) {
+    uint64_t allocateLocalTransferTag() {
+        const uint64_t tag = next_local_transfer_tag_++;
+        if (next_local_transfer_tag_ == 0) {
+            next_local_transfer_tag_ = 1;
+        }
+        return tag;
+    }
+
+    void initializeAsyncArrayLoad(AsyncArrayLoadState& state,
+                                  uint32_t array_id,
+                                  uint64_t base_addr,
+                                  uint64_t total_size,
+                                  bool completes_command,
+                                  uint64_t command_id) {
+        state = AsyncArrayLoadState{};
+        state.inflight = true;
+        state.array_id = array_id;
+        state.base_addr = base_addr;
+        state.total_size = total_size;
+        state.completes_command = completes_command;
+        state.command_id = command_id;
+        state.payload.resize(total_size);
+    }
+
+    void finishAsyncArrayLoad(uint32_t array_id, bool is_matrix) {
+        if (array_id >= async_matrix_loads.size() ||
+            array_id >= async_vector_loads.size()) {
             return;
         }
-
         auto& state = is_matrix ? async_matrix_loads[array_id] : async_vector_loads[array_id];
-        if (!state.inflight) {
+        const bool completes_command = state.completes_command;
+        const uint64_t command_id = state.command_id;
+        markArrayLoadReady(array_id, is_matrix);
+        if (completes_command && curr_cmd != nullptr &&
+            curr_cmd->cmd_id == command_id) {
+            completeRoCC(0);
+        }
+    }
+
+    void progressAsyncArrayLoad(uint32_t array_id, bool is_matrix) {
+        if (array_id >= async_matrix_loads.size() ||
+            array_id >= async_vector_loads.size()) {
             return;
         }
-
-        std::vector<uint8_t> payload;
-        payload.reserve(state.total_size);
-        globalMem->rd_from_globalmem(state.base_addr, state.total_size, payload);
-        if (payload.size() < state.total_size) {
+        auto& state = is_matrix ? async_matrix_loads[array_id] : async_vector_loads[array_id];
+        if (!state.inflight || state.local_request_inflight ||
+            state.array_request_inflight) {
+            return;
+        }
+        if (inputOperandSize == 0 || state.offset > state.total_size) {
             markAsyncLoadFailed(array_id, is_matrix);
             return;
         }
+
+        if (state.offset < state.total_size) {
+            const size_t max_request =
+                std::max<size_t>(globalMem->localMaxRequestBytes(), 1);
+            const size_t chunk_size = std::min<size_t>(
+                max_request, state.total_size - state.offset);
+            const uint64_t chunk_offset = state.offset;
+            const uint64_t tag = allocateLocalTransferTag();
+            const bool accepted = globalMem->localReadAsync(
+                state.base_addr + chunk_offset, chunk_size,
+                LocalMemoryClient::RoCC, tag,
+                [this, array_id, is_matrix, chunk_offset, chunk_size](
+                    bool success, uint64_t callback_tag,
+                    const std::vector<uint8_t>& data) {
+                    auto& callback_state = is_matrix
+                        ? async_matrix_loads[array_id]
+                        : async_vector_loads[array_id];
+                    if (!callback_state.inflight ||
+                        callback_state.request_tag != callback_tag) {
+                        return;
+                    }
+                    callback_state.local_request_inflight = false;
+                    if (!success || data.size() != chunk_size ||
+                        callback_state.offset != chunk_offset) {
+                        markAsyncLoadFailed(array_id, is_matrix);
+                        return;
+                    }
+                    std::copy(data.begin(), data.end(),
+                              callback_state.payload.begin() + chunk_offset);
+                    callback_state.offset += chunk_size;
+                    progressAsyncArrayLoad(array_id, is_matrix);
+                });
+            if (accepted) {
+                state.local_request_inflight = true;
+                state.request_tag = tag;
+            }
+            return;
+        }
+
+        std::vector<double> values(state.total_size / inputOperandSize, 0.0);
         for (size_t i = 0; i < state.total_size; i += inputOperandSize) {
             T value = 0;
-            memcpy(&value, &payload[i], inputOperandSize);
-            int index = static_cast<int>(i / inputOperandSize);
-            if (is_matrix) {
-                array->setMatrixItem(array_id, index, value);
-            } else {
-                array->setVectorItem(array_id, index, value);
-            }
+            memcpy(&value, &state.payload[i],
+                   std::min<size_t>(sizeof(T), inputOperandSize));
+            values[i / inputOperandSize] = static_cast<double>(value);
         }
-        markArrayLoadReady(array_id, is_matrix);
+        const uint64_t tag = allocateLocalTransferTag();
+        auto callback = [this, array_id, is_matrix](bool success,
+                                                    uint64_t callback_tag) {
+            auto& callback_state = is_matrix
+                ? async_matrix_loads[array_id]
+                : async_vector_loads[array_id];
+            if (!callback_state.inflight ||
+                callback_state.request_tag != callback_tag) {
+                return;
+            }
+            callback_state.array_request_inflight = false;
+            if (!success) {
+                markAsyncLoadFailed(array_id, is_matrix);
+                return;
+            }
+            finishAsyncArrayLoad(array_id, is_matrix);
+        };
+        const bool accepted = is_matrix
+            ? array->programMatrixAsync(
+                  array_id, values, inputOperandSize, tag, callback)
+            : array->programInputAsync(
+                  array_id, values, inputOperandSize, tag, callback);
+        if (accepted) {
+            state.array_request_inflight = true;
+            state.request_tag = tag;
+        }
     }
 
-    bool tryCompleteAsyncArrayLoads(uint64_t cycle) {
+    bool tryCompleteAsyncArrayLoads(uint64_t) {
         bool progressed = false;
         for (uint32_t array_id = 0; array_id < async_matrix_loads.size(); ++array_id) {
             auto& mstate = async_matrix_loads[array_id];
-            if (mstate.inflight && cycle >= mstate.ready_cycle) {
-                completeAsyncLocalArrayLoad(array_id, true);
+            if (mstate.inflight) {
+                progressAsyncArrayLoad(array_id, true);
                 progressed = true;
             }
             auto& vstate = async_vector_loads[array_id];
-            if (vstate.inflight && cycle >= vstate.ready_cycle) {
-                completeAsyncLocalArrayLoad(array_id, false);
+            if (vstate.inflight) {
+                progressAsyncArrayLoad(array_id, false);
                 progressed = true;
             }
         }
@@ -2165,17 +3677,13 @@ private:
             return false;
         }
 
-        state.inflight = true;
-        state.ready = false;
-        state.failed = false;
-        state.array_id = array_id;
-        state.base_addr = cmd->rs1;
-        state.total_size = is_matrix
+        const uint64_t total_size = is_matrix
             ? static_cast<uint64_t>(arrayInputSize) * static_cast<uint64_t>(arrayOutputSize) * static_cast<uint64_t>(inputOperandSize)
             : static_cast<uint64_t>(arrayInputSize) * static_cast<uint64_t>(inputOperandSize);
-        state.ready_cycle = cycle + (is_matrix ? latency_mvm_gm2imat : latency_mvm_gm2ivec);
+        initializeAsyncArrayLoad(
+            state, array_id, cmd->rs1, total_size, false, 0);
 
-        if (state.total_size == 0) {
+        if (total_size == 0) {
             markArrayLoadReady(array_id, is_matrix);
             enqueueResponse(new SST::Vanadis::RoCCResponse(cmd->inst->rd, 0, cmd->cmd_id, cmd->hw_thread));
             roccCmd_q.pop_front();
@@ -2183,13 +3691,116 @@ private:
             return true;
         }
 
-        // Async load from local GlobalMemory is accepted immediately and will
-        // complete after the configured local-load latency.
+        progressAsyncArrayLoad(array_id, is_matrix);
         enqueueResponse(new SST::Vanadis::RoCCResponse(cmd->inst->rd, 0, cmd->cmd_id, cmd->hw_thread));
 
         roccCmd_q.pop_front();
         delete cmd;
         return true;
+    }
+
+    void beginBlockingArrayLoad(bool is_matrix) {
+        if (curr_cmd == nullptr ||
+            curr_cmd->rs2 >= static_cast<uint64_t>(numArrays)) {
+            completeRoCC(1);
+            return;
+        }
+        const uint32_t array_id = static_cast<uint32_t>(curr_cmd->rs2);
+        auto& state = is_matrix
+            ? async_matrix_loads[array_id]
+            : async_vector_loads[array_id];
+        if (state.inflight) {
+            progressAsyncArrayLoad(array_id, is_matrix);
+            return;
+        }
+        const uint64_t total_size = is_matrix
+            ? static_cast<uint64_t>(arrayInputSize) *
+                  static_cast<uint64_t>(arrayOutputSize) *
+                  static_cast<uint64_t>(inputOperandSize)
+            : static_cast<uint64_t>(arrayInputSize) *
+                  static_cast<uint64_t>(inputOperandSize);
+        initializeAsyncArrayLoad(
+            state, array_id, curr_cmd->rs1, total_size, true, curr_cmd->cmd_id);
+        progressAsyncArrayLoad(array_id, is_matrix);
+    }
+
+    void finishLegacyOutputStore(bool success) {
+        const uint64_t command_id = legacy_output_store_.command_id;
+        legacy_output_store_ = LegacyOutputStoreState{};
+        if (curr_cmd != nullptr && curr_cmd->cmd_id == command_id) {
+            completeRoCC(success ? 0 : 1);
+        }
+    }
+
+    void progressLegacyOutputStore() {
+        auto& state = legacy_output_store_;
+        if (!state.active || state.array_request_inflight ||
+            state.local_request_inflight) {
+            return;
+        }
+        if (state.payload.empty()) {
+            const uint64_t tag = allocateLocalTransferTag();
+            const bool accepted = array->readOutputBytesAsync(
+                state.array_id, outputOperandSize, tag,
+                [this](bool success, uint64_t callback_tag,
+                       const std::vector<uint8_t>& bytes) {
+                    auto& callback_state = legacy_output_store_;
+                    if (!callback_state.active ||
+                        callback_state.request_tag != callback_tag) {
+                        return;
+                    }
+                    callback_state.array_request_inflight = false;
+                    if (!success ||
+                        bytes.size() != static_cast<size_t>(arrayOutputSize) *
+                            outputOperandSize ||
+                        outputOperandSize == 0) {
+                        finishLegacyOutputStore(false);
+                        return;
+                    }
+                    callback_state.payload = bytes;
+                    progressLegacyOutputStore();
+                });
+            if (accepted) {
+                state.array_request_inflight = true;
+                state.request_tag = tag;
+            }
+            return;
+        }
+
+        if (state.offset >= state.payload.size()) {
+            finishLegacyOutputStore(true);
+            return;
+        }
+        const size_t max_request =
+            std::max<size_t>(globalMem->localMaxRequestBytes(), 1);
+        const size_t chunk_size = std::min<size_t>(
+            max_request, state.payload.size() - state.offset);
+        const uint64_t chunk_offset = state.offset;
+        std::vector<uint8_t> chunk(
+            state.payload.begin() + chunk_offset,
+            state.payload.begin() + chunk_offset + chunk_size);
+        const uint64_t tag = allocateLocalTransferTag();
+        const bool accepted = globalMem->localWriteAsync(
+            state.dest_addr + chunk_offset, chunk, LocalMemoryClient::RoCC, tag,
+            [this, chunk_offset, chunk_size](bool success,
+                                             uint64_t callback_tag) {
+                auto& callback_state = legacy_output_store_;
+                if (!callback_state.active ||
+                    callback_state.request_tag != callback_tag) {
+                    return;
+                }
+                callback_state.local_request_inflight = false;
+                if (!success || callback_state.offset != chunk_offset) {
+                    finishLegacyOutputStore(false);
+                    return;
+                }
+                callback_state.offset += chunk_size;
+                progressLegacyOutputStore();
+            });
+        if (accepted) {
+            state.local_request_inflight = true;
+            state.request_tag = tag;
+        }
     }
 
     void enqueueResponse(SST::Vanadis::RoCCResponse *resp) {
@@ -2216,10 +3827,16 @@ private:
     SST::Golem::RequestSchedulerAPI *requestScheduler;
     SST::Golem::WorkerCommandProcessorAPI *workerCommandProcessor;
     SST::Golem::SFUAPI *sfu;
+    std::unordered_map<uint64_t, ManagerTensorJobState> managerTensorJobs_;
+    std::unordered_map<uint64_t, ManagerAttentionJobState> managerAttentionJobs_;
+    std::unique_ptr<AttentionWorkerState> attentionWorker_;
+    std::vector<uint8_t> attentionArrayPending_;
     bool sfuWaitBlocked_ = false;
     uint64_t sfuWaitBlockedCmdId_ = 0;
     uint64_t sfuWaitBlockedUntilTick_ = 0;
     uint64_t coreID;
+    uint64_t attentionWindowOffset_;
+    uint64_t attentionWindowBytes_;
 
   
     // Tile Parameters
@@ -2299,6 +3916,30 @@ private:
     Statistics::Statistic<uint64_t>* stat_cycles_mvm_gm2imat;
     Statistics::Statistic<uint64_t>* stat_cycles_remote_st;
     Statistics::Statistic<uint64_t>* stat_cycles_remote_ld;
+    Statistics::Statistic<uint64_t>* statTensorManagerJobsIssued_;
+    Statistics::Statistic<uint64_t>* statTensorManagerWorkersMapped_;
+    Statistics::Statistic<uint64_t>* statTensorManagerRowsDispatched_;
+    Statistics::Statistic<uint64_t>* statTensorManagerRowsCompleted_;
+    Statistics::Statistic<uint64_t>* statTensorManagerJobsCompleted_;
+    Statistics::Statistic<uint64_t>* statTensorManagerDescriptorAcceptTick_;
+    Statistics::Statistic<uint64_t>* statTensorManagerBandDispatchTick_;
+    Statistics::Statistic<uint64_t>* statTensorManagerCompletionReceivedTick_;
+    Statistics::Statistic<uint64_t>* statTensorManagerCompleteTick_;
+    Statistics::Statistic<uint64_t>* statTensorManagerWaitObservedTick_;
+    Statistics::Statistic<uint64_t>* statAttentionManagerJobsIssued_;
+    Statistics::Statistic<uint64_t>* statAttentionManagerJobsCompleted_;
+    Statistics::Statistic<uint64_t>* statAttentionManagerBandsCompleted_;
+    Statistics::Statistic<uint64_t>* statAttentionManagerBandCompletionsReceived_;
+    Statistics::Statistic<uint64_t>* statAttentionTensorJobsCompleted_;
+    Statistics::Statistic<uint64_t>* statAttentionManagerDescriptorAcceptTick_;
+    Statistics::Statistic<uint64_t>* statAttentionManagerDispatchTick_;
+    Statistics::Statistic<uint64_t>* statAttentionManagerLocalCompleteTick_;
+    Statistics::Statistic<uint64_t>* statAttentionManagerBandCompletionReceivedTick_;
+    Statistics::Statistic<uint64_t>* statAttentionTensorCompleteTick_;
+    Statistics::Statistic<uint64_t>* statAttentionManagerWaitObservedTick_;
+    Statistics::Statistic<uint64_t>* statAttentionQkArrayOps_;
+    Statistics::Statistic<uint64_t>* statAttentionPvArrayOps_;
+    Statistics::Statistic<uint64_t>* statAttentionSpHbmBytes_;
 
     uint64_t StartTickCycle;
     uint64_t LastTickCycle;
@@ -2311,6 +3952,8 @@ private:
     std::vector<InflightComputeState> inflight_compute_cmds;
     std::vector<AsyncArrayLoadState> async_matrix_loads;
     std::vector<AsyncArrayLoadState> async_vector_loads;
+    LegacyOutputStoreState legacy_output_store_;
+    uint64_t next_local_transfer_tag_ = 1;
     bool progress_heartbeat = false;
     uint64_t progress_interval_cycles = 50000;
     uint64_t progress_total_mvm_ops = 0;

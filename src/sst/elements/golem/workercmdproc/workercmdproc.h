@@ -152,7 +152,7 @@ public:
             return false;
         }
         if (header.hw_input_size == 0 || header.hw_output_size == 0 ||
-            header.block_k == 0 || header.block_m == 0 ||
+            header.block_k == 0 || header.block_m == 0 || header.block_n == 0 ||
             (header.block_k % header.hw_input_size) != 0 ||
             header.block_m != header.hw_output_size) {
             if (extOutput_ != nullptr) {
@@ -164,6 +164,30 @@ public:
         }
         const uint32_t reuseN = std::max<uint32_t>(header.a_reuse_n_tiles, 1u);
         const uint32_t reuseM = std::max<uint32_t>(header.b_reuse_m_tiles, 1u);
+        const uint64_t partialBytes = static_cast<uint64_t>(header.block_m) *
+                                      header.block_n * header.elem_bytes;
+        const uint64_t partialRows = std::min<uint64_t>(
+            reuseM, header.m / std::max<uint32_t>(header.block_m, 1u));
+        const uint64_t partialCols = std::min<uint64_t>(
+            reuseN, header.n / std::max<uint32_t>(header.block_n, 1u));
+        const uint64_t partialCount = partialRows * partialCols;
+        if (globalMem_ == nullptr || header.local_accum_gm_addr < globalMem_->getBaseAddr() ||
+            partialBytes == 0 || partialCount == 0 ||
+            partialCount > UINT64_MAX / partialBytes) {
+            return false;
+        }
+        const uint64_t partialOffset =
+            header.local_accum_gm_addr - globalMem_->getBaseAddr();
+        const uint64_t partialTotal = partialCount * partialBytes;
+        if (partialOffset > globalMem_->getSize() ||
+            partialTotal > globalMem_->getSize() - partialOffset) {
+            if (extOutput_ != nullptr) {
+                extOutput_->output(
+                    "[Core %u] [wcp] ERROR: partial-C Local GM window exceeds capacity bytes=%" PRIu64 " count=%" PRIu64 "\n",
+                    coreId_, partialBytes, partialCount);
+            }
+            return false;
+        }
         const uint32_t kTiles = header.block_k > 0 ? header.k / header.block_k : 0;
         if (reuseN > 1 && reuseM > 1 && reuseN != reuseM) {
             if (extOutput_ != nullptr) {
@@ -226,7 +250,6 @@ public:
         windowSubmitPrefetchCount_ = 0;
         windowActivateCount_ = 0;
         windowAdvanceWaitPrefetchCount_ = 0;
-        pendingWritebackTokens_.clear();
         lastStage3TraceCycle_ = 0;
         tileComputeStartCycles_.clear();
         tileComputeDoneCycles_.clear();
@@ -254,6 +277,11 @@ public:
         switch (phase_) {
         case Phase::RUN:
             tryIssuePrefetches();
+            progressArrayProgramming();
+            if (arrayProgramFailed_) {
+                phase_ = Phase::DONE;
+                break;
+            }
             if (!computeInFlight_) {
                 int tile = activeComputeTileIndex_;
                 if (tile < 0) {
@@ -277,19 +305,55 @@ public:
                     }
                     updateActiveTileInputReadiness();
                     if (!activeTilePayloadLoaded_ && !activeComputeReadyQueue_.empty()) {
-                        if (!loadTilePayload(static_cast<uint32_t>(tile))) {
+                        if (!operandLoadPending_ &&
+                            !beginTilePayloadLoad(static_cast<uint32_t>(tile))) {
                             phase_ = Phase::DONE;
                             break;
                         }
-                        activeTilePayloadLoaded_ = true;
+                        progressTilePayloadLoad();
+                        if (operandLoadFailed_) {
+                            phase_ = Phase::DONE;
+                            break;
+                        }
                     }
                     if (activeTilePayloadLoaded_ && !activeComputeReadyQueue_.empty()) {
+                        if (use2DWindowEngine() && !taskAccumInitialized_ &&
+                            activeWindowKBegin_ > 0) {
+                            if (!partialTransferPending_ && !partialLoadReady_ &&
+                                !beginPartialCLoad()) {
+                                phase_ = Phase::DONE;
+                                break;
+                            }
+                            progressPartialTransfer();
+                            if (partialTransferFailed_) {
+                                phase_ = Phase::DONE;
+                                break;
+                            }
+                            if (!partialLoadReady_) {
+                                break;
+                            }
+                            if (!arrayOutputWritePending_ && !arrayOutputWriteReady_ &&
+                                !beginPartialCApply()) {
+                                phase_ = Phase::DONE;
+                                break;
+                            }
+                            progressArrayOutputWrite();
+                            if (arrayOutputWriteFailed_) {
+                                phase_ = Phase::DONE;
+                                break;
+                            }
+                            if (!arrayOutputWriteReady_) {
+                                break;
+                            }
+                            arrayOutputWriteReady_ = false;
+                            partialLoadReady_ = false;
+                            partialTransferPayload_.clear();
+                            taskAccumInitialized_ = true;
+                        }
                         if (!issueActiveMicroTile()) {
                             phase_ = Phase::DONE;
                             break;
                         }
-                        pendingArrays_ = current_.block_n;
-                        computeInFlight_ = true;
                         if (static_cast<size_t>(tile) < tileComputeStartCycles_.size()) {
                             if (tileComputeStartCycles_[static_cast<size_t>(tile)] == 0) {
                                 tileComputeStartCycles_[static_cast<size_t>(tile)] = cycle;
@@ -322,40 +386,56 @@ public:
             {
                 if (use2DWindowEngine() && !isFinal2DWindow()) {
                     traceStage3("SAVE_PARTIAL", cycle);
-                    if (!savePartialCFromArray()) {
+                    if (!beginPartialCStore()) {
                         return false;
                     }
-                    markCurrentReuseDone();
-                    advanceAfterWriteback(cycle);
+                    phase_ = Phase::PARTIAL_STORE_WAIT;
                     break;
                 }
                 traceStage3("ISSUE_WRITEBACK", cycle);
-                std::vector<uint8_t> tile;
-                if (!captureArrayOutput(tile)) {
+                if (!beginFinalWriteback()) {
                     return false;
                 }
-                writebackDone_ = false;
-                writebackToken_ = issueDmaWrite(
-                    current_.c_base_addr,
-                    tile.size(),
-                    tile);
-                // Final C writeback is intentionally fire-and-forget. The SST
-                // network/memory events still drain before simulation exit;
-                // blocking the worker here serializes completion on write acks.
+                phase_ = Phase::WRITEBACK_WAIT;
             }
-            writebackDone_ = true;
-            writebackToken_ = 0;
+            break;
+        case Phase::PARTIAL_STORE_WAIT:
+            progressArrayOutputRead();
+            progressPartialTransfer();
+            if (arrayOutputReadFailed_ || partialTransferFailed_) {
+                phase_ = Phase::DONE;
+                break;
+            }
+            if (arrayOutputReadPending_ || partialTransferPending_) {
+                break;
+            }
+            if (partialTransferIndex_ >= partialValid_.size()) {
+                phase_ = Phase::DONE;
+                break;
+            }
+            partialValid_[partialTransferIndex_] = 1;
+            markCurrentReuseDone();
+            advanceAfterWriteback(cycle);
+            break;
+        case Phase::WRITEBACK_WAIT:
+            progressArrayOutputRead();
+            progressPartialTransfer();
+            if (arrayOutputReadFailed_ || partialTransferFailed_ ||
+                finalDmaFailed_) {
+                phase_ = Phase::DONE;
+                break;
+            }
+            if (arrayOutputReadPending_ || partialTransferPending_ ||
+                finalDmaPending_ || !finalDmaDone_) {
+                traceStage3Periodic("WRITEBACK_WAIT", cycle);
+                break;
+            }
+            finalDmaDone_ = false;
+            partialTransferPayload_.clear();
             if (use2DWindowEngine()) {
                 markCurrentReuseDone();
             }
             advanceAfterWriteback(cycle);
-            break;
-        case Phase::WRITEBACK_WAIT:
-            if (!drainPendingWritebacks()) {
-                traceStage3Periodic("WRITEBACK_WAIT", cycle);
-                break;
-            }
-            phase_ = Phase::DONE;
             break;
         case Phase::DONE:
             workerEndCycle_ = cycle;
@@ -456,6 +536,49 @@ private:
         uint32_t buffer = 0;
     };
 
+    enum class PartialTransferKind : uint8_t { None, Store, Load, FinalStore };
+    enum class OutputReadPurpose : uint8_t { None, PartialStore, FinalWriteback };
+
+    void resetLocalTransferState() {
+        ++operandLoadEpoch_;
+        operandLoadPending_ = false;
+        operandLoadFailed_ = false;
+        operandMatReadInFlight_ = false;
+        operandVecReadInFlight_ = false;
+        operandMatOffset_ = 0;
+        operandVecOffset_ = 0;
+        ++arrayProgramEpoch_;
+        arrayProgramPending_ = false;
+        arrayProgramInFlight_ = false;
+        arrayProgramFailed_ = false;
+        arrayProgramCursor_ = 0;
+        ++arrayOutputReadEpoch_;
+        arrayOutputReadPurpose_ = OutputReadPurpose::None;
+        arrayOutputReadPending_ = false;
+        arrayOutputReadInFlight_ = false;
+        arrayOutputReadFailed_ = false;
+        arrayOutputReadCursor_ = 0;
+        ++arrayOutputWriteEpoch_;
+        arrayOutputWritePending_ = false;
+        arrayOutputWriteInFlight_ = false;
+        arrayOutputWriteFailed_ = false;
+        arrayOutputWriteReady_ = false;
+        arrayOutputWriteCursor_ = 0;
+        ++partialTransferEpoch_;
+        partialTransferKind_ = PartialTransferKind::None;
+        partialTransferPending_ = false;
+        partialTransferInFlight_ = false;
+        partialTransferFailed_ = false;
+        partialLoadReady_ = false;
+        partialTransferOffset_ = 0;
+        partialTransferIndex_ = 0;
+        partialTransferPayload_.clear();
+        ++finalDmaEpoch_;
+        finalDmaPending_ = false;
+        finalDmaDone_ = false;
+        finalDmaFailed_ = false;
+    }
+
     void resetPipelineState() {
         const uint32_t slotCount = std::max<uint32_t>(header_.local_slot_count, 1u);
         buffers_.assign(slotCount, BufferSlot{});
@@ -484,6 +607,7 @@ private:
         taskAccumInitialized_ = false;
         activeMatPayload_.clear();
         activeVecPayload_.clear();
+        resetLocalTransferState();
         activeTileMicroOps_.clear();
         activeTileMicroOpCursor_ = 0;
         activeTileScoreboard_ = KStepScoreboard{};
@@ -503,11 +627,8 @@ private:
             prefetch2DWindows_.clear();
             current_.k_begin = activeWindowKBegin_;
             current_.k_count = activeWindowKCount_;
-            const size_t partialCount = static_cast<size_t>(std::max<uint32_t>(header_.b_reuse_m_tiles, 1u)) *
-                                        static_cast<size_t>(std::max<uint32_t>(header_.a_reuse_n_tiles, 1u));
-            const size_t partialBytes = static_cast<size_t>(header_.block_m) * static_cast<size_t>(header_.block_n) *
-                                        static_cast<size_t>(header_.elem_bytes);
-            partialCTiles_.assign(partialCount, std::vector<uint8_t>(partialBytes, 0));
+            const size_t partialCount = static_cast<size_t>(currentReuseMCount_) *
+                                        static_cast<size_t>(currentReuseNCount_);
             partialValid_.assign(partialCount, 0);
             windowReuseDone_.assign(partialCount, 0);
         } else {
@@ -520,7 +641,6 @@ private:
             next2DPrefetchK_ = 0;
             active2DTxnIds_.clear();
             prefetch2DWindows_.clear();
-            partialCTiles_.clear();
             partialValid_.clear();
             windowReuseDone_.clear();
         }
@@ -839,75 +959,8 @@ private:
         lastAccountCycle_ = cycle + 1;
     }
 
-    uint64_t issueDmaRead(uint64_t src_pa, size_t length, uint64_t gm_dst_addr) {
-        if (auto* gm = dynamic_cast<GlobalMemoryImplement*>(globalMem_)) {
-            return gm->dma_read_from_host_to_globalmem_async(src_pa, length, gm_dst_addr);
-        }
-        if (auto* gm = dynamic_cast<GlobalMemoryLocal*>(globalMem_)) {
-            return gm->dma_read_from_host_to_globalmem_async(src_pa, length, gm_dst_addr);
-        }
-        return 0;
-    }
-
-    uint64_t issueDmaWrite(uint64_t dst_pa, size_t length, const std::vector<uint8_t>& data) {
-        if (auto* gm = dynamic_cast<GlobalMemoryImplement*>(globalMem_)) {
-            return gm->dma_write_to_host_async(dst_pa, length, data);
-        }
-        if (auto* gm = dynamic_cast<GlobalMemoryLocal*>(globalMem_)) {
-            return gm->dma_write_to_host_async(dst_pa, length, data);
-        }
-        return 0;
-    }
-
-    bool dmaDone(uint64_t token) const {
-        if (token == 0) {
-            return true;
-        }
-        if (auto* gm = dynamic_cast<GlobalMemoryImplement*>(globalMem_)) {
-            return gm->dma_completion_done(token);
-        }
-        if (auto* gm = dynamic_cast<GlobalMemoryLocal*>(globalMem_)) {
-            return gm->dma_completion_done(token);
-        }
-        return false;
-    }
-
-    void retireDma(uint64_t token) {
-        if (token == 0) {
-            return;
-        }
-        if (auto* gm = dynamic_cast<GlobalMemoryImplement*>(globalMem_)) {
-            gm->dma_completion_retire(token);
-            return;
-        }
-        if (auto* gm = dynamic_cast<GlobalMemoryLocal*>(globalMem_)) {
-            gm->dma_completion_retire(token);
-        }
-    }
-
-    bool drainPendingWritebacks() {
-        bool allDone = true;
-        std::deque<uint64_t> remaining;
-        while (!pendingWritebackTokens_.empty()) {
-            const uint64_t token = pendingWritebackTokens_.front();
-            pendingWritebackTokens_.pop_front();
-            if (dmaDone(token)) {
-                retireDma(token);
-            } else {
-                remaining.push_back(token);
-                allDone = false;
-            }
-        }
-        pendingWritebackTokens_.swap(remaining);
-        return allDone;
-    }
-
     void finishOrDrainWritebacks() {
-        if (drainPendingWritebacks()) {
-            phase_ = Phase::DONE;
-        } else {
-            phase_ = Phase::WRITEBACK_WAIT;
-        }
+        phase_ = Phase::DONE;
     }
 
     void advanceAfterWriteback(uint64_t cycle) {
@@ -1440,42 +1493,161 @@ private:
         return -1;
     }
 
-    bool loadTilePayload(uint32_t local_tile_idx) {
+    bool beginTilePayloadLoad(uint32_t local_tile_idx) {
+        if (globalMem_ == nullptr || operandLoadPending_) {
+            return false;
+        }
         const uint64_t vec_bytes = current_.vec_stride_bytes;
         const uint32_t slotCount = std::max<uint32_t>(header_.local_slot_count, 1u);
         const uint32_t matSlotIdx = is2DReuse() ? groupMatSlotFor(local_tile_idx) : (local_tile_idx % slotCount);
         const uint32_t vecSlotIdx = is2DReuse() ? groupVecSlotFor(local_tile_idx) : (local_tile_idx % slotCount);
-        const uint64_t mat_addr = header_.local_mat_ping_gm_addr + static_cast<uint64_t>(matSlotIdx) * header_.local_mat_slot_stride_bytes;
-        const uint64_t vec_addr = header_.local_vec_ping_gm_addr + static_cast<uint64_t>(vecSlotIdx) * header_.local_vec_slot_stride_bytes;
-        globalMem_->rd_from_globalmem(mat_addr, static_cast<size_t>(current_.mat_stride_bytes), activeMatPayload_);
-        globalMem_->rd_from_globalmem(vec_addr, static_cast<size_t>(vec_bytes), activeVecPayload_);
-        if (activeMatPayload_.size() < current_.mat_stride_bytes || activeVecPayload_.size() < vec_bytes) {
-            return false;
-        }
+        operandMatAddress_ = header_.local_mat_ping_gm_addr +
+                             static_cast<uint64_t>(matSlotIdx) * header_.local_mat_slot_stride_bytes;
+        operandVecAddress_ = header_.local_vec_ping_gm_addr +
+                             static_cast<uint64_t>(vecSlotIdx) * header_.local_vec_slot_stride_bytes;
+        activeMatPayload_.assign(static_cast<size_t>(current_.mat_stride_bytes), 0);
+        activeVecPayload_.assign(static_cast<size_t>(vec_bytes), 0);
+        operandMatOffset_ = 0;
+        operandVecOffset_ = 0;
+        operandMatReadInFlight_ = false;
+        operandVecReadInFlight_ = false;
+        operandLoadFailed_ = false;
+        operandLoadPending_ = true;
+        activeTilePayloadLoaded_ = false;
+        ++operandLoadEpoch_;
+        progressTilePayloadLoad();
         return true;
     }
 
-    bool loadActiveMicroTileToArrays() {
-        const uint32_t kBase = activeMicroKStep_ * current_.array_input_size;
-        for (uint32_t array_id = 0; array_id < current_.block_n; ++array_id) {
-            for (uint32_t idx = 0; idx < current_.array_input_size * current_.array_output_size; ++idx) {
-                const uint32_t row = idx / current_.array_input_size;
-                const uint32_t col = idx % current_.array_input_size;
-                const size_t matIdx =
-                    (static_cast<size_t>(row) * header_.block_k + static_cast<size_t>(kBase + col)) *
-                    current_.elem_bytes;
-                double value = decodeElement(&activeMatPayload_[matIdx]);
-                array_->setMatrixItem(static_cast<int32_t>(array_id), static_cast<int32_t>(idx), value);
-            }
-            for (uint32_t idx = 0; idx < current_.array_input_size; ++idx) {
-                const size_t off =
-                    (static_cast<size_t>(array_id) * header_.block_k + static_cast<size_t>(kBase + idx)) *
-                    current_.elem_bytes;
-                double value = decodeElement(&activeVecPayload_[off]);
-                array_->setVectorItem(static_cast<int32_t>(array_id), static_cast<int32_t>(idx), value);
-            }
+    void progressTilePayloadLoad() {
+        if (!operandLoadPending_ || operandLoadFailed_ || globalMem_ == nullptr) {
+            return;
         }
+        issueOperandRead(true);
+        issueOperandRead(false);
+        if (operandMatOffset_ >= activeMatPayload_.size() &&
+            operandVecOffset_ >= activeVecPayload_.size() &&
+            !operandMatReadInFlight_ && !operandVecReadInFlight_) {
+            operandLoadPending_ = false;
+            activeTilePayloadLoaded_ = true;
+        }
+    }
+
+    void issueOperandRead(bool matrix) {
+        auto& payload = matrix ? activeMatPayload_ : activeVecPayload_;
+        auto& offset = matrix ? operandMatOffset_ : operandVecOffset_;
+        auto& inFlight = matrix ? operandMatReadInFlight_ : operandVecReadInFlight_;
+        const uint64_t address = matrix ? operandMatAddress_ : operandVecAddress_;
+        if (inFlight || offset >= payload.size()) {
+            return;
+        }
+        const size_t chunkBytes = std::min(
+            globalMem_->localMaxRequestBytes(), payload.size() - offset);
+        if (chunkBytes == 0) {
+            operandLoadFailed_ = true;
+            return;
+        }
+        const size_t chunkOffset = offset;
+        const uint64_t epoch = operandLoadEpoch_;
+        const uint64_t tag = nextLocalTransferTag_++;
+        inFlight = true;
+        const bool accepted = globalMem_->localReadAsync(
+            address + chunkOffset, chunkBytes, LocalMemoryClient::WCP, tag,
+            [this, matrix, chunkOffset, epoch](
+                bool ok, uint64_t, const std::vector<uint8_t>& data) {
+                if (epoch != operandLoadEpoch_ || !operandLoadPending_) {
+                    return;
+                }
+                auto& target = matrix ? activeMatPayload_ : activeVecPayload_;
+                auto& targetOffset = matrix ? operandMatOffset_ : operandVecOffset_;
+                auto& targetInFlight =
+                    matrix ? operandMatReadInFlight_ : operandVecReadInFlight_;
+                targetInFlight = false;
+                if (!ok || chunkOffset != targetOffset ||
+                    data.size() > target.size() - targetOffset) {
+                    operandLoadFailed_ = true;
+                    operandLoadPending_ = false;
+                    return;
+                }
+                std::copy(data.begin(), data.end(), target.begin() + targetOffset);
+                targetOffset += data.size();
+                progressTilePayloadLoad();
+            });
+        if (!accepted) {
+            inFlight = false;
+        }
+    }
+
+    bool beginArrayProgramming(uint64_t outputMode) {
+        if (array_ == nullptr || arrayProgramPending_) {
+            return false;
+        }
+        arrayProgramCursor_ = 0;
+        arrayProgramOutputMode_ = outputMode;
+        arrayProgramInFlight_ = false;
+        arrayProgramFailed_ = false;
+        arrayProgramPending_ = true;
+        ++arrayProgramEpoch_;
+        progressArrayProgramming();
         return true;
+    }
+
+    void progressArrayProgramming() {
+        if (!arrayProgramPending_ || arrayProgramInFlight_ ||
+            arrayProgramFailed_ || array_ == nullptr) {
+            return;
+        }
+        if (arrayProgramCursor_ >= current_.block_n) {
+            arrayProgramPending_ = false;
+            return;
+        }
+
+        const uint32_t arrayId = arrayProgramCursor_;
+        const uint32_t kBase = activeMicroKStep_ * current_.array_input_size;
+        std::vector<double> matrix(
+            static_cast<size_t>(current_.array_input_size) *
+                current_.array_output_size,
+            0.0);
+        std::vector<double> input(current_.array_input_size, 0.0);
+        for (uint32_t idx = 0;
+             idx < current_.array_input_size * current_.array_output_size; ++idx) {
+            const uint32_t row = idx / current_.array_input_size;
+            const uint32_t col = idx % current_.array_input_size;
+            const size_t matIdx =
+                (static_cast<size_t>(row) * header_.block_k +
+                 static_cast<size_t>(kBase + col)) * current_.elem_bytes;
+            matrix[idx] = decodeElement(&activeMatPayload_[matIdx]);
+        }
+        for (uint32_t idx = 0; idx < current_.array_input_size; ++idx) {
+            const size_t offset =
+                (static_cast<size_t>(arrayId) * header_.block_k +
+                 static_cast<size_t>(kBase + idx)) * current_.elem_bytes;
+            input[idx] = decodeElement(&activeVecPayload_[offset]);
+        }
+
+        const uint64_t epoch = arrayProgramEpoch_;
+        const uint64_t tag = nextArrayTransferTag_++;
+        arrayProgramInFlight_ = true;
+        const bool accepted = array_->programOperandsAsync(
+            arrayId, matrix, input, current_.elem_bytes, tag,
+            [this, arrayId, epoch](bool ok, uint64_t) {
+                if (epoch != arrayProgramEpoch_ || !arrayProgramPending_) {
+                    return;
+                }
+                arrayProgramInFlight_ = false;
+                if (!ok || arrayId != arrayProgramCursor_) {
+                    arrayProgramFailed_ = true;
+                    arrayProgramPending_ = false;
+                    return;
+                }
+                array_->configureOutputMode(arrayId, arrayProgramOutputMode_);
+                array_->beginComputation(arrayId);
+                arrayProgramCursor_ += 1;
+                progressArrayProgramming();
+            });
+        if (!accepted) {
+            arrayProgramInFlight_ = false;
+        }
     }
 
     bool issueActiveMicroTile() {
@@ -1505,85 +1677,294 @@ private:
         activeIssuedMicroOp_ = op;
         activeMicroOpIssued_ = true;
         activeMicroKStep_ = op.kStep;
-        if (use2DWindowEngine() && !taskAccumInitialized_ && activeWindowKBegin_ > 0) {
-            if (!loadPartialCToArray()) {
-                return false;
-            }
-            taskAccumInitialized_ = true;
-        }
-        if (!loadActiveMicroTileToArrays()) {
-            return false;
-        }
         const uint64_t outputMode = taskAccumInitialized_ ? 1 : 0;
         taskAccumInitialized_ = true;
-        for (uint32_t array_id = 0; array_id < current_.block_n; ++array_id) {
-            array_->configureOutputMode(array_id, outputMode);
-            array_->beginComputation(array_id);
+        pendingArrays_ = current_.block_n;
+        computeInFlight_ = true;
+        if (!beginArrayProgramming(outputMode)) {
+            computeInFlight_ = false;
+            pendingArrays_ = 0;
+            return false;
         }
         return true;
     }
 
     size_t currentPartialIndex() const {
-        const uint32_t reuseN = std::max<uint32_t>(header_.a_reuse_n_tiles, 1u);
-        return static_cast<size_t>(reuseMIndex_) * reuseN + static_cast<size_t>(reuseNIndex_);
+        return static_cast<size_t>(reuseMIndex_) * currentReuseNCount_ +
+               static_cast<size_t>(reuseNIndex_);
     }
 
-    bool captureArrayOutput(std::vector<uint8_t>& tile) const {
-        tile.assign(static_cast<size_t>(header_.block_m) * current_.block_n * current_.elem_bytes, 0);
-        for (uint32_t n = 0; n < current_.block_n; ++n) {
-            const size_t dst_off = static_cast<size_t>(n) * header_.block_m * current_.elem_bytes;
-            if (outputIsFloat_) {
-                auto* outVec = static_cast<std::vector<float>*>(array_->getOutputVector(n));
-                if (outVec == nullptr || outVec->size() < header_.block_m) {
-                    return false;
-                }
-                std::memcpy(&tile[dst_off], outVec->data(), static_cast<size_t>(header_.block_m) * current_.elem_bytes);
-            } else {
-                auto* outVec = static_cast<std::vector<int32_t>*>(array_->getOutputVector(n));
-                if (outVec == nullptr || outVec->size() < header_.block_m) {
-                    return false;
-                }
-                std::memcpy(&tile[dst_off], outVec->data(), static_cast<size_t>(header_.block_m) * current_.elem_bytes);
-            }
+    size_t partialCBytes() const {
+        return static_cast<size_t>(header_.block_m) * current_.block_n *
+               current_.elem_bytes;
+    }
+
+    uint64_t partialCAddress(size_t idx) const {
+        return header_.local_accum_gm_addr + idx * partialCBytes();
+    }
+
+    bool beginArrayOutputRead(OutputReadPurpose purpose) {
+        if (array_ == nullptr || arrayOutputReadPending_ ||
+            purpose == OutputReadPurpose::None) {
+            return false;
         }
+        partialTransferPayload_.assign(partialCBytes(), 0);
+        arrayOutputReadPurpose_ = purpose;
+        arrayOutputReadCursor_ = 0;
+        arrayOutputReadInFlight_ = false;
+        arrayOutputReadFailed_ = false;
+        arrayOutputReadPending_ = true;
+        ++arrayOutputReadEpoch_;
+        progressArrayOutputRead();
         return true;
     }
 
-    bool savePartialCFromArray() {
+    void progressArrayOutputRead() {
+        if (!arrayOutputReadPending_ || arrayOutputReadInFlight_ ||
+            arrayOutputReadFailed_ || array_ == nullptr) {
+            return;
+        }
+        if (arrayOutputReadCursor_ >= current_.block_n) {
+            arrayOutputReadPending_ = false;
+            partialTransferOffset_ = 0;
+            partialTransferInFlight_ = false;
+            partialTransferFailed_ = false;
+            partialTransferPending_ = true;
+            partialTransferKind_ =
+                arrayOutputReadPurpose_ == OutputReadPurpose::FinalWriteback
+                    ? PartialTransferKind::FinalStore
+                    : PartialTransferKind::Store;
+            ++partialTransferEpoch_;
+            progressPartialTransfer();
+            return;
+        }
+
+        const uint32_t arrayId = arrayOutputReadCursor_;
+        const uint64_t epoch = arrayOutputReadEpoch_;
+        const uint64_t tag = nextArrayTransferTag_++;
+        arrayOutputReadInFlight_ = true;
+        const bool accepted = array_->readOutputAsync(
+            arrayId, current_.elem_bytes, tag,
+            [this, arrayId, epoch](bool ok, uint64_t,
+                                   const std::vector<double>& values) {
+                if (epoch != arrayOutputReadEpoch_ || !arrayOutputReadPending_) {
+                    return;
+                }
+                arrayOutputReadInFlight_ = false;
+                if (!ok || arrayId != arrayOutputReadCursor_ ||
+                    values.size() < header_.block_m) {
+                    arrayOutputReadFailed_ = true;
+                    arrayOutputReadPending_ = false;
+                    return;
+                }
+                const size_t dstOffset =
+                    static_cast<size_t>(arrayId) * header_.block_m *
+                    current_.elem_bytes;
+                for (uint32_t row = 0; row < header_.block_m; ++row) {
+                    encodeElement(values[row],
+                                  partialTransferPayload_.data() + dstOffset +
+                                      static_cast<size_t>(row) * current_.elem_bytes);
+                }
+                arrayOutputReadCursor_ += 1;
+                progressArrayOutputRead();
+            });
+        if (!accepted) {
+            arrayOutputReadInFlight_ = false;
+        }
+    }
+
+    bool beginPartialCStore() {
         const size_t idx = currentPartialIndex();
-        if (idx >= partialCTiles_.size() || idx >= partialValid_.size()) {
+        if (partialTransferPending_ || arrayOutputReadPending_ ||
+            idx >= partialValid_.size()) {
             return false;
         }
-        if (!captureArrayOutput(partialCTiles_[idx])) {
+        partialTransferIndex_ = idx;
+        return beginArrayOutputRead(OutputReadPurpose::PartialStore);
+    }
+
+    bool beginFinalWriteback() {
+        if (partialTransferPending_ || arrayOutputReadPending_ ||
+            finalDmaPending_) {
             return false;
         }
-        partialValid_[idx] = 1;
+        finalDmaDone_ = false;
+        finalDmaFailed_ = false;
+        return beginArrayOutputRead(OutputReadPurpose::FinalWriteback);
+    }
+
+    bool beginPartialCLoad() {
+        const size_t idx = currentPartialIndex();
+        if (partialTransferPending_ || idx >= partialValid_.size() ||
+            partialValid_[idx] == 0) {
+            return false;
+        }
+        partialTransferPayload_.assign(partialCBytes(), 0);
+        partialTransferKind_ = PartialTransferKind::Load;
+        partialTransferIndex_ = idx;
+        partialTransferOffset_ = 0;
+        partialTransferInFlight_ = false;
+        partialTransferFailed_ = false;
+        partialLoadReady_ = false;
+        partialTransferPending_ = true;
+        ++partialTransferEpoch_;
+        progressPartialTransfer();
         return true;
     }
 
-    bool loadPartialCToArray() {
-        const size_t idx = currentPartialIndex();
-        if (idx >= partialCTiles_.size() || idx >= partialValid_.size() || partialValid_[idx] == 0) {
+    void progressPartialTransfer() {
+        if (!partialTransferPending_ || partialTransferInFlight_ ||
+            partialTransferFailed_ || globalMem_ == nullptr) {
+            return;
+        }
+        if (partialTransferOffset_ >= partialTransferPayload_.size()) {
+            partialTransferPending_ = false;
+            partialLoadReady_ = partialTransferKind_ == PartialTransferKind::Load;
+            if (partialTransferKind_ == PartialTransferKind::FinalStore) {
+                beginFinalDmaWrite();
+            }
+            return;
+        }
+        const size_t chunkBytes = std::min(
+            globalMem_->localMaxRequestBytes(),
+            partialTransferPayload_.size() - partialTransferOffset_);
+        if (chunkBytes == 0) {
+            partialTransferFailed_ = true;
+            partialTransferPending_ = false;
+            return;
+        }
+        const size_t chunkOffset = partialTransferOffset_;
+        const uint64_t baseAddress =
+            partialTransferKind_ == PartialTransferKind::FinalStore
+                ? current_.local_out_gm_addr
+                : partialCAddress(partialTransferIndex_);
+        const uint64_t address = baseAddress + chunkOffset;
+        const uint64_t epoch = partialTransferEpoch_;
+        const uint64_t tag = nextLocalTransferTag_++;
+        partialTransferInFlight_ = true;
+        if (partialTransferKind_ == PartialTransferKind::Store ||
+            partialTransferKind_ == PartialTransferKind::FinalStore) {
+            std::vector<uint8_t> chunk(
+                partialTransferPayload_.begin() + chunkOffset,
+                partialTransferPayload_.begin() + chunkOffset + chunkBytes);
+            const bool accepted = globalMem_->localWriteAsync(
+                address, chunk, LocalMemoryClient::WCP, tag,
+                [this, chunkOffset, chunkBytes, epoch](bool ok, uint64_t) {
+                    if (epoch != partialTransferEpoch_ || !partialTransferPending_) {
+                        return;
+                    }
+                    partialTransferInFlight_ = false;
+                    if (!ok || chunkOffset != partialTransferOffset_) {
+                        partialTransferFailed_ = true;
+                        partialTransferPending_ = false;
+                        return;
+                    }
+                    partialTransferOffset_ += chunkBytes;
+                    progressPartialTransfer();
+                });
+            if (!accepted) {
+                partialTransferInFlight_ = false;
+            }
+            return;
+        }
+        const bool accepted = globalMem_->localReadAsync(
+            address, chunkBytes, LocalMemoryClient::WCP, tag,
+            [this, chunkOffset, epoch](
+                bool ok, uint64_t, const std::vector<uint8_t>& data) {
+                if (epoch != partialTransferEpoch_ || !partialTransferPending_) {
+                    return;
+                }
+                partialTransferInFlight_ = false;
+                if (!ok || chunkOffset != partialTransferOffset_ ||
+                    data.size() > partialTransferPayload_.size() - partialTransferOffset_) {
+                    partialTransferFailed_ = true;
+                    partialTransferPending_ = false;
+                    return;
+                }
+                std::copy(data.begin(), data.end(),
+                          partialTransferPayload_.begin() + partialTransferOffset_);
+                partialTransferOffset_ += data.size();
+                progressPartialTransfer();
+            });
+        if (!accepted) {
+            partialTransferInFlight_ = false;
+        }
+    }
+
+    bool beginPartialCApply() {
+        const auto& tile = partialTransferPayload_;
+        if (tile.size() != partialCBytes() || arrayOutputWritePending_) {
             return false;
         }
-        const auto& tile = partialCTiles_[idx];
-        for (uint32_t n = 0; n < current_.block_n; ++n) {
-            const size_t src_off = static_cast<size_t>(n) * header_.block_m * current_.elem_bytes;
-            if (outputIsFloat_) {
-                auto* outVec = static_cast<std::vector<float>*>(array_->getOutputVector(n));
-                if (outVec == nullptr || outVec->size() < header_.block_m) {
-                    return false;
-                }
-                std::memcpy(outVec->data(), &tile[src_off], static_cast<size_t>(header_.block_m) * current_.elem_bytes);
-            } else {
-                auto* outVec = static_cast<std::vector<int32_t>*>(array_->getOutputVector(n));
-                if (outVec == nullptr || outVec->size() < header_.block_m) {
-                    return false;
-                }
-                std::memcpy(outVec->data(), &tile[src_off], static_cast<size_t>(header_.block_m) * current_.elem_bytes);
-            }
-        }
+        arrayOutputWriteCursor_ = 0;
+        arrayOutputWriteInFlight_ = false;
+        arrayOutputWriteFailed_ = false;
+        arrayOutputWriteReady_ = false;
+        arrayOutputWritePending_ = true;
+        ++arrayOutputWriteEpoch_;
+        progressArrayOutputWrite();
         return true;
+    }
+
+    void progressArrayOutputWrite() {
+        if (!arrayOutputWritePending_ || arrayOutputWriteInFlight_ ||
+            arrayOutputWriteFailed_ || array_ == nullptr) {
+            return;
+        }
+        if (arrayOutputWriteCursor_ >= current_.block_n) {
+            arrayOutputWritePending_ = false;
+            arrayOutputWriteReady_ = true;
+            return;
+        }
+
+        const uint32_t arrayId = arrayOutputWriteCursor_;
+        const size_t srcOffset =
+            static_cast<size_t>(arrayId) * header_.block_m * current_.elem_bytes;
+        std::vector<double> values(header_.block_m, 0.0);
+        for (uint32_t row = 0; row < header_.block_m; ++row) {
+            values[row] = decodeElement(
+                partialTransferPayload_.data() + srcOffset +
+                static_cast<size_t>(row) * current_.elem_bytes);
+        }
+        const uint64_t epoch = arrayOutputWriteEpoch_;
+        const uint64_t tag = nextArrayTransferTag_++;
+        arrayOutputWriteInFlight_ = true;
+        const bool accepted = array_->writeOutputAsync(
+            arrayId, values, current_.elem_bytes, tag,
+            [this, arrayId, epoch](bool ok, uint64_t) {
+                if (epoch != arrayOutputWriteEpoch_ || !arrayOutputWritePending_) {
+                    return;
+                }
+                arrayOutputWriteInFlight_ = false;
+                if (!ok || arrayId != arrayOutputWriteCursor_) {
+                    arrayOutputWriteFailed_ = true;
+                    arrayOutputWritePending_ = false;
+                    return;
+                }
+                arrayOutputWriteCursor_ += 1;
+                progressArrayOutputWrite();
+            });
+        if (!accepted) {
+            arrayOutputWriteInFlight_ = false;
+        }
+    }
+
+    void beginFinalDmaWrite() {
+        if (finalDmaPending_ || finalDmaDone_ || globalMem_ == nullptr) {
+            return;
+        }
+        finalDmaPending_ = true;
+        const uint64_t epoch = ++finalDmaEpoch_;
+        globalMem_->dma_write_from_globalmem_to_host(
+            current_.local_out_gm_addr, current_.c_base_addr, partialCBytes(),
+            [this, epoch](bool ok) {
+                if (epoch != finalDmaEpoch_ || !finalDmaPending_) {
+                    return;
+                }
+                finalDmaPending_ = false;
+                finalDmaDone_ = ok;
+                finalDmaFailed_ = !ok;
+            });
     }
 
     bool isFinal2DWindow() const {
@@ -1603,6 +1984,7 @@ private:
         taskAccumInitialized_ = false;
         activeMatPayload_.clear();
         activeVecPayload_.clear();
+        resetLocalTransferState();
         activeTileMicroOps_.clear();
         activeTileMicroOpCursor_ = 0;
         activeTileScoreboard_ = KStepScoreboard{};
@@ -1735,7 +2117,6 @@ private:
         activeTileMicroOpCursor_ += 1;
         refreshActiveComputeReadyQueue();
         if (activeTileMicroOpCursor_ < activeTileMicroOps_.size()) {
-            activeTilePayloadLoaded_ = false;
             return true;
         }
         activeMicroKStep_ = 0;
@@ -1806,6 +2187,7 @@ private:
         activeMicroKStep_ = 0;
         activeMatPayload_.clear();
         activeVecPayload_.clear();
+        resetLocalTransferState();
         activeTileMicroOps_.clear();
         activeTileMicroOpCursor_ = 0;
         activeTileScoreboard_ = KStepScoreboard{};
@@ -1837,6 +2219,16 @@ private:
         int32_t value = 0;
         std::memcpy(&value, raw, sizeof(value));
         return static_cast<double>(value);
+    }
+
+    void encodeElement(double value, uint8_t* raw) const {
+        if (outputIsFloat_) {
+            const float encoded = static_cast<float>(value);
+            std::memcpy(raw, &encoded, sizeof(encoded));
+            return;
+        }
+        const int32_t encoded = static_cast<int32_t>(value);
+        std::memcpy(raw, &encoded, sizeof(encoded));
     }
 
     void deriveTask(uint32_t taskIndex, bool resetState = true) {
@@ -1953,6 +2345,7 @@ private:
         IDLE = 0,
         RUN,
         WRITEBACK,
+        PARTIAL_STORE_WAIT,
         WRITEBACK_WAIT,
         DONE,
     };
@@ -2018,10 +2411,7 @@ private:
     uint64_t lastStage3TraceCycle_ = 0;
     bool allTilesScheduled_ = false;
     bool computeInFlight_ = false;
-    bool writebackDone_ = false;
     uint64_t activeTxnId_ = 0;
-    uint64_t writebackToken_ = 0;
-    std::deque<uint64_t> pendingWritebackTokens_;
     int activeComputeTileIndex_ = -1;
     int activeComputeSlotIndex_ = -1;
     uint32_t activeMicroKStep_ = 0;
@@ -2036,6 +2426,23 @@ private:
     std::vector<uint8_t> windowReuseDone_;
     std::vector<uint8_t> activeMatPayload_;
     std::vector<uint8_t> activeVecPayload_;
+    uint64_t operandMatAddress_ = 0;
+    uint64_t operandVecAddress_ = 0;
+    size_t operandMatOffset_ = 0;
+    size_t operandVecOffset_ = 0;
+    bool operandMatReadInFlight_ = false;
+    bool operandVecReadInFlight_ = false;
+    bool operandLoadPending_ = false;
+    bool operandLoadFailed_ = false;
+    uint64_t operandLoadEpoch_ = 0;
+    uint64_t nextLocalTransferTag_ = 1;
+    uint64_t nextArrayTransferTag_ = 1;
+    uint32_t arrayProgramCursor_ = 0;
+    uint64_t arrayProgramOutputMode_ = 0;
+    bool arrayProgramPending_ = false;
+    bool arrayProgramInFlight_ = false;
+    bool arrayProgramFailed_ = false;
+    uint64_t arrayProgramEpoch_ = 0;
     std::vector<MicroOp> activeTileMicroOps_;
     size_t activeTileMicroOpCursor_ = 0;
     KStepScoreboard activeTileScoreboard_;
@@ -2044,8 +2451,32 @@ private:
     MicroOp activeIssuedMicroOp_{};
     bool activeTilePayloadLoaded_ = false;
     bool taskAccumInitialized_ = false;
-    std::vector<std::vector<uint8_t>> partialCTiles_;
     std::vector<uint8_t> partialValid_;
+    PartialTransferKind partialTransferKind_ = PartialTransferKind::None;
+    std::vector<uint8_t> partialTransferPayload_;
+    size_t partialTransferIndex_ = 0;
+    size_t partialTransferOffset_ = 0;
+    bool partialTransferPending_ = false;
+    bool partialTransferInFlight_ = false;
+    bool partialTransferFailed_ = false;
+    bool partialLoadReady_ = false;
+    uint64_t partialTransferEpoch_ = 0;
+    OutputReadPurpose arrayOutputReadPurpose_ = OutputReadPurpose::None;
+    uint32_t arrayOutputReadCursor_ = 0;
+    bool arrayOutputReadPending_ = false;
+    bool arrayOutputReadInFlight_ = false;
+    bool arrayOutputReadFailed_ = false;
+    uint64_t arrayOutputReadEpoch_ = 0;
+    uint32_t arrayOutputWriteCursor_ = 0;
+    bool arrayOutputWritePending_ = false;
+    bool arrayOutputWriteInFlight_ = false;
+    bool arrayOutputWriteFailed_ = false;
+    bool arrayOutputWriteReady_ = false;
+    uint64_t arrayOutputWriteEpoch_ = 0;
+    bool finalDmaPending_ = false;
+    bool finalDmaDone_ = false;
+    bool finalDmaFailed_ = false;
+    uint64_t finalDmaEpoch_ = 0;
 };
 
 } // namespace Golem

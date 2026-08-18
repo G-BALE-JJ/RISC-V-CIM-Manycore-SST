@@ -55,6 +55,8 @@ public:
         {"arrayOutputSize", "Length of output vector (implies array columns)."},
         {"inputOperandSize", "Size of input operand in bytes."},
         {"outputOperandSize", "Size of output operand in bytes."},
+        {"attention_window_offset", "Offset of the fused Attention Local GM window", "0xC0000"},
+        {"attention_window_bytes", "Capacity of the fused Attention Local GM window", "0x10000"},
         {"progress_heartbeat", "Enable lightweight RoCC MVM progress heartbeat logs", "0"},
         {"progress_interval_cycles", "Progress heartbeat interval in RoCC cycles", "50000"},
         {"progress_total_mvm_ops", "Expected total MVM ops for this core", "0"})
@@ -70,7 +72,31 @@ public:
         {"cycles_mvm_gm2ivec", "Cycles consumed by mvm.gm2ivec instructions", "cycles", 1},
         {"cycles_mvm_gm2imat", "Cycles consumed by mvm.gm2imat instructions", "cycles", 1},
         {"cycles_remote_st", "Cycles consumed by remote_st instructions", "cycles", 1},
-        {"cycles_remote_ld", "Cycles consumed by remote_ld instructions", "cycles", 1})
+        {"cycles_remote_ld", "Cycles consumed by remote_ld instructions", "cycles", 1},
+        {"tensor_manager_jobs_issued", "Tensor jobs accepted by the manager RoCC", "jobs", 1},
+        {"tensor_manager_workers_mapped", "Physical worker cores mapped by manager jobs", "workers", 1},
+        {"tensor_manager_rows_dispatched", "Tensor rows dispatched by the manager RoCC", "rows", 1},
+        {"tensor_manager_rows_completed", "Tensor rows completed at the manager RoCC", "rows", 1},
+        {"tensor_manager_jobs_completed", "Tensor jobs completed by the manager RoCC", "jobs", 1},
+        {"tensor_manager_descriptor_accept_tick", "Simulation tick when a manager descriptor is accepted", "ticks", 1},
+        {"tensor_manager_band_dispatch_tick", "Simulation tick for each manager worker-band dispatch", "ticks", 1},
+        {"tensor_manager_completion_received_tick", "Simulation tick for each manager worker completion", "ticks", 1},
+        {"tensor_manager_complete_tick", "Simulation tick when all manager workers complete", "ticks", 1},
+        {"tensor_manager_wait_observed_tick", "Simulation tick when software observes manager completion", "ticks", 1},
+        {"attention_manager_jobs_issued", "Fused Attention jobs issued by manager", "jobs", 1},
+        {"attention_manager_jobs_completed", "Fused Attention jobs completed by manager", "jobs", 1},
+        {"attention_manager_bands_completed", "Fused Attention bands completed locally", "bands", 1},
+        {"attention_manager_band_completions_received", "Attention band completions received by the root manager", "bands", 1},
+        {"attention_tensor_jobs_completed", "Fused Attention tensors completed after manager aggregation", "jobs", 1},
+        {"attention_manager_descriptor_accept_tick", "Tick when an Attention manager job is accepted", "ticks", 1},
+        {"attention_manager_dispatch_tick", "Tick when an Attention manager dispatches all workers", "ticks", 1},
+        {"attention_manager_local_complete_tick", "Tick when an Attention manager completes its local band", "ticks", 1},
+        {"attention_manager_band_completion_received_tick", "Tick for each Attention manager band received by root", "ticks", 1},
+        {"attention_tensor_complete_tick", "Tick when root completes the Attention tensor", "ticks", 1},
+        {"attention_manager_wait_observed_tick", "Tick when software observes Attention manager completion", "ticks", 1},
+        {"attention_qk_array_ops", "QK array operations", "operations", 1},
+        {"attention_pv_array_ops", "PV array operations", "operations", 1},
+        {"attention_sp_hbm_bytes", "Score/probability HBM bytes", "bytes", 1})
 
     RoCCAnalogInt(ComponentId_t id, Params &params)
         : RoCCAnalog<int64_t>(id, params) {}

@@ -18,6 +18,7 @@
 
 #include <sst/elements/golem/array/computeArray.h>
 #include <algorithm>
+#include <cstring>
 #include <type_traits>
 #include <filesystem>
 #include <fstream>
@@ -106,6 +107,139 @@ public:
     //同理
     virtual void setVectorItem(int32_t arrayID, int32_t index, double value) override {
         inputVectors[arrayID][index] = static_cast<T>(value);
+    }
+
+    virtual bool programMatrixAsync(
+        uint32_t arrayID,
+        const std::vector<double>& matrix,
+        size_t elemBytes,
+        uint64_t tag,
+        typename ComputeArray::BufferCallback callback) override {
+        if (arrayID >= matrixData.size() ||
+            matrix.size() != inputArraySize * outputArraySize || elemBytes == 0) {
+            return false;
+        }
+        return enqueueBufferTransfer(
+            matrix.size() * elemBytes, tag,
+            [this, arrayID, matrix, tag, callback = std::move(callback)]() {
+                std::transform(matrix.begin(), matrix.end(), matrixData[arrayID].begin(),
+                               [](double value) { return static_cast<T>(value); });
+                if (callback) {
+                    callback(true, tag);
+                }
+            });
+    }
+
+    virtual bool programInputAsync(
+        uint32_t arrayID,
+        const std::vector<double>& input,
+        size_t elemBytes,
+        uint64_t tag,
+        typename ComputeArray::BufferCallback callback) override {
+        if (arrayID >= inputVectors.size() || input.size() != inputArraySize ||
+            elemBytes == 0) {
+            return false;
+        }
+        return enqueueBufferTransfer(
+            input.size() * elemBytes, tag,
+            [this, arrayID, input, tag, callback = std::move(callback)]() {
+                std::transform(input.begin(), input.end(), inputVectors[arrayID].begin(),
+                               [](double value) { return static_cast<T>(value); });
+                if (callback) {
+                    callback(true, tag);
+                }
+            });
+    }
+
+    virtual bool programOperandsAsync(
+        uint32_t arrayID,
+        const std::vector<double>& matrix,
+        const std::vector<double>& input,
+        size_t elemBytes,
+        uint64_t tag,
+        typename ComputeArray::BufferCallback callback) override {
+        if (arrayID >= matrixData.size() ||
+            matrix.size() != inputArraySize * outputArraySize ||
+            input.size() != inputArraySize || elemBytes == 0) {
+            return false;
+        }
+        const size_t bytes = (matrix.size() + input.size()) * elemBytes;
+        return enqueueBufferTransfer(
+            bytes, tag,
+            [this, arrayID, matrix, input, tag, callback = std::move(callback)]() {
+                std::transform(matrix.begin(), matrix.end(), matrixData[arrayID].begin(),
+                               [](double value) { return static_cast<T>(value); });
+                std::transform(input.begin(), input.end(), inputVectors[arrayID].begin(),
+                               [](double value) { return static_cast<T>(value); });
+                if (callback) {
+                    callback(true, tag);
+                }
+            });
+    }
+
+    virtual bool readOutputAsync(
+        uint32_t arrayID,
+        size_t elemBytes,
+        uint64_t tag,
+        typename ComputeArray::BufferReadCallback callback) override {
+        if (arrayID >= outputVectors.size() || elemBytes == 0) {
+            return false;
+        }
+        return enqueueBufferTransfer(
+            outputArraySize * elemBytes, tag,
+            [this, arrayID, tag, callback = std::move(callback)]() {
+                std::vector<double> values(outputVectors[arrayID].size(), 0.0);
+                std::transform(outputVectors[arrayID].begin(), outputVectors[arrayID].end(),
+                               values.begin(),
+                               [](T value) { return static_cast<double>(value); });
+                if (callback) {
+                    callback(true, tag, values);
+                }
+            });
+    }
+
+    virtual bool readOutputBytesAsync(
+        uint32_t arrayID,
+        size_t elemBytes,
+        uint64_t tag,
+        typename ComputeArray::BufferByteReadCallback callback) override {
+        if (arrayID >= outputVectors.size() || elemBytes == 0) {
+            return false;
+        }
+        return enqueueBufferTransfer(
+            outputArraySize * elemBytes, tag,
+            [this, arrayID, elemBytes, tag, callback = std::move(callback)]() {
+                std::vector<uint8_t> bytes(outputVectors[arrayID].size() * elemBytes, 0);
+                for (size_t index = 0; index < outputVectors[arrayID].size(); ++index) {
+                    const T value = outputVectors[arrayID][index];
+                    std::memcpy(bytes.data() + index * elemBytes, &value,
+                                std::min<size_t>(sizeof(T), elemBytes));
+                }
+                if (callback) {
+                    callback(true, tag, bytes);
+                }
+            });
+    }
+
+    virtual bool writeOutputAsync(
+        uint32_t arrayID,
+        const std::vector<double>& output,
+        size_t elemBytes,
+        uint64_t tag,
+        typename ComputeArray::BufferCallback callback) override {
+        if (arrayID >= outputVectors.size() || output.size() != outputArraySize ||
+            elemBytes == 0) {
+            return false;
+        }
+        return enqueueBufferTransfer(
+            output.size() * elemBytes, tag,
+            [this, arrayID, output, tag, callback = std::move(callback)]() {
+                std::transform(output.begin(), output.end(), outputVectors[arrayID].begin(),
+                               [](double value) { return static_cast<T>(value); });
+                if (callback) {
+                    callback(true, tag);
+                }
+            });
     }
 
     virtual void compute(uint32_t arrayID) override {

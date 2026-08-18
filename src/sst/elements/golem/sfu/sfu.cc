@@ -547,6 +547,7 @@ SFU::SFU(ComponentId_t id, SST::Params& params)
       rowEngineReductionTreeLatency_(params.find<uint32_t>("reduction_tree_latency", 4)),
       rowEngineExpLatency_(params.find<uint32_t>("exp_latency", 8)),
       rowEngineReciprocalLatency_(params.find<uint32_t>("reciprocal_latency", 1)),
+      rowEngineRsqrtLatency_(params.find<uint32_t>("rsqrt_latency", 8)),
       rowEngineContexts_(params.find<uint32_t>("row_contexts", 4)),
       rowEngineScratchpadBytes_(params.find<uint64_t>("scratchpad_bytes", 65536)),
       rowEngineTimebaseTicksPerSecond_(0),
@@ -571,6 +572,7 @@ SFU::SFU(ComponentId_t id, SST::Params& params)
         rowEngineScratchpadBytes_ == 0) {
         output_.fatal(CALL_INFO, -1, "Row Engine parameters must be positive\n");
     }
+    attentionOnlineContexts_.resize(rowEngineContexts_);
     rowEngineTimebaseTicksPerSecond_ = getTimeConverter("1s")->getFactor();
     if (rowEngineTimebaseTicksPerSecond_ == 0) {
         output_.fatal(CALL_INFO, -1, "SST timebase conversion for 1s must be positive\n");
@@ -634,6 +636,12 @@ SFU::SFU(ComponentId_t id, SST::Params& params)
     statTensorOutputDmaAckTick_ = registerStatistic<uint64_t>("sfu_tensor_output_dma_ack_tick");
     statTensorCompletionReceivedTick_ = registerStatistic<uint64_t>("sfu_tensor_completion_received_tick");
     statTensorGuestWaitObservedTick_ = registerStatistic<uint64_t>("sfu_tensor_guest_wait_observed_tick");
+    statAttentionJobs_ = registerStatistic<uint64_t>("sfu_attention_jobs");
+    statAttentionRsqrtReadyTick_ = registerStatistic<uint64_t>("sfu_attention_rsqrt_ready_tick");
+    statAttentionScaleMaskStartTick_ = registerStatistic<uint64_t>("sfu_attention_scale_mask_start_tick");
+    statAttentionScaleMaskDoneTick_ = registerStatistic<uint64_t>("sfu_attention_scale_mask_done_tick");
+    statAttentionScaledElements_ = registerStatistic<uint64_t>("sfu_attention_scaled_elements");
+    statAttentionMaskedElements_ = registerStatistic<uint64_t>("sfu_attention_masked_elements");
     statPrimitiveElems_ = registerStatistic<uint64_t>("sfu_primitive_elems");
     statPartialSubmits_ = registerStatistic<uint64_t>("sfu_partial_submits");
     statPartialDone_ = registerStatistic<uint64_t>("sfu_partial_done");
@@ -854,6 +862,25 @@ void SFU::recordDistributedReductionResponse(bool maxStage)
 
 void SFU::finish()
 {
+    output_.output(
+        "GOLEM_TENSOR_LOCAL_STATS core=%" PRIu32
+        " sfu_tensor_max_local_read_bytes=%" PRIu64
+        " sfu_tensor_max_local_write_bytes=%" PRIu64
+        " sfu_tensor_exp_sum_local_read_bytes=%" PRIu64
+        " sfu_tensor_exp_sum_local_write_bytes=%" PRIu64
+        " sfu_tensor_normalize_local_read_bytes=%" PRIu64
+        " sfu_tensor_normalize_local_write_bytes=%" PRIu64
+        " sfu_tensor_lane_buffer_high_water=%" PRIu64
+        " sfu_tensor_local_retry_events=%" PRIu64 "\n",
+        coreId_,
+        tensorMaxLocalReadBytes_,
+        tensorMaxLocalWriteBytes_,
+        tensorExpSumLocalReadBytes_,
+        tensorExpSumLocalWriteBytes_,
+        tensorNormalizeLocalReadBytes_,
+        tensorNormalizeLocalWriteBytes_,
+        tensorLaneBufferHighWater_,
+        tensorLocalRetryEvents_);
     if (verbose_ > 0) {
         output_.verbose(CALL_INFO, 1, 0,
             "SFU finish core=%" PRIu32 " inflight=%" PRIu32 "\n",
@@ -1033,6 +1060,17 @@ bool SFU::issueJob(uint64_t descAddr, uint64_t tag)
         !readTensorJobParams(state.desc.params_addr, &state.tensorParams)) {
         state.status = SFUStatus::InvalidDescriptor;
     }
+    if (tensorRowEngineJob && state.status == SFUStatus::Success) {
+        state.attentionMode =
+            state.tensorParams.version == SFU_SOFTMAX_JOB_PARAMS_VERSION_ATTENTION;
+        state.attentionCausal = state.attentionMode &&
+            (state.tensorParams.flags & SFU_SOFTMAX_PARAMS_FLAG_CAUSAL) != 0;
+        if (state.attentionMode) {
+            const float headDim = static_cast<float>(state.tensorParams.reserved0);
+            state.attentionScale = 1.0f / std::sqrt(headDim);
+            statAttentionJobs_->addData(1);
+        }
+    }
     const bool tensorRowEngineBusy = tensorRowEngineJob &&
         std::any_of(pendingJobOps_.begin(), pendingJobOps_.end(),
                     [](const auto& entry) {
@@ -1073,6 +1111,11 @@ bool SFU::issueJob(uint64_t descAddr, uint64_t tag)
             ? state.rowEngineIssueTick
             : std::max(state.rowEngineIssueTick, rowEngineFreeTick_);
         state.rowEngineReadyTick = 0;
+        if (tensorRowEngineJob && state.attentionMode) {
+            state.attentionRsqrtReadyTick = state.rowEngineIssueTick + ceilMulDiv(
+                rowEngineRsqrtLatency_, rowEngineTimebaseTicksPerSecond_,
+                rowEngineAcceleratorClockHz_);
+        }
         if (!tensorRowEngineJob) {
             const uint64_t modeledTicks = ceilMulDiv(
                 state.rowEngineModeledCycles,
@@ -1132,6 +1175,7 @@ bool SFU::issueJob(uint64_t descAddr, uint64_t tag)
     pendingJobOps_[tag] = state;
 
     if (tensorRowEngineJob && state.status == SFUStatus::Pending &&
+        !state.attentionMode &&
         !startTensorRowEngineJob(tag)) {
         pendingJobOps_[tag].status = SFUStatus::InvalidDescriptor;
     }
@@ -1185,7 +1229,19 @@ bool SFU::wait(uint64_t tag, uint64_t* status)
                     if (state.status == SFUStatus::Pending &&
                         (state.desc.flags & SFU_JOB_FLAG_ROW_ENGINE_MODEL) != 0) {
                         if ((state.desc.flags & SFU_JOB_FLAG_TENSOR_ROW_ENGINE) != 0) {
-                            finishTensorJobIfReady(&state);
+                            if (state.attentionMode && !state.tensorStarted) {
+                                if (getCurrentSimCycle() >= state.attentionRsqrtReadyTick) {
+                                    statAttentionRsqrtReadyTick_->addData(getCurrentSimCycle());
+                                    if (!startTensorRowEngineJob(state.tag)) {
+                                        state.status = SFUStatus::InvalidDescriptor;
+                                    }
+                                } else {
+                                    statRowEngineWaitPolls_->addData(1);
+                                }
+                            }
+                            if (state.tensorStarted) {
+                                finishTensorJobIfReady(&state);
+                            }
                         } else if (getCurrentSimCycle() >= state.rowEngineReadyTick) {
                             if (executeJob(&state)) {
                                 state.status = SFUStatus::Success;
@@ -1310,8 +1366,16 @@ bool SFU::readTensorJobParams(uint64_t paramsAddr, SFUSoftmaxJobParamsV1* params
         return false;
     }
     std::memcpy(params, raw.data(), sizeof(SFUSoftmaxJobParamsV1));
+    const bool legacy = params->version == SFU_SOFTMAX_JOB_PARAMS_VERSION &&
+        params->flags == 0;
+    const bool attention =
+        params->version == SFU_SOFTMAX_JOB_PARAMS_VERSION_ATTENTION &&
+        (params->flags & SFU_SOFTMAX_PARAMS_FLAG_ATTENTION) != 0 &&
+        (params->flags & ~(SFU_SOFTMAX_PARAMS_FLAG_ATTENTION |
+                           SFU_SOFTMAX_PARAMS_FLAG_CAUSAL)) == 0 &&
+        params->reserved0 != 0;
     return params->magic == SFU_SOFTMAX_JOB_PARAMS_MAGIC &&
-        params->version == SFU_SOFTMAX_JOB_PARAMS_VERSION &&
+        (legacy || attention) &&
         params->size_bytes == sizeof(SFUSoftmaxJobParamsV1) &&
         params->hbm_layout == SFU_SOFTMAX_HBM_LAYOUT_BAND_STRIPED &&
         params->data_node_mask != 0 && params->node_stride_bytes != 0 &&
@@ -1806,7 +1870,7 @@ uint64_t SFU::tensorWorkerHostAddress(const ReductionTransportMessage& message,
 
 void SFU::handleTensorRowDispatch(const ReductionTransportMessage& message)
 {
-    if (message.workerSlot != coreId_ || message.expectedRows == 0 ||
+    if (message.workerCore != coreId_ || message.expectedRows == 0 ||
         message.expectedCols == 0 || message.rowsPerBand == 0 ||
         message.dataNodeMask == 0 || message.nodeStrideBytes == 0 ||
         globalMem_ == nullptr) {
@@ -1846,6 +1910,77 @@ void SFU::handleTensorRowDispatch(const ReductionTransportMessage& message)
     }
 }
 
+bool SFU::issueAttentionTile(const AttentionTileRequest& request,
+                             std::function<void(bool, const AttentionTileResult&)> callback)
+{
+    if (globalMem_ == nullptr || !callback || !tensorWorkerOps_.empty() ||
+        request.jobId == 0 || request.rows == 0 || request.rows > 16 ||
+        request.cols == 0 || request.headDim == 0 || request.keyTiles == 0 ||
+        request.keyTile >= request.keyTiles ||
+        (request.keyTiles > 1 && request.rows > rowEngineContexts_) ||
+        request.localScoreAddr < globalMem_->getBaseAddr()) {
+        return false;
+    }
+    const uint64_t rowBytes = static_cast<uint64_t>(request.cols) * sizeof(float);
+    const uint64_t tileBytes = rowBytes * request.rows;
+    if (request.localScoreAddr + tileBytes < request.localScoreAddr ||
+        request.localScoreAddr + tileBytes > globalMem_->getBaseAddr() + globalMem_->getSize()) {
+        return false;
+    }
+
+    const TensorWorkerKey key(request.tag, request.globalRowBegin);
+    TensorWorkerState worker = {};
+    worker.dispatch.kind = ReductionTransportMessageKind::AttentionDispatch;
+    worker.dispatch.tag = request.tag;
+    worker.dispatch.ownerCore = coreId_;
+    worker.dispatch.workerCore = coreId_;
+    worker.dispatch.row = request.globalRowBegin;
+    worker.dispatch.expectedRows = request.rows;
+    worker.dispatch.expectedCols = request.cols;
+    worker.dispatch.rowsPerBand = request.rows;
+    worker.dispatch.headDim = request.headDim;
+    const double scale = 1.0 / std::sqrt(static_cast<double>(request.headDim));
+    worker.dispatch.value = request.causal ? -scale : scale;
+    worker.scratchAddr = request.localScoreAddr;
+    worker.nextRow = request.globalRowBegin;
+    worker.rowsCompleted = 0;
+    worker.localTileMode = true;
+    worker.attentionJobId = request.jobId;
+    worker.attentionKeyTile = request.keyTile;
+    worker.attentionKeyTiles = request.keyTiles;
+    worker.attentionKeyBegin = request.keyBegin;
+    worker.attentionFirstTileForJob = request.firstTileForJob;
+    worker.attentionResult.rows = request.rows;
+    worker.localTileCallback = std::move(callback);
+    const uint32_t contextCount = std::min(request.rows, rowEngineContexts_);
+    for (uint32_t index = 0; index < contextCount; ++index) {
+        AttentionOnlineRowContext& online = attentionOnlineContexts_[index];
+        const uint32_t globalRow = request.globalRowBegin + index;
+        if (request.keyTile == 0) {
+            online.valid = true;
+            online.jobId = request.jobId;
+            online.globalRow = globalRow;
+            online.m = -std::numeric_limits<double>::infinity();
+            online.l = 0.0;
+        } else if (!online.valid || online.jobId != request.jobId ||
+                   online.globalRow != globalRow) {
+            return false;
+        }
+    }
+    worker.contexts.resize(contextCount);
+    if (!tensorWorkerOps_.emplace(key, std::move(worker)).second) {
+        return false;
+    }
+
+    statAttentionJobs_->addData(1);
+    rowEngineSelfLink_->send(
+        request.firstTileForJob ? std::max<uint32_t>(1, rowEngineRsqrtLatency_) : 1,
+        new TensorRowEngineEvent(request.tag, request.globalRowBegin, 0,
+                                 TensorRowEngineStage::Max,
+                                 TensorRowEngineEventKind::AttentionStart, 0));
+    return true;
+}
+
 void SFU::rejectTensorRowDispatch(const ReductionTransportMessage& message)
 {
     statRetryEvents_->addData(1);
@@ -1883,33 +2018,180 @@ void SFU::issueTensorInputDma(const TensorWorkerKey& key, uint32_t contextIndex)
 
     context.busy = true;
     context.row = worker.nextRow++;
-    context.values.clear();
+    context.laneValues.clear();
+    context.laneValues.reserve(rowEngineVectorLanes_);
     const uint64_t rowBytes = static_cast<uint64_t>(worker.dispatch.expectedCols) * sizeof(float);
+    if (worker.localTileMode) {
+        AttentionOnlineRowContext& online = attentionOnlineContexts_[contextIndex];
+        if (worker.attentionKeyTile == 0) {
+            online.valid = true;
+            online.jobId = worker.attentionJobId;
+            online.globalRow = context.row;
+            online.m = -std::numeric_limits<double>::infinity();
+            online.l = 0.0;
+        } else if (!online.valid || online.jobId != worker.attentionJobId ||
+                   online.globalRow != context.row) {
+            finishTensorWorker(key, false);
+            return;
+        }
+        context.scratchAddr = worker.scratchAddr +
+            static_cast<uint64_t>(context.row - worker.dispatch.row) * rowBytes;
+        beginTensorRowStage(key, contextIndex, TensorRowEngineStage::Max);
+        return;
+    }
     const uint64_t inputAddr = tensorWorkerHostAddress(worker.dispatch, context.row, false);
     globalMem_->dma_read_from_host_to_globalmem(
         inputAddr,
         rowBytes,
         context.scratchAddr,
-        [this, key, contextIndex, rowBytes](bool ok) {
+        [this, key, contextIndex](bool ok) {
             auto it = tensorWorkerOps_.find(key);
             if (it == tensorWorkerOps_.end() || contextIndex >= it->second.contexts.size()) {
                 return;
-            }
-            TensorWorkerState::Context& callbackContext = it->second.contexts[contextIndex];
-            std::vector<uint8_t> raw;
-            if (ok) {
-                globalMem_->rd_from_globalmem(callbackContext.scratchAddr, rowBytes, raw);
-                ok = raw.size() == rowBytes;
             }
             if (!ok) {
                 finishTensorWorker(key, false);
                 return;
             }
-            callbackContext.values.resize(it->second.dispatch.expectedCols);
-            std::memcpy(callbackContext.values.data(), raw.data(), rowBytes);
             statTensorInputDmaReadyTick_->addData(getCurrentSimCycle());
-            scheduleTensorRowStage(key, contextIndex, TensorRowEngineStage::Max);
+            beginTensorRowStage(key, contextIndex, TensorRowEngineStage::Max);
         });
+}
+
+void SFU::beginTensorRowStage(const TensorWorkerKey& key,
+                              uint32_t contextIndex,
+                              TensorRowEngineStage stage)
+{
+    auto workerIt = tensorWorkerOps_.find(key);
+    if (workerIt == tensorWorkerOps_.end() || contextIndex >= workerIt->second.contexts.size()) {
+        return;
+    }
+    TensorWorkerState::Context& context = workerIt->second.contexts[contextIndex];
+    context.stage = stage;
+    context.chunkBegin = 0;
+    context.laneValues.clear();
+    if (stage == TensorRowEngineStage::Max) {
+        context.rowMax = -std::numeric_limits<float>::infinity();
+    } else if (stage == TensorRowEngineStage::ExpSum) {
+        context.rowSum = 0.0;
+    } else {
+        if (context.rowSum == 0.0 && !workerIt->second.localTileMode) {
+            finishTensorWorker(key, false);
+            return;
+        }
+        context.invSum = workerIt->second.localTileMode
+            ? context.tileWeightScale
+            : static_cast<float>(1.0 / context.rowSum);
+    }
+    issueTensorLocalRead(key, contextIndex);
+}
+
+void SFU::scheduleTensorLocalRetry(const TensorWorkerKey& key,
+                                   uint32_t contextIndex,
+                                   TensorRowEngineEventKind kind)
+{
+    auto workerIt = tensorWorkerOps_.find(key);
+    if (workerIt == tensorWorkerOps_.end() || rowEngineSelfLink_ == nullptr ||
+        contextIndex >= workerIt->second.contexts.size()) {
+        return;
+    }
+    const TensorWorkerState::Context& context = workerIt->second.contexts[contextIndex];
+    ++tensorLocalRetryEvents_;
+    rowEngineSelfLink_->send(
+        1,
+        new TensorRowEngineEvent(key.first, key.second, contextIndex, context.stage,
+                                 kind, context.pendingLocalTag));
+}
+
+void SFU::issueTensorLocalRead(const TensorWorkerKey& key, uint32_t contextIndex)
+{
+    auto workerIt = tensorWorkerOps_.find(key);
+    if (workerIt == tensorWorkerOps_.end() || globalMem_ == nullptr ||
+        contextIndex >= workerIt->second.contexts.size()) {
+        return;
+    }
+    TensorWorkerState& worker = workerIt->second;
+    TensorWorkerState::Context& context = worker.contexts[contextIndex];
+    const uint32_t remaining = worker.dispatch.expectedCols - context.chunkBegin;
+    const uint32_t chunkElems = std::min(rowEngineVectorLanes_, remaining);
+    const size_t chunkBytes = static_cast<size_t>(chunkElems) * sizeof(float);
+    context.pendingLocalTag = nextTensorLocalTag_++;
+    const uint64_t localTag = context.pendingLocalTag;
+    const bool accepted = globalMem_->localReadAsync(
+        context.scratchAddr + static_cast<uint64_t>(context.chunkBegin) * sizeof(float),
+        chunkBytes,
+        LocalMemoryClient::SFU,
+        localTag,
+        [this, key, contextIndex, chunkElems, chunkBytes](
+            bool ok, uint64_t tag, const std::vector<uint8_t>& raw) {
+            auto it = tensorWorkerOps_.find(key);
+            if (it == tensorWorkerOps_.end() || contextIndex >= it->second.contexts.size()) {
+                return;
+            }
+            TensorWorkerState::Context& callbackContext = it->second.contexts[contextIndex];
+            if (!ok || tag != callbackContext.pendingLocalTag || raw.size() != chunkBytes) {
+                finishTensorWorker(key, false);
+                return;
+            }
+            callbackContext.laneValues.resize(chunkElems);
+            std::memcpy(callbackContext.laneValues.data(), raw.data(), chunkBytes);
+            if (chunkElems > tensorLaneBufferHighWater_) {
+                tensorLaneBufferHighWater_ = chunkElems;
+            }
+            if (callbackContext.stage == TensorRowEngineStage::Max) {
+                tensorMaxLocalReadBytes_ += chunkBytes;
+            } else if (callbackContext.stage == TensorRowEngineStage::ExpSum) {
+                tensorExpSumLocalReadBytes_ += chunkBytes;
+            } else {
+                tensorNormalizeLocalReadBytes_ += chunkBytes;
+            }
+            scheduleTensorRowStage(key, contextIndex, callbackContext.stage);
+        });
+    if (!accepted) {
+        scheduleTensorLocalRetry(key, contextIndex, TensorRowEngineEventKind::LocalReadRetry);
+    }
+}
+
+void SFU::issueTensorLocalWrite(const TensorWorkerKey& key, uint32_t contextIndex)
+{
+    auto workerIt = tensorWorkerOps_.find(key);
+    if (workerIt == tensorWorkerOps_.end() || globalMem_ == nullptr ||
+        contextIndex >= workerIt->second.contexts.size()) {
+        return;
+    }
+    TensorWorkerState::Context& context = workerIt->second.contexts[contextIndex];
+    std::vector<uint8_t> raw(context.laneValues.size() * sizeof(float));
+    std::memcpy(raw.data(), context.laneValues.data(), raw.size());
+    context.pendingLocalTag = nextTensorLocalTag_++;
+    const uint64_t localTag = context.pendingLocalTag;
+    const size_t chunkBytes = raw.size();
+    const bool accepted = globalMem_->localWriteAsync(
+        context.scratchAddr + static_cast<uint64_t>(context.chunkBegin) * sizeof(float),
+        raw,
+        LocalMemoryClient::SFU,
+        localTag,
+        [this, key, contextIndex, chunkBytes](bool ok, uint64_t tag) {
+            auto it = tensorWorkerOps_.find(key);
+            if (it == tensorWorkerOps_.end() || contextIndex >= it->second.contexts.size()) {
+                return;
+            }
+            TensorWorkerState::Context& callbackContext = it->second.contexts[contextIndex];
+            if (!ok || tag != callbackContext.pendingLocalTag) {
+                finishTensorWorker(key, false);
+                return;
+            }
+            if (callbackContext.stage == TensorRowEngineStage::Max) {
+                tensorMaxLocalWriteBytes_ += chunkBytes;
+            } else if (callbackContext.stage == TensorRowEngineStage::ExpSum) {
+                tensorExpSumLocalWriteBytes_ += chunkBytes;
+            } else {
+                tensorNormalizeLocalWriteBytes_ += chunkBytes;
+            }
+            advanceTensorRowChunk(key, contextIndex);
+        });
+    if (!accepted) {
+        scheduleTensorLocalRetry(key, contextIndex, TensorRowEngineEventKind::LocalWriteRetry);
+    }
 }
 
 void SFU::scheduleTensorRowStage(const TensorWorkerKey& key,
@@ -1925,94 +2207,139 @@ void SFU::scheduleTensorRowStage(const TensorWorkerKey& key,
     }
 
     const uint64_t now = rowEngineCurrentCycle();
-    const uint64_t cols = workerIt->second.dispatch.expectedCols;
+    TensorWorkerState::Context& context = workerIt->second.contexts[contextIndex];
+    if (context.stage != stage || context.laneValues.empty()) {
+        finishTensorWorker(key, false);
+        return;
+    }
+    const uint64_t elems = context.laneValues.size();
+    const bool finalChunk = context.chunkBegin + elems == workerIt->second.dispatch.expectedCols;
     uint64_t start = now;
     uint64_t duration = 0;
     if (stage == TensorRowEngineStage::Max) {
-        const uint64_t active = ceilDiv(cols, rowEngineVectorLanes_);
+        const uint64_t active = ceilDiv(elems, rowEngineVectorLanes_);
         start = std::max(now, rowEngineVectorFreeCycle_);
         rowEngineVectorFreeCycle_ = start + active;
-        duration = active + rowEngineReductionTreeLatency_;
+        duration = active + (finalChunk ? rowEngineReductionTreeLatency_ : 0);
     } else if (stage == TensorRowEngineStage::ExpSum) {
-        const uint64_t active = ceilDiv(cols, rowEngineExpLanes_);
+        const uint64_t active = ceilDiv(elems, rowEngineExpLanes_);
         start = std::max(now, rowEngineExpFreeCycle_);
         rowEngineExpFreeCycle_ = start + active;
-        duration = active + rowEngineExpLatency_ + rowEngineReductionTreeLatency_;
+        duration = active + (finalChunk ? rowEngineExpLatency_ + rowEngineReductionTreeLatency_ : 0);
     } else {
-        const uint64_t active = ceilDiv(cols, rowEngineVectorLanes_);
+        const uint64_t active = ceilDiv(elems, rowEngineVectorLanes_);
         start = std::max(now, rowEngineVectorFreeCycle_);
-        duration = rowEngineReciprocalLatency_ + active;
+        duration = active + (context.chunkBegin == 0 ? rowEngineReciprocalLatency_ : 0);
         rowEngineVectorFreeCycle_ = start + duration;
     }
     const uint64_t delay = std::max<uint64_t>(1, start - now + duration);
     const uint64_t startTick = ceilMulDiv(
         start, rowEngineTimebaseTicksPerSecond_, rowEngineAcceleratorClockHz_);
-    if (stage == TensorRowEngineStage::Max) {
+    if (context.chunkBegin == 0 && stage == TensorRowEngineStage::Max) {
         statTensorMaxStartTick_->addData(startTick);
-    } else if (stage == TensorRowEngineStage::ExpSum) {
+    } else if (context.chunkBegin == 0 && stage == TensorRowEngineStage::ExpSum) {
         statTensorExpSumStartTick_->addData(startTick);
-    } else {
+    } else if (context.chunkBegin == 0) {
         statTensorNormalizeStartTick_->addData(startTick);
     }
     rowEngineSelfLink_->send(
         delay,
-        new TensorRowEngineEvent(key.first, key.second, contextIndex, stage));
+        new TensorRowEngineEvent(key.first, key.second, contextIndex, stage,
+                                 TensorRowEngineEventKind::ResourceDone,
+                                 context.pendingLocalTag));
 }
 
-void SFU::handleTensorRowEngineEvent(SST::Event* event)
+void SFU::advanceTensorRowChunk(const TensorWorkerKey& key, uint32_t contextIndex)
 {
-    auto* rowEvent = static_cast<TensorRowEngineEvent*>(event);
-    const TensorWorkerKey key(rowEvent->tag(), rowEvent->bandRow());
-    const uint32_t contextIndex = rowEvent->context();
-    const TensorRowEngineStage stage = rowEvent->stage();
-    delete rowEvent;
-
     auto workerIt = tensorWorkerOps_.find(key);
-    if (workerIt == tensorWorkerOps_.end() ||
-        contextIndex >= workerIt->second.contexts.size()) {
+    if (workerIt == tensorWorkerOps_.end() || contextIndex >= workerIt->second.contexts.size()) {
+        return;
+    }
+    TensorWorkerState::Context& context = workerIt->second.contexts[contextIndex];
+    context.chunkBegin += context.laneValues.size();
+    context.laneValues.clear();
+    if (context.chunkBegin < workerIt->second.dispatch.expectedCols) {
+        issueTensorLocalRead(key, contextIndex);
+        return;
+    }
+    if (context.stage == TensorRowEngineStage::Max) {
+        statTensorMaxDoneTick_->addData(getCurrentSimCycle());
+        if (workerIt->second.dispatch.value != 0.0) {
+            statAttentionScaleMaskDoneTick_->addData(getCurrentSimCycle());
+        }
+        beginTensorRowStage(key, contextIndex, TensorRowEngineStage::ExpSum);
+    } else if (context.stage == TensorRowEngineStage::ExpSum) {
+        statTensorExpSumDoneTick_->addData(getCurrentSimCycle());
+        TensorWorkerState& worker = workerIt->second;
+        if (worker.localTileMode) {
+            if (contextIndex >= attentionOnlineContexts_.size()) {
+                finishTensorWorker(key, false);
+                return;
+            }
+            AttentionOnlineRowContext& online = attentionOnlineContexts_[contextIndex];
+            if (!online.valid || online.jobId != worker.attentionJobId ||
+                online.globalRow != context.row) {
+                finishTensorWorker(key, false);
+                return;
+            }
+            const double mNew = std::max(online.m, static_cast<double>(context.rowMax));
+            const double alpha = std::isinf(online.m) && online.m < 0.0
+                ? 0.0 : std::exp(online.m - mNew);
+            const double beta = std::exp(context.rowMax - mNew);
+            const double lNew = online.l * alpha + context.rowSum * beta;
+            if (!(lNew > 0.0) || !std::isfinite(lNew)) {
+                finishTensorWorker(key, false);
+                return;
+            }
+            const bool finalKeyTile = worker.attentionKeyTile + 1 == worker.attentionKeyTiles;
+            const double normalization = finalKeyTile ? 1.0 / lNew : 1.0;
+            context.oldOutputScale = static_cast<float>(alpha * normalization);
+            context.tileWeightScale = static_cast<float>(beta * normalization);
+            online.m = mNew;
+            online.l = lNew;
+        }
+        beginTensorRowStage(key, contextIndex, TensorRowEngineStage::Normalize);
+    } else {
+        statTensorNormalizeDoneTick_->addData(getCurrentSimCycle());
+        statTensorComputeDoneTick_->addData(getCurrentSimCycle());
+        completeTensorRow(key, contextIndex);
+    }
+}
+
+void SFU::completeTensorRow(const TensorWorkerKey& key, uint32_t contextIndex)
+{
+    auto workerIt = tensorWorkerOps_.find(key);
+    if (workerIt == tensorWorkerOps_.end() || contextIndex >= workerIt->second.contexts.size()) {
         return;
     }
     TensorWorkerState& worker = workerIt->second;
-    TensorWorkerState::Context& context = worker.contexts[contextIndex];
-    if (!context.busy || context.values.empty()) {
-        finishTensorWorker(key, false);
-        return;
-    }
-
-    if (stage == TensorRowEngineStage::Max) {
-        statTensorMaxDoneTick_->addData(getCurrentSimCycle());
-        context.rowMax = *std::max_element(context.values.begin(), context.values.end());
-        scheduleTensorRowStage(key, contextIndex, TensorRowEngineStage::ExpSum);
-        return;
-    }
-    if (stage == TensorRowEngineStage::ExpSum) {
-        statTensorExpSumDoneTick_->addData(getCurrentSimCycle());
-        context.rowSum = 0.0;
-        for (float& value : context.values) {
-            value = std::exp(value - context.rowMax);
-            context.rowSum += value;
+    TensorWorkerState::Context& mutableContext = worker.contexts[contextIndex];
+    if (worker.localTileMode) {
+        const uint32_t resultIndex = mutableContext.row - worker.dispatch.row;
+        if (resultIndex >= worker.attentionResult.oldOutputScale.size()) {
+            finishTensorWorker(key, false);
+            return;
         }
-        scheduleTensorRowStage(key, contextIndex, TensorRowEngineStage::Normalize);
+        worker.attentionResult.oldOutputScale[resultIndex] = mutableContext.oldOutputScale;
+        mutableContext.busy = false;
+        mutableContext.laneValues.clear();
+        worker.rowsCompleted += 1;
+        statSoftmaxRows_->addData(1);
+        if (worker.rowsCompleted == worker.dispatch.expectedRows) {
+            finishTensorWorker(key, true);
+        } else {
+            issueTensorInputDma(key, contextIndex);
+        }
         return;
     }
-
-    if (context.rowSum == 0.0) {
-        finishTensorWorker(key, false);
-        return;
-    }
-    const float invSum = static_cast<float>(1.0 / context.rowSum);
-    for (float& value : context.values) {
-        value *= invSum;
-    }
-    statTensorNormalizeDoneTick_->addData(getCurrentSimCycle());
-    statTensorComputeDoneTick_->addData(getCurrentSimCycle());
-    std::vector<uint8_t> output(context.values.size() * sizeof(float));
-    std::memcpy(output.data(), context.values.data(), output.size());
-    const uint64_t outputAddr = tensorWorkerHostAddress(worker.dispatch, context.row, true);
-    globalMem_->dma_write_to_host(
+    const TensorWorkerState::Context& context = mutableContext;
+    const size_t rowBytes = static_cast<size_t>(workerIt->second.dispatch.expectedCols) * sizeof(float);
+    const uint64_t outputAddr = tensorWorkerHostAddress(
+        workerIt->second.dispatch, context.row, true);
+    globalMem_->dma_write_from_globalmem_to_host(
+        context.scratchAddr,
         outputAddr,
-        output.size(),
-        output,
+        rowBytes,
         [this, key, contextIndex](bool ok) {
             auto it = tensorWorkerOps_.find(key);
             if (it == tensorWorkerOps_.end() || contextIndex >= it->second.contexts.size()) {
@@ -2025,9 +2352,9 @@ void SFU::handleTensorRowEngineEvent(SST::Event* event)
             statTensorOutputDmaAckTick_->addData(getCurrentSimCycle());
             statSoftmaxRows_->addData(1);
             TensorWorkerState& worker = it->second;
-            TensorWorkerState::Context& context = worker.contexts[contextIndex];
-            context.busy = false;
-            context.values.clear();
+            TensorWorkerState::Context& callbackContext = worker.contexts[contextIndex];
+            callbackContext.busy = false;
+            callbackContext.laneValues.clear();
             worker.rowsCompleted += 1;
             if (worker.rowsCompleted == worker.dispatch.expectedRows) {
                 finishTensorWorker(key, true);
@@ -2037,6 +2364,91 @@ void SFU::handleTensorRowEngineEvent(SST::Event* event)
         });
 }
 
+void SFU::handleTensorRowEngineEvent(SST::Event* event)
+{
+    auto* rowEvent = static_cast<TensorRowEngineEvent*>(event);
+    const TensorWorkerKey key(rowEvent->tag(), rowEvent->bandRow());
+    const uint32_t contextIndex = rowEvent->context();
+    const TensorRowEngineStage stage = rowEvent->stage();
+    const TensorRowEngineEventKind kind = rowEvent->kind();
+    const uint64_t localTag = rowEvent->localTag();
+    delete rowEvent;
+
+    auto workerIt = tensorWorkerOps_.find(key);
+    if (workerIt == tensorWorkerOps_.end() ||
+        contextIndex >= workerIt->second.contexts.size()) {
+        return;
+    }
+    TensorWorkerState& worker = workerIt->second;
+    if (kind == TensorRowEngineEventKind::AttentionStart) {
+        if (worker.attentionFirstTileForJob) {
+            statAttentionRsqrtReadyTick_->addData(getCurrentSimCycle());
+        }
+        for (uint32_t index = 0; index < worker.contexts.size(); ++index) {
+            issueTensorInputDma(key, index);
+        }
+        return;
+    }
+    TensorWorkerState::Context& context = worker.contexts[contextIndex];
+    if (!context.busy || context.stage != stage || context.pendingLocalTag != localTag) {
+        return;
+    }
+    if (kind == TensorRowEngineEventKind::LocalReadRetry) {
+        issueTensorLocalRead(key, contextIndex);
+        return;
+    }
+    if (kind == TensorRowEngineEventKind::LocalWriteRetry) {
+        issueTensorLocalWrite(key, contextIndex);
+        return;
+    }
+    if (context.laneValues.empty()) {
+        finishTensorWorker(key, false);
+        return;
+    }
+
+    if (stage == TensorRowEngineStage::Max) {
+        if (worker.dispatch.value != 0.0) {
+            if (context.chunkBegin == 0) {
+                statAttentionScaleMaskStartTick_->addData(getCurrentSimCycle());
+            }
+            const bool causal = worker.dispatch.value < 0.0;
+            const float scale = static_cast<float>(std::abs(worker.dispatch.value));
+            uint64_t masked = 0;
+            for (uint32_t lane = 0; lane < context.laneValues.size(); ++lane) {
+                const uint32_t col = context.chunkBegin + lane;
+                context.laneValues[lane] *= scale;
+                if (causal && worker.attentionKeyBegin + col > context.row) {
+                    context.laneValues[lane] = -std::numeric_limits<float>::infinity();
+                    ++masked;
+                }
+            }
+            statAttentionScaledElements_->addData(context.laneValues.size());
+            statAttentionMaskedElements_->addData(masked);
+        }
+        context.rowMax = std::max(
+            context.rowMax,
+            *std::max_element(context.laneValues.begin(), context.laneValues.end()));
+        if (worker.dispatch.value != 0.0) {
+            issueTensorLocalWrite(key, contextIndex);
+        } else {
+            advanceTensorRowChunk(key, contextIndex);
+        }
+        return;
+    }
+    if (stage == TensorRowEngineStage::ExpSum) {
+        for (float& value : context.laneValues) {
+            value = std::exp(value - context.rowMax);
+            context.rowSum += value;
+        }
+        issueTensorLocalWrite(key, contextIndex);
+        return;
+    }
+    for (float& value : context.laneValues) {
+        value *= context.invSum;
+    }
+    issueTensorLocalWrite(key, contextIndex);
+}
+
 void SFU::finishTensorWorker(const TensorWorkerKey& key, bool ok)
 {
     auto workerIt = tensorWorkerOps_.find(key);
@@ -2044,7 +2456,26 @@ void SFU::finishTensorWorker(const TensorWorkerKey& key, bool ok)
         return;
     }
     ReductionTransportMessage completion = workerIt->second.dispatch;
+    const bool localTileMode = workerIt->second.localTileMode;
+    const bool finalAttentionTile = localTileMode &&
+        workerIt->second.attentionKeyTile + 1 == workerIt->second.attentionKeyTiles;
+    const uint64_t attentionJobId = workerIt->second.attentionJobId;
+    const AttentionTileResult attentionResult = workerIt->second.attentionResult;
+    std::function<void(bool, const AttentionTileResult&)> callback =
+        std::move(workerIt->second.localTileCallback);
     tensorWorkerOps_.erase(workerIt);
+    if (localTileMode) {
+        if (finalAttentionTile) {
+            for (AttentionOnlineRowContext& online : attentionOnlineContexts_) {
+                if (online.valid && online.jobId == attentionJobId) online.valid = false;
+            }
+        }
+        callback(ok, attentionResult);
+        if (!ok) {
+            statRetryEvents_->addData(1);
+        }
+        return;
+    }
     completion.kind = ReductionTransportMessageKind::TensorRowComplete;
     completion.sendCycle = getCurrentSimCycle();
     completion.value = ok ? 1.0 : 0.0;
@@ -2131,6 +2562,7 @@ bool SFU::startTensorRowEngineJob(uint64_t tag)
     }
     state.tensorRowsCompleted = 0;
     state.tensorDmaComplete = false;
+    state.tensorStarted = true;
     state.tensorCompletionSeen.assign(bands, 0);
     for (uint32_t band = 0; band < bands; ++band) {
         ReductionTransportMessage dispatch = {};
@@ -2139,6 +2571,7 @@ bool SFU::startTensorRowEngineJob(uint64_t tag)
         dispatch.tag = tag;
         dispatch.ownerCore = coreId_;
         dispatch.workerSlot = band % state.desc.worker_cores;
+        dispatch.workerCore = dispatch.workerSlot;
         dispatch.row = band * rowsPerBand;
         dispatch.expectedWorkers = state.desc.worker_cores;
         dispatch.expectedRows = std::min(rowsPerBand, state.desc.rows - dispatch.row);
@@ -2149,6 +2582,9 @@ bool SFU::startTensorRowEngineJob(uint64_t tag)
         dispatch.nodeStrideBytes = state.tensorParams.node_stride_bytes;
         dispatch.dataNodeMask = state.tensorParams.data_node_mask;
         dispatch.rowsPerBand = rowsPerBand;
+        dispatch.value = state.attentionMode
+            ? (state.attentionCausal ? -state.attentionScale : state.attentionScale)
+            : 0.0;
         statTensorBandDispatchTick_->addData(getCurrentSimCycle());
         if (!globalMem_->sendReductionMessage(dispatch.workerSlot, dispatch)) {
             return false;
@@ -2777,22 +3213,18 @@ bool SFU::normalizeTile(SoftmaxOpState* state)
 
 void SFU::bindGlobalMemory(GlobalMemoryAPI* globalMem)
 {
-    if (globalMem_ != nullptr && globalMem_ != globalMem) {
-        globalMem_->setReductionMessageHandler(GlobalMemoryAPI::ReductionMessageHandler{});
-    }
     globalMem_ = globalMem;
-    if (globalMem_ != nullptr) {
-        globalMem_->setReductionMessageHandler(
-            [this](const ReductionTransportMessage& message) {
-                handleReductionTransportMessage(message);
-            });
-    }
 }
 
 void SFU::setCoreInfo(uint32_t coreId, uint32_t activeWorkerCores)
 {
     coreId_ = coreId;
     activeWorkerCores_ = activeWorkerCores == 0 ? 1 : activeWorkerCores;
+}
+
+void SFU::receiveReductionMessage(const ReductionTransportMessage& message)
+{
+    handleReductionTransportMessage(message);
 }
 
 } // namespace Golem
