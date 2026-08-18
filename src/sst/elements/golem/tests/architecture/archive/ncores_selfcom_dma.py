@@ -84,10 +84,12 @@ _control_plane_defaults = {
     "GOLEM_REQUEST_SCHEDULER_ENABLE": True,
     "GOLEM_WORKER_COMMAND_PROCESSOR_ENABLE": False,
 }
+_manager_rocc_only = _env_flag("GOLEM_SFU_MANAGER_COORDINATOR", False)
 _enabled_control_plane = [
     name
     for name, default in _control_plane_defaults.items()
     if _env_flag(name, default)
+    and not (name == "GOLEM_GROUP_MANAGER_ENABLE" and _manager_rocc_only)
 ]
 if _enabled_control_plane:
     raise ValueError(

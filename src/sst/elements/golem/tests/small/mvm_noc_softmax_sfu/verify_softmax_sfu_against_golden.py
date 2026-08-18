@@ -72,10 +72,15 @@ def matmul(a, b, m: int, n: int, k: int, bias_enable: int, bias_value: float):
     return out
 
 
-def full_rowwise_softmax(logits, m: int, n: int):
+def full_rowwise_softmax(logits, m: int, n: int, attention_head_dim: int = 0, causal: bool = False):
+    if causal and attention_head_dim <= 0:
+        raise ValueError("causal mask requires a positive attention head dimension")
+    scale = 1.0 / math.sqrt(attention_head_dim) if attention_head_dim > 0 else 1.0
     ref = [[0.0 for _ in range(n)] for _ in range(m)]
     for r in range(m):
-        row = logits[r]
+        row = [float(value) * scale for value in logits[r]]
+        if causal:
+            row = [value if c <= r else -math.inf for c, value in enumerate(row)]
         max_v = max(row)
         exps = [math.exp(float(v) - max_v) for v in row]
         denom = sum(exps)
@@ -166,6 +171,17 @@ def main(argv=None):
     parser.add_argument("--atol", type=float, default=None)
     parser.add_argument("--rtol", type=float, default=None)
     parser.add_argument("--max-mismatches", type=int, default=8)
+    parser.add_argument(
+        "--attention-head-dim",
+        type=int,
+        default=int(os.getenv("GOLEM_SFU_ATTENTION_HEAD_DIM", "0")),
+    )
+    parser.add_argument(
+        "--causal",
+        type=int,
+        choices=[0, 1],
+        default=int(os.getenv("GOLEM_SFU_ATTENTION_CAUSAL", "0")),
+    )
     args = parser.parse_args(argv)
 
     dtype = normalize_dtype(args.dtype)
@@ -210,7 +226,9 @@ def main(argv=None):
         if not args.logits_file:
             parser.error("--logits-file is required when --reference=logits")
         logits = load_matrix(args.logits_file, args.m, args.n, "logits", dtype)
-        ref = full_rowwise_softmax(logits, args.m, args.n)
+        ref = full_rowwise_softmax(
+            logits, args.m, args.n, args.attention_head_dim, bool(args.causal)
+        )
         mismatches, max_abs = compare_matrices(
             dtype, c, ref, args.m, args.n, atol, rtol, args.max_mismatches
         )
@@ -231,7 +249,9 @@ def main(argv=None):
     a = load_matrix(args.a_file, args.m, args.k, "A", dtype)
     b = load_matrix(args.b_file, args.k, args.n, "B", dtype)
     logits = matmul(a, b, args.m, args.n, args.k, args.bias_enable, args.bias_value)
-    ref = full_rowwise_softmax(logits, args.m, args.n)
+    ref = full_rowwise_softmax(
+        logits, args.m, args.n, args.attention_head_dim, bool(args.causal)
+    )
     mismatches, max_abs = compare_matrices(
         dtype, c, ref, args.m, args.n, atol, rtol, args.max_mismatches
     )

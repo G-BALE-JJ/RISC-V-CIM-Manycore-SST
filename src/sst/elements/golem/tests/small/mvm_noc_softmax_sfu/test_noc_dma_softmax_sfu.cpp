@@ -4089,12 +4089,21 @@ int run_standalone_unified_job_softmax_for_core(int executor_core_id,
         read_i64_env_or_default("GOLEM_SFU_JOB_SOFTMAX_ROW_ENGINE", 0) != 0;
     const bool tensor_controller =
         read_i64_env_or_default("GOLEM_SFU_JOB_SOFTMAX_TENSOR_CONTROLLER", 0) != 0;
+    const int64_t attention_head_dim =
+        read_i64_env_or_default("GOLEM_SFU_ATTENTION_HEAD_DIM", 0);
+    const bool attention_causal =
+        read_i64_env_or_default("GOLEM_SFU_ATTENTION_CAUSAL", 0) != 0;
     const int total_bands = (cfg.m + staging_rows - 1) / staging_rows;
     if (!distributed_columns && band_core_count > total_bands) {
         band_core_count = total_bands;
     }
-    if (tensor_controller && requested_core_id != 0) {
-        return 0;
+    if (tensor_controller) {
+        const bool coordinator = GROUP_MANAGER_ENABLED
+            ? executor_core_id >= 0 && executor_core_id < TOTAL_GROUPS
+            : requested_core_id == 0;
+        if (!coordinator) {
+            return 0;
+        }
     }
     if (!tensor_controller && !distributed_columns && requested_core_id >= band_core_count) {
         return 0;
@@ -4274,6 +4283,8 @@ int run_standalone_unified_job_softmax_for_core(int executor_core_id,
             static_cast<uint32_t>(staging_rows),
             row_contexts,
             ACTIVE_GEMM_CORES,
+            static_cast<uint32_t>(attention_head_dim),
+            attention_causal,
             job_id,
             tag,
             &launch_timeline);

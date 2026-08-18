@@ -38,6 +38,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <queue>
 #include <unordered_map>
 #include <vector>
@@ -153,6 +154,12 @@ public:
         statAttentionManagerBandCompletionReceivedTick_ = registerStatistic<uint64_t>("attention_manager_band_completion_received_tick");
         statAttentionTensorCompleteTick_ = registerStatistic<uint64_t>("attention_tensor_complete_tick");
         statAttentionManagerWaitObservedTick_ = registerStatistic<uint64_t>("attention_manager_wait_observed_tick");
+        statAttentionWorkerDispatchAcceptTick_ = registerStatistic<uint64_t>("attention_worker_dispatch_accept_tick");
+        statAttentionWorkerQkTileCompleteTick_ = registerStatistic<uint64_t>("attention_worker_qk_tile_complete_tick");
+        statAttentionWorkerSoftmaxTileCompleteTick_ = registerStatistic<uint64_t>("attention_worker_softmax_tile_complete_tick");
+        statAttentionWorkerPvTileCompleteTick_ = registerStatistic<uint64_t>("attention_worker_pv_tile_complete_tick");
+        statAttentionWorkerOutputDmaAckTick_ = registerStatistic<uint64_t>("attention_worker_output_dma_ack_tick");
+        statAttentionPvMatrixBroadcasts_ = registerStatistic<uint64_t>("attention_pv_matrix_broadcasts");
         statAttentionQkArrayOps_ = registerStatistic<uint64_t>("attention_qk_array_ops");
         statAttentionPvArrayOps_ = registerStatistic<uint64_t>("attention_pv_array_ops");
         statAttentionSpHbmBytes_ = registerStatistic<uint64_t>("attention_sp_hbm_bytes");
@@ -205,6 +212,7 @@ public:
         outputOperandSize = params.find<uint64_t>("outputOperandSize", 4);
         attentionWindowOffset_ = params.find<uint64_t>("attention_window_offset", 0xC0000);
         attentionWindowBytes_ = params.find<uint64_t>("attention_window_bytes", 0x10000);
+        attentionPvMatrixBroadcast_ = params.find<bool>("attention_pv_matrix_broadcast", false);
 
         remoteTransferLength = defaultRemoteLength();
   
@@ -1615,6 +1623,7 @@ public:
                 state.index = 0;
                 programAttentionQkInput();
             } else {
+                statAttentionWorkerQkTileCompleteTick_->addData(getCurrentSimCycle());
                 beginAttentionSoftmax();
             }
             return;
@@ -1681,6 +1690,7 @@ public:
         if (!sfu->issueAttentionTile(request, [this](
                 bool ok, const AttentionTileResult& result) {
                 if (!attentionWorker_ || !ok) { finishAttentionWorker(false); return; }
+                statAttentionWorkerSoftmaxTileCompleteTick_->addData(getCurrentSimCycle());
                 attentionWorker_->outputScales.assign(
                     result.oldOutputScale.begin(),
                     result.oldOutputScale.begin() + result.rows);
@@ -1711,6 +1721,27 @@ public:
                             v[key * callbackState.dispatch.headDim +
                               callbackState.panel * 16 + dim];
                     }
+                }
+                if (attentionPvMatrixBroadcast_) {
+                    std::vector<uint32_t> arrayIDs(attentionQueryRows(callbackState));
+                    std::iota(arrayIDs.begin(), arrayIDs.end(), 0);
+                    const uint64_t tag = attentionTransferTag();
+                    if (!array->programMatrixGroupAsync(
+                            arrayIDs, callbackState.arrayPayload, sizeof(float), tag,
+                            [this, tag](bool programOk, uint64_t callbackTag) {
+                                if (!attentionWorker_ || !programOk || callbackTag != tag) {
+                                    finishAttentionWorker(false); return;
+                                }
+                                attentionWorker_->phase =
+                                    AttentionWorkerPhase::PvProgramInputs;
+                                attentionWorker_->index = 0;
+                                programAttentionPvInput();
+                            })) {
+                        finishAttentionWorker(false);
+                    } else {
+                        statAttentionPvMatrixBroadcasts_->addData(1);
+                    }
+                    return;
                 }
                 callbackState.index = 0;
                 const auto programMatrix = [this](auto&& self) -> void {
@@ -1829,6 +1860,7 @@ public:
             if (++state.panel < attentionDimensionPanels(state)) {
                 beginAttentionPvPanel();
             } else {
+                statAttentionWorkerPvTileCompleteTick_->addData(getCurrentSimCycle());
                 const uint32_t keyTiles = attentionKeyTilesForQueryBlock(state);
                 if (++state.keyTile < keyTiles) {
                     loadAttentionKeyTile();
@@ -1843,6 +1875,7 @@ public:
                             state.dispatch.queryBlockRows * state.dispatch.headDim * sizeof(float),
                     blockBytes, [this](bool ok) {
                         if (!attentionWorker_ || !ok) { finishAttentionWorker(false); return; }
+                        statAttentionWorkerOutputDmaAckTick_->addData(getCurrentSimCycle());
                         AttentionWorkerState& state = *attentionWorker_;
                         const uint32_t queryBlocks = attentionQueryBlocks(state);
                         if (++state.queryBlock < queryBlocks) beginAttentionQueryBlock();
@@ -1910,15 +1943,19 @@ public:
         const bool e4Shape = message.expectedRows == 128 && message.expectedCols == 2048 &&
             message.rowsPerBand == 512 && message.headDim == 128 &&
             message.nodeStrideBytes != 0;
+        const bool e5Shape = message.expectedRows == 256 && message.expectedCols == 4096 &&
+            message.rowsPerBand == 1024 && message.headDim == 128 &&
+            message.nodeStrideBytes != 0;
         const uint64_t requiredWindow = d3Shape ? ATTENTION_D3_WINDOW_BYTES :
             (d1Shape ? ATTENTION_D1_WINDOW_BYTES :
-             ((e3Shape || e4Shape) ? ATTENTION_E3_WINDOW_BYTES :
+             ((e3Shape || e4Shape || e5Shape) ? ATTENTION_E3_WINDOW_BYTES :
               (e1Shape ? ATTENTION_E1_WINDOW_BYTES : ATTENTION_C1_WINDOW_BYTES)));
         if (attentionWorker_ || globalMem == nullptr || array == nullptr || sfu == nullptr ||
             message.workerCore != coreID ||
-            (!c1Shape && !d1Shape && !d3Shape && !e1Shape && !e3Shape && !e4Shape) ||
-            ((!(e3Shape || e4Shape) && message.headDim != 64) ||
-             ((e3Shape || e4Shape) && message.headDim != 128)) ||
+            (!c1Shape && !d1Shape && !d3Shape && !e1Shape && !e3Shape && !e4Shape &&
+             !e5Shape) ||
+            ((!(e3Shape || e4Shape || e5Shape) && message.headDim != 64) ||
+             ((e3Shape || e4Shape || e5Shape) && message.headDim != 128)) ||
             message.queryBlockRows != 16 || message.keyBlockRows != 32 ||
             (message.flags & ~GOLEM_ATTENTION_FLAG_CAUSAL) != 0 ||
             numArrays < 16 || arrayInputSize != static_cast<int>(message.headDim) ||
@@ -1933,13 +1970,14 @@ public:
         attentionWorker_ = std::make_unique<AttentionWorkerState>();
         AttentionWorkerState& state = *attentionWorker_;
         state.dispatch = message;
+        statAttentionWorkerDispatchAcceptTick_->addData(getCurrentSimCycle());
         state.phase = AttentionWorkerPhase::LoadingKv;
         const uint64_t base = globalMem->getBaseAddr() + attentionWindowOffset_;
         state.qLocal = base;
         const uint64_t qTileBytes = static_cast<uint64_t>(message.queryBlockRows) *
             message.headDim * sizeof(float);
         state.kLocal = state.qLocal + qTileBytes;
-        const uint64_t kvBytes = (e1Shape || e3Shape || e4Shape) ?
+        const uint64_t kvBytes = (e1Shape || e3Shape || e4Shape || e5Shape) ?
             static_cast<uint64_t>(message.keyBlockRows) * message.headDim * sizeof(float) :
             static_cast<uint64_t>(message.expectedCols) * message.headDim * sizeof(float);
         state.vLocal = state.kLocal + kvBytes;
@@ -1947,7 +1985,7 @@ public:
         state.oLocal = state.spLocal + static_cast<uint64_t>(message.queryBlockRows) *
             message.keyBlockRows * sizeof(float);
         attentionArrayPending_.assign(numArrays, 0);
-        if (e1Shape || e3Shape || e4Shape) {
+        if (e1Shape || e3Shape || e4Shape || e5Shape) {
             beginAttentionQueryBlock();
             return;
         }
@@ -2071,19 +2109,27 @@ public:
             desc.tensor_manager_count == 4 &&
             desc.tensor_manager_slot < desc.tensor_manager_count &&
             desc.tensor_manager_slot == coreID;
+        const bool e5Shape = desc.queries == 1024 && desc.keys == 4096 &&
+            desc.head_dim == 128 && desc.worker_count == 4 &&
+            desc.query_row_begin % 1024 == 0 && desc.query_row_begin < 4096 &&
+            desc.kv_rows_per_node == 1024 && desc.kv_node_stride_bytes != 0 &&
+            desc.flags == 0 && desc.tensor_root_core == 0 &&
+            desc.tensor_manager_count == 4 &&
+            desc.tensor_manager_slot < desc.tensor_manager_count &&
+            desc.tensor_manager_slot == coreID;
         const uint64_t requiredWindow = d3Shape ? ATTENTION_D3_WINDOW_BYTES :
             (d1Shape ? ATTENTION_D1_WINDOW_BYTES :
-             ((e3Shape || e4Shape) ? ATTENTION_E3_WINDOW_BYTES :
+             ((e3Shape || e4Shape || e5Shape) ? ATTENTION_E3_WINDOW_BYTES :
               (e1Shape ? ATTENTION_E1_WINDOW_BYTES : ATTENTION_C1_WINDOW_BYTES)));
         return desc.magic == GOLEM_ATTENTION_DESC_MAGIC &&
             desc.version == GOLEM_ATTENTION_DESC_VERSION &&
             desc.size_bytes == sizeof(GolemAttentionDescV1) &&
-            (c1Shape || d1Shape || d3Shape || e1Shape || e3Shape || e4Shape) &&
-            ((!(e3Shape || e4Shape) && desc.head_dim == 64) ||
-             ((e3Shape || e4Shape) && desc.head_dim == 128)) &&
+            (c1Shape || d1Shape || d3Shape || e1Shape || e3Shape || e4Shape || e5Shape) &&
+            ((!(e3Shape || e4Shape || e5Shape) && desc.head_dim == 64) ||
+             ((e3Shape || e4Shape || e5Shape) && desc.head_dim == 128)) &&
             desc.query_block_rows == 16 && desc.key_block_rows == 32 &&
-            (((e1Shape || e3Shape || e4Shape) && desc.worker_count == 4) ||
-             (!e1Shape && !e3Shape && !e4Shape && desc.worker_count == 1)) &&
+            (((e1Shape || e3Shape || e4Shape || e5Shape) && desc.worker_count == 4) ||
+             (!e1Shape && !e3Shape && !e4Shape && !e5Shape && desc.worker_count == 1)) &&
             (desc.flags & ~GOLEM_ATTENTION_FLAG_CAUSAL) == 0 &&
             desc.q_addr != 0 && desc.k_addr != 0 && desc.v_addr != 0 &&
             desc.output_addr != 0 && desc.topology_gm_addr != 0 &&
@@ -3837,6 +3883,7 @@ private:
     uint64_t coreID;
     uint64_t attentionWindowOffset_;
     uint64_t attentionWindowBytes_;
+    bool attentionPvMatrixBroadcast_;
 
   
     // Tile Parameters
@@ -3937,6 +3984,12 @@ private:
     Statistics::Statistic<uint64_t>* statAttentionManagerBandCompletionReceivedTick_;
     Statistics::Statistic<uint64_t>* statAttentionTensorCompleteTick_;
     Statistics::Statistic<uint64_t>* statAttentionManagerWaitObservedTick_;
+    Statistics::Statistic<uint64_t>* statAttentionWorkerDispatchAcceptTick_;
+    Statistics::Statistic<uint64_t>* statAttentionWorkerQkTileCompleteTick_;
+    Statistics::Statistic<uint64_t>* statAttentionWorkerSoftmaxTileCompleteTick_;
+    Statistics::Statistic<uint64_t>* statAttentionWorkerPvTileCompleteTick_;
+    Statistics::Statistic<uint64_t>* statAttentionWorkerOutputDmaAckTick_;
+    Statistics::Statistic<uint64_t>* statAttentionPvMatrixBroadcasts_;
     Statistics::Statistic<uint64_t>* statAttentionQkArrayOps_;
     Statistics::Statistic<uint64_t>* statAttentionPvArrayOps_;
     Statistics::Statistic<uint64_t>* statAttentionSpHbmBytes_;

@@ -10,6 +10,8 @@ static constexpr uint32_t GOLEM_ROCC_FUNC7_SFU_PRIMITIVE_BATCH = 0x1b;
 static constexpr uint32_t GOLEM_ROCC_FUNC7_SFU_PRIMITIVE_BATCH_WAIT = 0x1c;
 static constexpr uint32_t GOLEM_ROCC_FUNC7_SFU_JOB = 0x1d;
 static constexpr uint32_t GOLEM_ROCC_FUNC7_REMOTE_STORE_WAIT = 0x1e;
+static constexpr uint32_t GOLEM_ROCC_FUNC7_TENSOR_MANAGER_JOB = 0x1f;
+static constexpr uint32_t GOLEM_ROCC_FUNC7_TENSOR_MANAGER_WAIT = 0x20;
 
 static inline void remote_store_wait(uint64_t local_gm_addr, uint64_t host_addr) {
     asm volatile(
@@ -83,4 +85,22 @@ static inline void sfu_job(uint64_t desc_gm_addr, uint64_t tag) {
 
 static inline uint64_t sfu_job_wait(uint64_t tag) {
     return sfu_wait(tag);
+}
+
+static inline void tensor_manager_job(uint64_t desc_gm_addr, uint64_t tag) {
+    asm volatile(
+        ".insn r 0x0b, 7, %2, x0, %0, %1"
+        :
+        : "r"(desc_gm_addr), "r"(tag), "i"(GOLEM_ROCC_FUNC7_TENSOR_MANAGER_JOB)
+        : "memory");
+}
+
+static inline uint64_t tensor_manager_wait(uint64_t tag) {
+    uint64_t status;
+    asm volatile(
+        ".insn r 0x0b, 7, %2, %0, %1, x0"
+        : "=r"(status)
+        : "r"(tag), "i"(GOLEM_ROCC_FUNC7_TENSOR_MANAGER_WAIT)
+        : "memory");
+    return status;
 }

@@ -95,7 +95,15 @@ constexpr uint32_t SFU_JOB_FLAG_ROW_ENGINE_MODEL = 0x4u;
 constexpr uint32_t SFU_JOB_FLAG_TENSOR_ROW_ENGINE = 0x8u;
 constexpr uint32_t SFU_SOFTMAX_JOB_PARAMS_MAGIC = 0x53465531u;
 constexpr uint16_t SFU_SOFTMAX_JOB_PARAMS_VERSION = 1u;
+constexpr uint16_t SFU_SOFTMAX_JOB_PARAMS_VERSION_ATTENTION = 2u;
+constexpr uint16_t SFU_SOFTMAX_JOB_PARAMS_VERSION_MANAGER = 3u;
+constexpr uint32_t SFU_SOFTMAX_PARAMS_FLAG_ATTENTION = 0x1u;
+constexpr uint32_t SFU_SOFTMAX_PARAMS_FLAG_CAUSAL = 0x2u;
 constexpr uint32_t SFU_SOFTMAX_HBM_LAYOUT_BAND_STRIPED = 1u;
+constexpr uint32_t SFU_SOFTMAX_MAPPING_EXPLICIT_TOPOLOGY = 2u;
+constexpr uint32_t SFU_WORKER_TOPOLOGY_MAP_MAGIC = 0x574d4150u;
+constexpr uint16_t SFU_WORKER_TOPOLOGY_MAP_VERSION = 1u;
+constexpr uint32_t SFU_WORKER_TOPOLOGY_MAX_WORKERS = 16u;
 
 struct SFUSoftmaxJobParamsV1 {
     uint32_t magic;
@@ -116,6 +124,18 @@ struct SFUSoftmaxJobParamsV1 {
 
 static_assert(sizeof(SFUSoftmaxJobParamsV1) == 64,
               "Tensor softmax parameter ABI must match golem.SFU");
+
+struct SFUWorkerTopologyMapV1 {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t size_bytes;
+    uint32_t worker_count;
+    uint32_t reserved0;
+    uint32_t worker_core_ids[SFU_WORKER_TOPOLOGY_MAX_WORKERS];
+};
+
+static_assert(sizeof(SFUWorkerTopologyMapV1) == 80,
+              "Worker topology map ABI must match golem.SFU");
 
 struct SFUJobDesc {
     uint64_t job_id;
@@ -201,6 +221,8 @@ golem_status_t golemRunTensorSoftmaxSfuJob(
     uint32_t rows_per_band,
     uint32_t row_contexts,
     uint32_t physical_engines,
+    uint32_t attention_head_dim,
+    bool attention_causal,
     uint64_t job_id,
     uint64_t tag,
     golem_softmax_launch_timeline_t* timeline);

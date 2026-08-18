@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 
 #ifndef GOLEM_ARRAY_INPUT_SIZE
@@ -653,8 +654,12 @@ constexpr uint64_t LOCAL_DATA_BASE = 0x2000;
 constexpr uint64_t LOCAL_ALIGN = 0x100;
 constexpr uint64_t LOCAL_MAT_BYTES_ALIGNED = align_up_constexpr(GEMM_BLOCK_MAT_BYTES, LOCAL_ALIGN);
 constexpr uint64_t LOCAL_VEC_BYTES_ALIGNED = align_up_constexpr(GEMM_BLOCK_VEC_PACK_BYTES, LOCAL_ALIGN);
-constexpr uint64_t LOCAL_OUT_SCRATCH_BYTES_ALIGNED = align_up_constexpr(OUT_VEC_BYTES, LOCAL_ALIGN);
 constexpr uint64_t LOCAL_OUT_TILE_BYTES_ALIGNED = align_up_constexpr(GEMM_BLOCK_OUT_TILE_BYTES, LOCAL_ALIGN);
+constexpr uint64_t LOCAL_OUT_SCRATCH_BYTES_ALIGNED =
+    align_up_constexpr(std::max(OUT_VEC_BYTES, GEMM_BLOCK_OUT_TILE_BYTES), LOCAL_ALIGN);
+constexpr uint64_t LOCAL_PARTIAL_TILE_COUNT =
+    static_cast<uint64_t>(std::min(A_REUSE_N_TILES, GEMM_N_TILES)) *
+    static_cast<uint64_t>(std::min(B_REUSE_M_TILES, GEMM_M_TILES));
 
 constexpr LocalLayout LOCAL_LAYOUT = {
     .tmp = LOCAL_TMP_OFFSET,
@@ -696,7 +701,8 @@ static_assert(DATA_MEMORY_NODE_COUNT > 0, "DATA_MEMORY_NODE_COUNT must be positi
 static_assert(GEMM_BIAS_STRIDE_MM < MEM_NODE_SIZE, "bias vector region exceeds memory node size");
 static_assert(GEMM_DATA_REGION_END <= OFF_GEMM_BIAS_BASE, "GEMM HBM data layout exceeds per-node memory size");
 static_assert(
-    LOCAL_LAYOUT.accum + LOCAL_OUT_TILE_BYTES_ALIGNED < (GOLEM_GLOBAL_STRIDE_BYTES - 0x40),
+    LOCAL_LAYOUT.accum + LOCAL_PARTIAL_TILE_COUNT * LOCAL_OUT_TILE_BYTES_ALIGNED <
+        (GOLEM_GLOBAL_STRIDE_BYTES - 0x40),
     "本地 GM 布局接近/覆盖 DMA flag 尾部区域，请调整 LOCAL_DATA_BASE/对齐策略"
 );
 

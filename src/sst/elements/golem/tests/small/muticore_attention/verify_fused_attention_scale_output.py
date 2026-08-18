@@ -9,14 +9,35 @@ from pathlib import Path
 import attention_case
 
 
+def compute_attention_blocked(
+    q, k, v, queries, keys, head_dim, query_block_rows=64
+):
+    """Compute a bounded-memory NumPy reference for scale-point verification."""
+    import numpy as np
+
+    if query_block_rows <= 0:
+        raise ValueError("query_block_rows must be positive")
+    q_matrix = np.asarray(q, dtype=np.float64).reshape(queries, head_dim)
+    k_matrix = np.asarray(k, dtype=np.float64).reshape(keys, head_dim)
+    v_matrix = np.asarray(v, dtype=np.float64).reshape(keys, head_dim)
+    scale = 1.0 / math.sqrt(head_dim)
+    output = []
+    for begin in range(0, queries, query_block_rows):
+        scores = q_matrix[begin:begin + query_block_rows] @ k_matrix.T
+        scores *= scale
+        scores -= np.max(scores, axis=1, keepdims=True)
+        np.exp(scores, out=scores)
+        scores /= np.sum(scores, axis=1, keepdims=True)
+        output.extend((scores @ v_matrix).ravel().tolist())
+    return output
+
+
 def verify(q_file, k_file, v_file, hbm_dir, output_offset,
            queries, keys, head_dim, band_rows):
     q = attention_case._read_f32(q_file, queries * head_dim)
     k = attention_case._read_f32(k_file, keys * head_dim)
     v = attention_case._read_f32(v_file, keys * head_dim)
-    expected = attention_case.compute_attention(
-        q, k, v, queries, keys, head_dim, False
-    )
+    expected = compute_attention_blocked(q, k, v, queries, keys, head_dim)
     actual = []
     band_values = band_rows * head_dim
     for node in range(1, 5):

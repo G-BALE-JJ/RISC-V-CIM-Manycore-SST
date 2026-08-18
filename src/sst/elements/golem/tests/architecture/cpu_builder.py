@@ -52,6 +52,12 @@ branch_arith_cycles = int(os.getenv("VANADIS_BRANCH_ARITH_CYCLES", 2))
 
 cpu_clock = os.getenv("VANADIS_CPU_CLOCK", "2.3GHz")
 gm_trans_latency = os.getenv("GOLEM_GM_TRANS_LATENCY", "30ns")
+local_gm_base_latency_cycles = int(os.getenv("GOLEM_LOCAL_GM_BASE_LATENCY_CYCLES", "1"))
+local_gm_bytes_per_cycle = int(os.getenv("GOLEM_LOCAL_GM_BYTES_PER_CYCLE", "64"))
+local_gm_read_ports = int(os.getenv("GOLEM_LOCAL_GM_READ_PORTS", "1"))
+local_gm_write_ports = int(os.getenv("GOLEM_LOCAL_GM_WRITE_PORTS", "1"))
+local_gm_queue_depth = int(os.getenv("GOLEM_LOCAL_GM_QUEUE_DEPTH", "32"))
+local_gm_max_request_bytes = int(os.getenv("GOLEM_LOCAL_GM_MAX_REQUEST_BYTES", "4096"))
 
 
 def _parse_frequency_hz(freq_str: str) -> float:
@@ -442,6 +448,11 @@ roccarrayParams = {
     "latency_remote_ld": 10,
     "enable_async_array_load": int(os.getenv("GOLEM_ENABLE_ASYNC_ARRAY_LOAD", "1")),
     "workerCommandProcessorEnable": worker_command_processor_enable,
+    "attention_window_offset": int(os.getenv("GOLEM_ATTENTION_WINDOW_OFFSET", "0xC0000"), 0),
+    "attention_window_bytes": int(os.getenv("GOLEM_ATTENTION_WINDOW_BYTES", "0x10000"), 0),
+    "attention_pv_matrix_broadcast": int(
+        os.getenv("GOLEM_ATTENTION_PV_MATRIX_BROADCAST", "0")
+    ),
 }
 
 arrayParams = {
@@ -701,6 +712,13 @@ class CPU_Builder:
                 "dma_read_max_retries": gm_dma_max_retries,
                 "dma_burst_bytes": gm_dma_burst_bytes,
                 "globalMemTransLatency": gm_trans_latency,
+                "local_access_clock": cpu_clock,
+                "local_access_base_latency_cycles": local_gm_base_latency_cycles,
+                "local_access_bytes_per_cycle": local_gm_bytes_per_cycle,
+                "local_access_read_ports": local_gm_read_ports,
+                "local_access_write_ports": local_gm_write_ports,
+                "local_access_queue_depth": local_gm_queue_depth,
+                "local_access_max_request_bytes": local_gm_max_request_bytes,
                 "dma_retry_tick_cpu_cycles": gm_retry_tick_cpu_cycles,
                 "dma_progress_heartbeat": progress_heartbeat,
                 "dma_progress_interval_ticks": gm_progress_interval_ticks,

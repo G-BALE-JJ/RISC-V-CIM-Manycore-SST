@@ -125,7 +125,7 @@ class SfuSoftmaxRowEngineTest(unittest.TestCase):
         self.assertIn("static_assert(sizeof(SFUSoftmaxJobParamsV1) == 64", self.header)
         self.assertIn("startTensorRowEngineJob", self.header)
         self.assertIn("dma_read_from_host_to_globalmem", self.source)
-        self.assertIn("dma_write_to_host", self.source)
+        self.assertIn("dma_write_from_globalmem_to_host", self.source)
         self.assertIn(".reserved0 = rows_per_band", self.runtime)
         self.assertIn("worker.nextRow++", self.source)
         self.assertIn("TensorRowDispatch", self.global_memory)
@@ -162,14 +162,14 @@ class SfuSoftmaxRowEngineTest(unittest.TestCase):
         self.assertNotIn("std::exp", dispatch.group(0))
         self.assertNotIn("dma_write_to_host", dispatch.group(0))
 
-        event_handler = re.search(
-            r"void SFU::handleTensorRowEngineEvent.*?\n\}(?=\n\nvoid SFU::)",
+        stage_advance = re.search(
+            r"void SFU::advanceTensorRowChunk.*?\n\}(?=\n\nvoid SFU::)",
             self.source,
             re.S,
         )
-        self.assertIsNotNone(event_handler)
-        normalize = event_handler.group(0).find("TensorRowEngineStage::Normalize")
-        output_dma = event_handler.group(0).find("dma_write_to_host")
+        self.assertIsNotNone(stage_advance)
+        normalize = stage_advance.group(0).find("TensorRowEngineStage::Normalize")
+        output_dma = stage_advance.group(0).find("completeTensorRow")
         self.assertGreaterEqual(normalize, 0)
         self.assertGreater(output_dma, normalize)
 
@@ -177,6 +177,60 @@ class SfuSoftmaxRowEngineTest(unittest.TestCase):
         self.assertNotIn("constexpr uint32_t rowsPerContext = 16", self.source)
         self.assertIn("context.scratchAddr = worker.scratchAddr + contextIndex * rowBytes", self.source)
         self.assertIn("message.expectedRows, rowEngineContexts_", self.source)
+
+    def test_tensor_context_uses_bounded_lane_state_not_a_full_row(self):
+        context = re.search(
+            r"struct TensorWorkerState \{.*?struct Context \{(?P<body>.*?)\n        \};",
+            self.header,
+            re.S,
+        )
+        self.assertIsNotNone(context)
+        body = context.group("body")
+        self.assertNotIn("std::vector<float> values", body)
+        self.assertIn("std::vector<float> laneValues", body)
+        self.assertIn("TensorRowEngineStage stage", body)
+        self.assertIn("uint32_t chunkBegin", body)
+        self.assertIn("uint64_t pendingLocalTag", body)
+        self.assertIn("laneValues.reserve(rowEngineVectorLanes_)", self.source)
+
+    def test_tensor_stages_use_async_local_memory_and_address_output_dma(self):
+        self.assertIn("localReadAsync", self.source)
+        self.assertIn("localWriteAsync", self.source)
+        self.assertIn("LocalMemoryClient::SFU", self.source)
+        self.assertIn("dma_write_from_globalmem_to_host", self.global_memory)
+        self.assertIn("dma_write_from_globalmem_to_host", self.source)
+
+        input_dma = re.search(
+            r"void SFU::issueTensorInputDma.*?\n\}(?=\n\nvoid SFU::)",
+            self.source,
+            re.S,
+        )
+        self.assertIsNotNone(input_dma)
+        self.assertNotIn("rd_from_globalmem", input_dma.group(0))
+        self.assertNotIn("values.resize", input_dma.group(0))
+
+        event_handler = re.search(
+            r"void SFU::handleTensorRowEngineEvent.*?\n\}(?=\n\nvoid SFU::)",
+            self.source,
+            re.S,
+        )
+        self.assertIsNotNone(event_handler)
+        self.assertNotIn("context.values", event_handler.group(0))
+        self.assertNotIn("std::vector<uint8_t> output", event_handler.group(0))
+
+    def test_tensor_local_memory_statistics_cover_each_in_place_pass(self):
+        self.assertIn("GOLEM_TENSOR_LOCAL_STATS", self.source)
+        for statistic in [
+            "sfu_tensor_max_local_read_bytes",
+            "sfu_tensor_max_local_write_bytes",
+            "sfu_tensor_exp_sum_local_read_bytes",
+            "sfu_tensor_exp_sum_local_write_bytes",
+            "sfu_tensor_normalize_local_read_bytes",
+            "sfu_tensor_normalize_local_write_bytes",
+            "sfu_tensor_lane_buffer_high_water",
+            "sfu_tensor_local_retry_events",
+        ]:
+            self.assertIn(statistic, self.source)
 
     def test_tensor_completion_is_unique_and_matches_the_dispatched_band(self):
         self.assertIn("std::vector<uint8_t> tensorCompletionSeen", self.header)

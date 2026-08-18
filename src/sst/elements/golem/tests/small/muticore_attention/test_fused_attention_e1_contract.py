@@ -4,7 +4,13 @@ import pathlib
 import subprocess
 import unittest
 
-from verify_fused_attention_scale_stats import ticks_to_cycles
+import attention_case
+import verify_fused_attention_scale_output
+from verify_fused_attention_scale_stats import (
+    PROFILES,
+    summarize_worker_critical_path,
+    ticks_to_cycles,
+)
 
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -28,6 +34,18 @@ class FusedAttentionE1ContractTests(unittest.TestCase):
         ).read_text()
         cls.globalmemory = (
             REPO_ROOT / "src/sst/elements/golem/globalmemory/globalmemory.h"
+        ).read_text()
+        cls.compute_array = (
+            REPO_ROOT / "src/sst/elements/golem/array/computeArray.h"
+        ).read_text()
+        cls.mvm_array = (
+            REPO_ROOT / "src/sst/elements/golem/array/mvmComputeArray.h"
+        ).read_text()
+        cls.crosssim_array = (
+            REPO_ROOT / "src/sst/elements/golem/array/crossSimComputeArray.h"
+        ).read_text()
+        cls.cpu_builder = (
+            REPO_ROOT / "src/sst/elements/golem/tests/architecture/cpu_builder.py"
         ).read_text()
         cls.stats_verifier = (
             HERE / "verify_fused_attention_scale_stats.py"
@@ -140,6 +158,66 @@ class FusedAttentionE1ContractTests(unittest.TestCase):
         self.assertIn('"rows": 8192', self.stats_verifier)
         self.assertIn('"scaled": 262144', self.stats_verifier)
 
+    def test_e5_runner_selects_s4096_d128_with_expensive_run_gate(self):
+        dry_run = subprocess.run(
+            ["bash", str(RUNNER), "--scale-point", "e5", "--dry-run"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(dry_run.returncode, 0, dry_run.stderr)
+        self.assertIn("fused_attention_e5_s4096_d128", dry_run.stdout)
+        self.assertIn("--queries 4096 --keys 4096 --head-dim 128", dry_run.stdout)
+        self.assertIn("--band-rows 1024", dry_run.stdout)
+        self.assertIn("scale-e5", dry_run.stdout)
+        self.assertIn("timeout 28800", dry_run.stdout)
+
+        blocked = subprocess.run(
+            ["bash", str(RUNNER), "--scale-point", "e5"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(blocked.returncode, 2)
+        self.assertIn("--allow-expensive", blocked.stderr)
+
+    def test_e5_rocc_accepts_bounded_s4096_worker_and_manager_shapes(self):
+        self.assertIn(
+            "message.expectedRows == 256 && message.expectedCols == 4096", self.rocc
+        )
+        self.assertIn("desc.queries == 1024 && desc.keys == 4096", self.rocc)
+        self.assertIn("desc.kv_rows_per_node == 1024", self.rocc)
+        self.assertIn("ATTENTION_E3_WINDOW_BYTES", self.rocc)
+
+    def test_e5_stats_profile_has_exact_per_worker_activity(self):
+        self.assertEqual(PROFILES["e5"], {
+            "qk": 65536,
+            "pv": 262144,
+            "jobs": 2048,
+            "qblocks": 16,
+            "rows": 32768,
+            "scaled": 1048576,
+        })
+
+    def test_scale_output_blocked_reference_matches_scalar_attention(self):
+        queries, keys, head_dim = 5, 7, 4
+        q = [((index * 5) % 17 - 8) / 16.0
+             for index in range(queries * head_dim)]
+        k = [((index * 7) % 19 - 9) / 16.0
+             for index in range(keys * head_dim)]
+        v = [((index * 11) % 23 - 11) / 16.0
+             for index in range(keys * head_dim)]
+
+        scalar = attention_case.compute_attention(
+            q, k, v, queries, keys, head_dim, False
+        )
+        blocked = verify_fused_attention_scale_output.compute_attention_blocked(
+            q, k, v, queries, keys, head_dim, query_block_rows=2
+        )
+        self.assertEqual(len(blocked), len(scalar))
+        for got, want in zip(blocked, scalar):
+            self.assertAlmostEqual(got, want, places=12)
+
     def test_scale_descriptor_names_root_and_manager_slot(self):
         self.assertIn("tensor_root_core", self.runtime)
         self.assertIn("tensor_manager_slot", self.runtime)
@@ -163,6 +241,11 @@ class FusedAttentionE1ContractTests(unittest.TestCase):
             "attention_manager_band_completion_received_tick",
             "attention_tensor_complete_tick",
             "attention_manager_wait_observed_tick",
+            "attention_worker_dispatch_accept_tick",
+            "attention_worker_qk_tile_complete_tick",
+            "attention_worker_softmax_tile_complete_tick",
+            "attention_worker_pv_tile_complete_tick",
+            "attention_worker_output_dma_ack_tick",
         ):
             self.assertIn(statistic, self.rocc)
             self.assertIn(statistic, self.rocc_float)
@@ -170,6 +253,7 @@ class FusedAttentionE1ContractTests(unittest.TestCase):
             self.assertIn(statistic, self.stats_verifier)
         self.assertIn("accelerator_completion_cycles", self.stats_verifier)
         self.assertIn("wait_return_cycles", self.stats_verifier)
+        self.assertIn("system_frontier", self.stats_verifier)
         self.assertIn("attention_lifecycle.json", RUNNER.read_text())
 
     def test_lifecycle_ticks_are_converted_to_accelerator_cycles(self):
@@ -181,6 +265,89 @@ class FusedAttentionE1ContractTests(unittest.TestCase):
         )
         self.assertEqual(dry_run.returncode, 0, dry_run.stderr)
         self.assertIn("--accelerator-clock 1.0GHz", dry_run.stdout)
+
+    def test_worker_critical_path_uses_one_slowest_worker(self):
+        observed = {
+            ("core4:rocc", "attention_worker_dispatch_accept_tick"): 105,
+            ("core5:rocc", "attention_worker_dispatch_accept_tick"): 110,
+            ("core5:rocc", "attention_worker_qk_tile_complete_tick"): 370,
+            ("core5:rocc", "attention_worker_softmax_tile_complete_tick"): 400,
+            ("core5:rocc", "attention_worker_pv_tile_complete_tick"): 470,
+        }
+        minima = {
+            ("core5:rocc", "attention_worker_qk_tile_complete_tick"): 150,
+        }
+        maxima = {
+            ("core4:rocc", "attention_worker_qk_tile_complete_tick"): 250,
+            ("core4:rocc", "attention_worker_softmax_tile_complete_tick"): 270,
+            ("core4:rocc", "attention_worker_pv_tile_complete_tick"): 280,
+            ("core4:rocc", "attention_worker_output_dma_ack_tick"): 300,
+            ("core5:rocc", "attention_worker_qk_tile_complete_tick"): 220,
+            ("core5:rocc", "attention_worker_softmax_tile_complete_tick"): 240,
+            ("core5:rocc", "attention_worker_pv_tile_complete_tick"): 290,
+            ("core5:rocc", "attention_worker_output_dma_ack_tick"): 310,
+        }
+
+        critical_path = summarize_worker_critical_path(
+            observed, minima, maxima, worker_cores=range(4, 6),
+            accelerator_clock_hz=1_000, timebase_ticks_per_second=1_000,
+        )
+
+        self.assertEqual(critical_path["slowest_worker_core"], 5)
+        self.assertEqual(
+            critical_path["milestone_ticks"],
+            {
+                "dispatch_accept": 110,
+                "final_qk_tile_complete": 220,
+                "final_softmax_tile_complete": 240,
+                "final_pv_tile_complete": 290,
+                "final_output_dma_ack": 310,
+            },
+        )
+        self.assertEqual(
+            critical_path["stage_cycles"],
+            {
+                "dispatch_to_final_qk": 110,
+                "final_qk_to_final_softmax": 20,
+                "final_softmax_to_final_pv": 50,
+                "final_pv_to_output_dma_ack": 20,
+            },
+        )
+        self.assertEqual(
+            critical_path["aggregate_online_pipeline_cycles"],
+            {
+                "dispatch_to_first_qk": 40,
+                "all_qk_to_softmax": 30,
+                "all_softmax_to_pv": 70,
+                "inter_tile_pv_to_next_qk": 40,
+                "final_pv_to_output_dma_ack": 20,
+            },
+        )
+
+    def test_pv_matrix_broadcast_is_explicit_and_opt_in(self):
+        for source in (self.compute_array, self.mvm_array, self.crosssim_array):
+            self.assertIn("programMatrixGroupAsync", source)
+        self.assertIn("attention_pv_matrix_broadcast", self.rocc)
+        self.assertIn("GOLEM_ATTENTION_PV_MATRIX_BROADCAST", self.cpu_builder)
+        self.assertIn("attention_pv_matrix_broadcasts", self.stats_verifier)
+
+        default_run = subprocess.run(
+            ["bash", str(RUNNER), "--scale-point", "e2", "--dry-run"],
+            text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(default_run.returncode, 0, default_run.stderr)
+        self.assertIn("GOLEM_ATTENTION_PV_MATRIX_BROADCAST=0", default_run.stdout)
+
+        optimized_run = subprocess.run(
+            [
+                "bash", str(RUNNER), "--scale-point", "e2",
+                "--pv-matrix-broadcast", "--dry-run",
+            ],
+            text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(optimized_run.returncode, 0, optimized_run.stderr)
+        self.assertIn("GOLEM_ATTENTION_PV_MATRIX_BROADCAST=1", optimized_run.stdout)
+        self.assertIn("--pv-matrix-broadcast", optimized_run.stdout)
 
 
 if __name__ == "__main__":

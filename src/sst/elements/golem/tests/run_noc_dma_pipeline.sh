@@ -149,6 +149,7 @@ GOLEM_GEMM_BLOCK_M="${GOLEM_GEMM_BLOCK_M:-$GOLEM_ARRAY_OUTPUT_SIZE}"
 GOLEM_GEMM_BLOCK_N="${GOLEM_GEMM_BLOCK_N:-$GOLEM_NUM_ARRAYS}"
 GOLEM_GEMM_BLOCK_K="${GOLEM_GEMM_BLOCK_K:-$GOLEM_ARRAY_INPUT_SIZE}"
 GOLEM_MATMUL_DTYPE="${GOLEM_MATMUL_DTYPE:-fp32}"
+GOLEM_MATMUL_TRANSPOSE_B="${GOLEM_MATMUL_TRANSPOSE_B:-0}"
 GOLEM_BIAS_ENABLE="${GOLEM_BIAS_ENABLE:-0}"
 GOLEM_BIAS_VALUE="${GOLEM_BIAS_VALUE:-0}"
 GOLEM_DMA_READ_RETRY_TICKS="${GOLEM_DMA_READ_RETRY_TICKS:-256}"
@@ -806,6 +807,7 @@ Options:
 	--gemm-block-n N     GEMM block_N（默认: 跟 --num-arrays，phase-1 要求 <= --num-arrays）
 	--gemm-block-k N     GEMM block_K（默认: 跟 --array-in，phase-1 要求等于 --array-in）
 	--dtype TYPE         matmul 数据类型：int32|fp32（默认: int32）
+	--transpose-b N      B 的逻辑转置：0 使用 [K,N]，1 使用原生 [N,K]（默认: 0）
 	--bias-enable N      可选后处理bias开关（0:关闭,1:开启，默认: 0）
 	--bias-value N       bias常量值（int32/fp32，默认: 0）
 	--bias-file FILE     bias向量文件（.bin/.csv/.npy），透传给 gen_hbm_init.py
@@ -915,6 +917,8 @@ while [[ $# -gt 0 ]]; do
 			GOLEM_GEMM_BLOCK_K="$2"; shift 2 ;;
 		--dtype)
 			GOLEM_MATMUL_DTYPE="$2"; shift 2 ;;
+		--transpose-b)
+			GOLEM_MATMUL_TRANSPOSE_B="$2"; shift 2 ;;
 		--bias-enable)
 			GOLEM_BIAS_ENABLE="$2"; shift 2 ;;
 		--bias-value)
@@ -1077,6 +1081,11 @@ if [[ "$TENSOR_SOURCE" != "synthetic" && "$TENSOR_SOURCE" != "file" && "$TENSOR_
 	exit 1
 fi
 
+if [[ "$GOLEM_MATMUL_TRANSPOSE_B" != "0" && "$GOLEM_MATMUL_TRANSPOSE_B" != "1" ]]; then
+	echo "[ERROR] --transpose-b 必须为 0 或 1，收到: $GOLEM_MATMUL_TRANSPOSE_B" >&2
+	exit 1
+fi
+
 if [[ "$TENSOR_SOURCE" == "synthetic" && ( -n "$TENSOR_A_FILE" || -n "$TENSOR_B_FILE" ) ]]; then
 	TENSOR_SOURCE="file"
 fi
@@ -1168,9 +1177,15 @@ LOCAL_ALIGN=256
 LOCAL_DATA_BASE_DEC=$((0x2000))
 mat_slot_bytes=$(align_up_int $(( GOLEM_GEMM_BLOCK_M * GOLEM_GEMM_BLOCK_K * ELEM_BYTES )) $LOCAL_ALIGN)
 vec_slot_bytes=$(align_up_int $(( GOLEM_GEMM_BLOCK_N * GOLEM_GEMM_BLOCK_K * ELEM_BYTES )) $LOCAL_ALIGN)
-out_scratch_bytes=$(align_up_int $(( GOLEM_ARRAY_OUTPUT_SIZE * ELEM_BYTES )) $LOCAL_ALIGN)
 out_tile_bytes=$(align_up_int $(( GOLEM_GEMM_BLOCK_M * GOLEM_GEMM_BLOCK_N * ELEM_BYTES )) $LOCAL_ALIGN)
-required_global_stride_bytes=$(( LOCAL_DATA_BASE_DEC + GOLEM_DMA_SLOT_COUNT * mat_slot_bytes + GOLEM_DMA_SLOT_COUNT * vec_slot_bytes + out_scratch_bytes + out_tile_bytes + 0x40 + LOCAL_ALIGN ))
+out_vec_bytes=$(align_up_int $(( GOLEM_ARRAY_OUTPUT_SIZE * ELEM_BYTES )) $LOCAL_ALIGN)
+out_scratch_bytes=$(( out_vec_bytes > out_tile_bytes ? out_vec_bytes : out_tile_bytes ))
+gemm_m_tiles=$(( GOLEM_GEMM_M / GOLEM_GEMM_BLOCK_M ))
+gemm_n_tiles=$(( GOLEM_GEMM_N / GOLEM_GEMM_BLOCK_N ))
+partial_rows=$(( GOLEM_B_REUSE_M_TILES < gemm_m_tiles ? GOLEM_B_REUSE_M_TILES : gemm_m_tiles ))
+partial_cols=$(( GOLEM_A_REUSE_N_TILES < gemm_n_tiles ? GOLEM_A_REUSE_N_TILES : gemm_n_tiles ))
+partial_tile_count=$(( partial_rows * partial_cols ))
+required_global_stride_bytes=$(( LOCAL_DATA_BASE_DEC + GOLEM_DMA_SLOT_COUNT * mat_slot_bytes + GOLEM_DMA_SLOT_COUNT * vec_slot_bytes + out_scratch_bytes + partial_tile_count * out_tile_bytes + 0x40 + LOCAL_ALIGN ))
 if (( GOLEM_GLOBAL_STRIDE_BYTES < required_global_stride_bytes )); then
 	echo "[INFO] Expanding GOLEM_GLOBAL_STRIDE_BYTES from ${GOLEM_GLOBAL_STRIDE_BYTES} to ${required_global_stride_bytes} for local GM layout (slots=${GOLEM_DMA_SLOT_COUNT})"
 	GOLEM_GLOBAL_STRIDE_BYTES=$required_global_stride_bytes
@@ -1536,6 +1551,7 @@ HBM_METADATA_KEYS=(
 	GOLEM_GEMM_BLOCK_N
 	GOLEM_GEMM_BLOCK_K
 	GOLEM_MATMUL_DTYPE
+	GOLEM_MATMUL_TRANSPOSE_B
 	GOLEM_ARRAY_INPUT_SIZE
 	GOLEM_ARRAY_OUTPUT_SIZE
 	GOLEM_NUM_ARRAYS
@@ -1657,7 +1673,7 @@ export GOLEM_MATMUL_DTYPE
 export GOLEM_GEMM_OUT_LAYOUT="colmajor_tile"
 export GOLEM_MATMUL_LAYOUT="row_major"
 export GOLEM_MATMUL_TRANSPOSE_A="0"
-export GOLEM_MATMUL_TRANSPOSE_B="0"
+export GOLEM_MATMUL_TRANSPOSE_B="$GOLEM_MATMUL_TRANSPOSE_B"
 export GOLEM_DMA_READ_RETRY_TICKS
 export GOLEM_DMA_READ_MAX_RETRIES
 export GOLEM_DMA_BURST_BYTES
@@ -1912,7 +1928,7 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
 		echo "  python3 tools/unpack_c_from_hbm.py --out-file $DUMP_C_FILE"
 	fi
 	if [[ "$VERIFY_C" -eq 1 ]]; then
-		echo "  python3 verify/verify_c_against_golden.py --dtype $GOLEM_MATMUL_DTYPE --a-file $TENSOR_A_FILE --b-file $TENSOR_B_FILE --c-file $DUMP_C_FILE --m $GOLEM_GEMM_M --n $GOLEM_GEMM_N --k $GOLEM_GEMM_K --bias-enable $GOLEM_BIAS_ENABLE --bias-value $GOLEM_BIAS_VALUE"
+		echo "  python3 verify/verify_c_against_golden.py --dtype $GOLEM_MATMUL_DTYPE --a-file $TENSOR_A_FILE --b-file $TENSOR_B_FILE --c-file $DUMP_C_FILE --m $GOLEM_GEMM_M --n $GOLEM_GEMM_N --k $GOLEM_GEMM_K --transpose-b $GOLEM_MATMUL_TRANSPOSE_B --bias-enable $GOLEM_BIAS_ENABLE --bias-value $GOLEM_BIAS_VALUE"
 	fi
 	echo "  python3 stats/extract_latency_csv.py --log $LOG_PATH --log-dir $STDOUT_DIR --summary $EXEC_SUMMARY_FILE"
 	echo "  python3 stats/extract_dma_read_stats_csv.py --log $LOG_PATH --log-dir $STDOUT_DIR --summary $DMA_SUMMARY_FILE"
@@ -2092,6 +2108,7 @@ if [[ "$VERIFY_C" -eq 1 ]]; then
 		--m "$GOLEM_GEMM_M" \
 		--n "$GOLEM_GEMM_N" \
 		--k "$GOLEM_GEMM_K" \
+		--transpose-b "$GOLEM_MATMUL_TRANSPOSE_B" \
 		--bias-enable "$GOLEM_BIAS_ENABLE" \
 		--bias-value "$GOLEM_BIAS_VALUE"
 fi

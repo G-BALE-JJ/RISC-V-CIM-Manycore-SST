@@ -82,8 +82,8 @@ golem_status_t validate_op_desc_v1(const golem_matmul_op_desc_t* op) {
         set_last_error("v1 only supports GOLEM_LAYOUT_ROW_MAJOR");
         return GOLEM_STATUS_UNSUPPORTED;
     }
-    if (op->transpose_a != 0 || op->transpose_b != 0) {
-        set_last_error("v1 only supports transpose_a=0 and transpose_b=0");
+    if (op->transpose_a != 0 || (op->transpose_b != 0 && op->transpose_b != 1)) {
+        set_last_error("v1 supports transpose_a=0 and transpose_b in {0,1}");
         return GOLEM_STATUS_UNSUPPORTED;
     }
     if ((op->block_m % TILE_M) != 0 || (op->block_k % TILE_K) != 0) {
@@ -168,6 +168,7 @@ golem_status_t run_matmul_int32(const golem_matmul_op_desc_t& op,
             .a_stride1 = a->stride[1],
             .b_stride0 = b->stride[0],
             .b_stride1 = b->stride[1],
+            .transpose_b = op.transpose_b != 0,
             .c_stride0 = c->stride[0],
             .c_stride1 = c->stride[1],
         };
@@ -229,6 +230,7 @@ golem_status_t run_matmul_fp32(const golem_matmul_op_desc_t& op,
             .a_stride1 = a->stride[1],
             .b_stride0 = b->stride[0],
             .b_stride1 = b->stride[1],
+            .transpose_b = op.transpose_b != 0,
             .c_stride0 = c->stride[0],
             .c_stride1 = c->stride[1],
         };
@@ -323,7 +325,9 @@ extern "C" golem_status_t golemRunMatmul(
     if (st != GOLEM_STATUS_OK) {
         return st;
     }
-    st = validate_tensor_desc_for_op(b, op.k, op.n, "B", op.dtype);
+    const int64_t b_rows = op.transpose_b ? op.n : op.k;
+    const int64_t b_cols = op.transpose_b ? op.k : op.n;
+    st = validate_tensor_desc_for_op(b, b_rows, b_cols, "B", op.dtype);
     if (st != GOLEM_STATUS_OK) {
         return st;
     }

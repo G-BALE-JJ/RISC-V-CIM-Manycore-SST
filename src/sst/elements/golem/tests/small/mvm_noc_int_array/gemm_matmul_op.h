@@ -164,6 +164,7 @@ struct MatmulTensorBindingsT {
     int64_t a_stride1;
     int64_t b_stride0;
     int64_t b_stride1;
+    bool transpose_b;
     int64_t c_stride0;
     int64_t c_stride1;
 };
@@ -766,7 +767,9 @@ static inline void load_b_col_from_tensor(
     const int k_base = k_tile * desc.block_k;
     const int n_base = desc.n_tile * desc.block_n + n_col;
     for (int i = 0; i < desc.block_k; ++i) {
-        const int64_t src_idx = static_cast<int64_t>(k_base + i) * tensors.b_stride0 + static_cast<int64_t>(n_base) * tensors.b_stride1;
+        const int64_t src_idx = tensors.transpose_b
+            ? static_cast<int64_t>(n_base) * tensors.b_stride0 + static_cast<int64_t>(k_base + i) * tensors.b_stride1
+            : static_cast<int64_t>(k_base + i) * tensors.b_stride0 + static_cast<int64_t>(n_base) * tensors.b_stride1;
         vec[i] = tensors.b[src_idx];
     }
 }

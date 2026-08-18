@@ -40,6 +40,17 @@ SFU_JOB_SOFTMAX_DIRECT_ROWMAJOR_HBM = (
 SFU_PRIMITIVE_HBM_STREAM = int(os.getenv("GOLEM_SFU_PRIMITIVE_HBM_STREAM", "0")) != 0
 SFU_PRIMITIVE_HBM_OPS = os.getenv("GOLEM_SFU_PRIMITIVE_HBM_OPS", "EXP")
 SFU_PRIMITIVE_HBM_ELEMS = max(1, int(os.getenv("GOLEM_SFU_PRIMITIVE_HBM_ELEMS", "64")))
+ATTENTION_FUSED = int(os.getenv("GOLEM_ATTENTION_FUSED", "0")) != 0
+ATTENTION_Q_FILE = os.getenv("GOLEM_ATTENTION_Q_FILE", "")
+ATTENTION_K_FILE = os.getenv("GOLEM_ATTENTION_K_FILE", "")
+ATTENTION_V_FILE = os.getenv("GOLEM_ATTENTION_V_FILE", "")
+ATTENTION_Q_OFFSET = int(os.getenv("GOLEM_ATTENTION_Q_OFFSET", "0x02000000"), 0)
+ATTENTION_K_OFFSET = int(os.getenv("GOLEM_ATTENTION_K_OFFSET", "0x02010000"), 0)
+ATTENTION_V_OFFSET = int(os.getenv("GOLEM_ATTENTION_V_OFFSET", "0x02020000"), 0)
+ATTENTION_QUERIES = int(os.getenv("GOLEM_ATTENTION_QUERIES", "32"))
+ATTENTION_KEYS = int(os.getenv("GOLEM_ATTENTION_KEYS", "32"))
+ATTENTION_HEAD_DIM = int(os.getenv("GOLEM_ATTENTION_HEAD_DIM", "64"))
+ATTENTION_HBM_STRIPED = int(os.getenv("GOLEM_ATTENTION_HBM_STRIPED", "0")) != 0
 SOFTMAX_LOGITS_FILE = os.getenv("GOLEM_SOFTMAX_LOGITS_FILE", "")
 SFU_SOFTMAX_HBM_LAYOUT = os.getenv("GOLEM_SFU_SOFTMAX_HBM_LAYOUT", "single_node")
 SFU_SOFTMAX_STAGING_ROWS = max(
@@ -322,6 +333,56 @@ def _write_block(buf, offset: int, data: bytes, tag: str):
         buf[offset:end] = data
 
 
+def _preload_fused_attention(node_buffers):
+    if not ATTENTION_FUSED:
+        return
+    if 1 not in node_buffers:
+        raise ValueError("fused Attention requires HBM data node 1")
+    tensors = (
+        ("Q", ATTENTION_Q_FILE, ATTENTION_Q_OFFSET,
+         ATTENTION_QUERIES * ATTENTION_HEAD_DIM * 4),
+        ("K", ATTENTION_K_FILE, ATTENTION_K_OFFSET,
+         ATTENTION_KEYS * ATTENTION_HEAD_DIM * 4),
+        ("V", ATTENTION_V_FILE, ATTENTION_V_OFFSET,
+         ATTENTION_KEYS * ATTENTION_HEAD_DIM * 4),
+    )
+    loaded = {}
+    for name, path, offset, expected_bytes in tensors:
+        if not path:
+            raise ValueError(f"GOLEM_ATTENTION_{name}_FILE is required")
+        with open(path, "rb") as tensor_file:
+            data = tensor_file.read()
+        if len(data) != expected_bytes:
+            raise ValueError(
+                f"fused Attention {name} expected {expected_bytes} bytes, got {len(data)}"
+            )
+        loaded[name] = (offset, data)
+    if ATTENTION_HBM_STRIPED:
+        if len(DATA_NODE_IDS) != 4 or ATTENTION_QUERIES % 4 != 0 or ATTENTION_KEYS % 4 != 0:
+            raise ValueError("striped fused Attention requires four data nodes and /4 shapes")
+        q_band_bytes = (ATTENTION_QUERIES // 4) * ATTENTION_HEAD_DIM * 4
+        kv_band_bytes = (ATTENTION_KEYS // 4) * ATTENTION_HEAD_DIM * 4
+        for band, node_idx in enumerate(DATA_NODE_IDS):
+            q_offset, q_data = loaded["Q"]
+            _write_block(
+                node_buffers[node_idx], q_offset,
+                q_data[band * q_band_bytes:(band + 1) * q_band_bytes],
+                f"attention_q_band{band}",
+            )
+            for name in ("K", "V"):
+                offset, data = loaded[name]
+                _write_block(
+                    node_buffers[node_idx], offset,
+                    data[band * kv_band_bytes:(band + 1) * kv_band_bytes],
+                    f"attention_kv_band{band}_{name}",
+                )
+        print("Preloaded fused Attention Q/K/V bands across four HBM data nodes")
+    else:
+        for name, (offset, data) in loaded.items():
+            _write_block(node_buffers[1], offset, data, f"fused_attention_{name}")
+        print("Preloaded fused Attention Q/K/V in HBM node1; S/P have no HBM region")
+
+
 def _node_base(node_idx: int) -> int:
     return node_idx * MEM_NODE_SIZE
 
@@ -544,13 +605,25 @@ def _matrix_tile_from_input(
 
 
 def _vector_from_input(
-    b_matrix, k_tile: int, n_tile: int, n_col: int, block_k: int, block_n: int
+    b_matrix,
+    k_tile: int,
+    n_tile: int,
+    n_col: int,
+    block_k: int,
+    block_n: int,
+    *,
+    transpose_b: bool = False,
 ):
     k_base = k_tile * block_k
     n_base = n_tile * block_n + n_col
     out = []
     for i in range(block_k):
-        out.append(cast_scalar(MATMUL_DTYPE, b_matrix[k_base + i][n_base]))
+        value = (
+            b_matrix[n_base][k_base + i]
+            if transpose_b
+            else b_matrix[k_base + i][n_base]
+        )
+        out.append(cast_scalar(MATMUL_DTYPE, value))
     return out
 
 
@@ -820,8 +893,8 @@ def main(argv=None):
         raise ValueError(
             f"Phase-1 requires GOLEM_MATMUL_LAYOUT=row_major, got {MATMUL_OP_DESC['layout']}"
         )
-    if MATMUL_OP_DESC["transpose_a"] != 0 or MATMUL_OP_DESC["transpose_b"] != 0:
-        raise ValueError("Phase-1 requires transpose_a=0 and transpose_b=0")
+    if MATMUL_OP_DESC["transpose_a"] != 0 or MATMUL_OP_DESC["transpose_b"] not in (0, 1):
+        raise ValueError("Phase-1 requires transpose_a=0 and transpose_b in {0,1}")
     if GEMM_M % BLOCK_M != 0 or GEMM_N % BLOCK_N != 0 or GEMM_K % BLOCK_K != 0:
         raise ValueError(
             f"GOLEM_GEMM_M/N/K must be divisible by block_M/N/K ({BLOCK_M}/{BLOCK_N}/{BLOCK_K}), got {GEMM_M}/{GEMM_N}/{GEMM_K}"
@@ -917,8 +990,13 @@ def main(argv=None):
         init_file = os.path.join(HBM_DIR, f"hbm_init_node{node_idx}.bin")
         node_buffers[node_idx] = SparseNodeBuffer(init_file, MEM_NODE_SIZE)
 
+    _preload_fused_attention(node_buffers)
+
     a_matrix = _load_matrix_from_file(args.a_file, GEMM_M, GEMM_K, "A")
-    b_matrix = _load_matrix_from_file(args.b_file, GEMM_K, GEMM_N, "B")
+    transpose_b = MATMUL_OP_DESC["transpose_b"] == 1
+    b_rows = GEMM_N if transpose_b else GEMM_K
+    b_cols = GEMM_K if transpose_b else GEMM_N
+    b_matrix = _load_matrix_from_file(args.b_file, b_rows, b_cols, "B")
     bias_vec = _load_bias_vector_from_file(args.bias_file, GEMM_N)
     softmax_logits = None
     bias_enabled = int(os.getenv("GOLEM_BIAS_ENABLE", "0")) != 0
@@ -1172,7 +1250,13 @@ def main(argv=None):
             for n_col in range(BLOCK_N):
                 if b_matrix is not None:
                     vec = _vector_from_input(
-                        b_matrix, k_tile, n_tile, n_col, BLOCK_K, BLOCK_N
+                        b_matrix,
+                        k_tile,
+                        n_tile,
+                        n_col,
+                        BLOCK_K,
+                        BLOCK_N,
+                        transpose_b=transpose_b,
                     )
                 else:
                     vec = _build_vector_tile(n_tile, k_tile, n_col, BLOCK_K)

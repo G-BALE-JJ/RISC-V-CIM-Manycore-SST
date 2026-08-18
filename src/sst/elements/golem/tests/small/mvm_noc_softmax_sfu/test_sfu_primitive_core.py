@@ -11,6 +11,7 @@ SFU_H = os.path.join(GOLEM_DIR, "sfu", "sfu.h")
 SFU_CC = os.path.join(GOLEM_DIR, "sfu", "sfu.cc")
 GLOBAL_MEMORY_H = os.path.join(GOLEM_DIR, "globalmemory", "globalmemory.h")
 GLOBAL_MEMORY_CC = os.path.join(GOLEM_DIR, "globalmemory", "globalmemory.cc")
+ROCC_H = os.path.join(GOLEM_DIR, "rocc", "roccAnalog.h")
 
 
 def read(path):
@@ -25,6 +26,7 @@ class SfuPrimitiveCoreTest(unittest.TestCase):
         cls.source = read(SFU_CC)
         cls.global_memory_header = read(GLOBAL_MEMORY_H)
         cls.global_memory_source = read(GLOBAL_MEMORY_CC)
+        cls.rocc_header = read(ROCC_H)
 
     def test_global_memory_exposes_serializable_reduction_transport_bridge(self):
         for token in (
@@ -343,7 +345,6 @@ class SfuPrimitiveCoreTest(unittest.TestCase):
 
     def test_explicit_noc_reduction_uses_global_memory_transport_interfaces(self):
         for token in (
-            "setReductionMessageHandler",
             "handleReductionTransportMessage",
             "sendReductionMessage",
             "distributedReductionResponseInbox_",
@@ -353,6 +354,9 @@ class SfuPrimitiveCoreTest(unittest.TestCase):
             "SumResponse",
         ):
             self.assertIn(token, self.source + self.header)
+        self.assertIn("setReductionMessageHandler", self.rocc_header)
+        self.assertIn("sfu->receiveReductionMessage(message)", self.rocc_header)
+        self.assertNotIn("setReductionMessageHandler", self.source)
 
     def test_explicit_noc_reduction_waits_for_keyed_response_inbox(self):
         advance_start = self.source.index("bool SFU::advanceDistributedSoftmaxJob")

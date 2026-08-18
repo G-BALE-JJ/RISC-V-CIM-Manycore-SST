@@ -24,11 +24,11 @@ LAUNCH_TIMELINE = re.compile(
 )
 
 
-def load_sfu_stats(path):
+def load_component_stats(path, marker):
     components = {}
     with open(path, newline="", encoding="utf-8") as stats_file:
         for row in csv.reader(stats_file):
-            if len(row) < 11 or ":sfu" not in row[0]:
+            if len(row) < 11 or marker not in row[0]:
                 continue
             try:
                 value_sum = int(float(row[6]))
@@ -44,6 +44,10 @@ def load_sfu_stats(path):
                 "max": value_max,
             }
     return components
+
+
+def load_sfu_stats(path):
+    return load_component_stats(path, ":sfu")
 
 
 def load_system_envelope(path):
@@ -105,12 +109,16 @@ def completed_rows(components):
     return total
 
 
-def tile_contract_failures(components, rows, tensor_controller=False):
+def tile_contract_failures(components, rows, tensor_controller=False,
+                           expected_sfus=16, worker_count=16,
+                           manager_coordinator=False):
     failures = []
-    if len(components) != 16:
-        failures.append(f"physical_sfus={len(components)} expected=16")
-    if rows % 16 != 0:
-        failures.append(f"rows={rows} is not divisible by 16")
+    if len(components) != expected_sfus:
+        failures.append(f"physical_sfus={len(components)} expected={expected_sfus}")
+    if rows % worker_count != 0:
+        failures.append(f"rows={rows} is not divisible by workers={worker_count}")
+        return failures
+    if manager_coordinator:
         return failures
     if tensor_controller:
         jobs = stat_sum(components, "sfu_row_engine_jobs")
@@ -167,20 +175,44 @@ def main():
     parser.add_argument("--attempt-id", default="")
     parser.add_argument("--require-contract", action="store_true")
     parser.add_argument("--tensor-controller", action="store_true")
+    parser.add_argument("--manager-coordinator", action="store_true")
+    parser.add_argument("--worker-count", type=int, default=16)
+    parser.add_argument("--manager-count", type=int, default=0)
     args = parser.parse_args()
 
     components = load_sfu_stats(args.stats)
+    manager_components = load_component_stats(args.stats, ":rocc")
     simulated_time_ps, vanadis_critical_cycles = load_system_envelope(args.stats)
-    issue_tick = stat_min(components, "sfu_row_engine_issue_tick")
-    ready_tick = stat_max(components, "sfu_row_engine_ready_tick")
-    observed_tick = stat_max(components, "sfu_row_engine_completion_observed_tick")
+    issue_tick = stat_min(
+        manager_components if args.manager_coordinator else components,
+        "tensor_manager_descriptor_accept_tick" if args.manager_coordinator
+        else "sfu_row_engine_issue_tick",
+    )
+    ready_tick = stat_max(
+        manager_components if args.manager_coordinator else components,
+        "tensor_manager_complete_tick" if args.manager_coordinator
+        else "sfu_row_engine_ready_tick",
+    )
+    observed_tick = stat_max(
+        manager_components if args.manager_coordinator else components,
+        "tensor_manager_wait_observed_tick" if args.manager_coordinator
+        else "sfu_row_engine_completion_observed_tick",
+    )
     issue_to_ready_ticks = max(0, ready_tick - issue_tick)
     issue_to_observed_ticks = max(0, observed_tick - issue_tick)
     timeline_ticks = {
         "descriptor_accept": issue_tick,
         "accelerator_complete": ready_tick,
-        "first_band_dispatch": stat_min(components, "sfu_tensor_band_dispatch_tick"),
-        "last_band_dispatch": stat_max(components, "sfu_tensor_band_dispatch_tick"),
+        "first_band_dispatch": stat_min(
+            manager_components if args.manager_coordinator else components,
+            "tensor_manager_band_dispatch_tick" if args.manager_coordinator
+            else "sfu_tensor_band_dispatch_tick",
+        ),
+        "last_band_dispatch": stat_max(
+            manager_components if args.manager_coordinator else components,
+            "tensor_manager_band_dispatch_tick" if args.manager_coordinator
+            else "sfu_tensor_band_dispatch_tick",
+        ),
         "first_worker_dispatch": stat_min(components, "sfu_tensor_worker_dispatch_tick"),
         "last_worker_dispatch": stat_max(components, "sfu_tensor_worker_dispatch_tick"),
         "first_input_dma_ready": stat_min(components, "sfu_tensor_input_dma_ready_tick"),
@@ -195,9 +227,21 @@ def main():
         "last_compute_done": stat_max(components, "sfu_tensor_compute_done_tick"),
         "first_output_dma_ack": stat_min(components, "sfu_tensor_output_dma_ack_tick"),
         "final_output_dma_ack": stat_max(components, "sfu_tensor_output_dma_ack_tick"),
-        "first_completion_received": stat_min(components, "sfu_tensor_completion_received_tick"),
-        "last_completion_received": stat_max(components, "sfu_tensor_completion_received_tick"),
-        "guest_wait_observed": stat_max(components, "sfu_tensor_guest_wait_observed_tick"),
+        "first_completion_received": stat_min(
+            manager_components if args.manager_coordinator else components,
+            "tensor_manager_completion_received_tick" if args.manager_coordinator
+            else "sfu_tensor_completion_received_tick",
+        ),
+        "last_completion_received": stat_max(
+            manager_components if args.manager_coordinator else components,
+            "tensor_manager_completion_received_tick" if args.manager_coordinator
+            else "sfu_tensor_completion_received_tick",
+        ),
+        "guest_wait_observed": stat_max(
+            manager_components if args.manager_coordinator else components,
+            "tensor_manager_wait_observed_tick" if args.manager_coordinator
+            else "sfu_tensor_guest_wait_observed_tick",
+        ),
     }
     timeline_pairs = {
         "descriptor_to_first_band_dispatch": ("descriptor_accept", "first_band_dispatch"),
@@ -245,7 +289,11 @@ def main():
             0, max(record["end"] for record in guest_records) - guest_wait_observed_cycle
         )
     timeline_event_counts = {
-        "band_dispatch": stat_count(components, "sfu_tensor_band_dispatch_tick"),
+        "band_dispatch": stat_count(
+            manager_components if args.manager_coordinator else components,
+            "tensor_manager_band_dispatch_tick" if args.manager_coordinator
+            else "sfu_tensor_band_dispatch_tick",
+        ),
         "worker_dispatch": stat_count(components, "sfu_tensor_worker_dispatch_tick"),
         "input_dma_ready": stat_count(components, "sfu_tensor_input_dma_ready_tick"),
         "max_start": stat_count(components, "sfu_tensor_max_start_tick"),
@@ -256,8 +304,16 @@ def main():
         "normalize_done": stat_count(components, "sfu_tensor_normalize_done_tick"),
         "compute_done": stat_count(components, "sfu_tensor_compute_done_tick"),
         "output_dma_ack": stat_count(components, "sfu_tensor_output_dma_ack_tick"),
-        "completion_received": stat_count(components, "sfu_tensor_completion_received_tick"),
-        "guest_wait_observed": stat_count(components, "sfu_tensor_guest_wait_observed_tick"),
+        "completion_received": stat_count(
+            manager_components if args.manager_coordinator else components,
+            "tensor_manager_completion_received_tick" if args.manager_coordinator
+            else "sfu_tensor_completion_received_tick",
+        ),
+        "guest_wait_observed": stat_count(
+            manager_components if args.manager_coordinator else components,
+            "tensor_manager_wait_observed_tick" if args.manager_coordinator
+            else "sfu_tensor_guest_wait_observed_tick",
+        ),
     }
     actual_stage_windows_cycles = {
         "max": timeline_cycles.get("max_stage_window", 0),
@@ -312,10 +368,21 @@ def main():
         "rows": args.rows,
         "cols": args.cols,
         "physical_sfus_with_stats": len(components),
-        "row_engine_jobs": stat_sum(components, "sfu_row_engine_jobs"),
-        "rows_dispatched": stat_sum(components, "sfu_row_engine_rows"),
-        "rows_completed": completed_rows(components),
-        "completed_jobs": stat_sum(components, "sfu_row_engine_completed_jobs"),
+        "row_engine_jobs": stat_sum(
+            manager_components if args.manager_coordinator else components,
+            "tensor_manager_jobs_issued" if args.manager_coordinator else "sfu_row_engine_jobs",
+        ),
+        "rows_dispatched": stat_sum(
+            manager_components if args.manager_coordinator else components,
+            "tensor_manager_rows_dispatched" if args.manager_coordinator else "sfu_row_engine_rows",
+        ),
+        "rows_completed": stat_sum(manager_components, "tensor_manager_rows_completed")
+            if args.manager_coordinator else completed_rows(components),
+        "completed_jobs": stat_sum(
+            manager_components if args.manager_coordinator else components,
+            "tensor_manager_jobs_completed" if args.manager_coordinator
+            else "sfu_row_engine_completed_jobs",
+        ),
         "vector_max_active_critical_cycles": stat_critical_max(components, "sfu_row_engine_max_cycles"),
         "exp_sum_active_critical_cycles": stat_critical_max(components, "sfu_row_engine_exp_sum_cycles"),
         "normalize_active_critical_cycles": stat_critical_max(components, "sfu_row_engine_normalize_cycles"),
@@ -351,9 +418,23 @@ def main():
         ),
         "wait_polls": stat_sum(components, "sfu_row_engine_wait_polls"),
     }
-    failures = tile_contract_failures(components, args.rows, args.tensor_controller)
+    failures = tile_contract_failures(
+        components, args.rows, args.tensor_controller,
+        expected_sfus=args.worker_count + args.manager_count,
+        worker_count=args.worker_count,
+        manager_coordinator=args.manager_coordinator,
+    )
+    if args.manager_coordinator:
+        if stat_sum(manager_components, "tensor_manager_workers_mapped") != args.worker_count:
+            failures.append("manager topology map worker count is inconsistent")
+        for manager_core in range(args.manager_count):
+            manager_sfu = components.get(f"core{manager_core}:sfu", {})
+            if any(manager_sfu.get(name, {}).get("sum", 0) != 0 for name in (
+                    "sfu_row_engine_jobs", "sfu_row_engine_rows",
+                    "sfu_tensor_worker_dispatch_tick")):
+                failures.append(f"manager core{manager_core} SFU datapath was used")
     if args.tensor_controller:
-        expected_control_events = min(args.rows, len(components))
+        expected_control_events = min(args.rows, args.worker_count)
         required_timeline = [
             "descriptor_accept", "first_band_dispatch", "first_worker_dispatch",
             "first_input_dma_ready", "first_max_start", "last_max_done",

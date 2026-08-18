@@ -111,6 +111,15 @@ void write_sfu_tensor_params_to_gm(uint64_t params_gm_addr,
     }
 }
 
+void write_sfu_worker_topology_to_gm(uint64_t topology_gm_addr,
+                                     const SFUWorkerTopologyMapV1& topology) {
+    const uint64_t* words = reinterpret_cast<const uint64_t*>(&topology);
+    constexpr size_t kWords = sizeof(SFUWorkerTopologyMapV1) / sizeof(uint64_t);
+    for (size_t i = 0; i < kWords; ++i) {
+        reg2gm(words[i], topology_gm_addr + static_cast<uint64_t>(i) * sizeof(uint64_t));
+    }
+}
+
 int task_id_for_tile(int n_tiles, int m_tile, int n_tile) {
     return m_tile * n_tiles + n_tile;
 }
@@ -389,6 +398,8 @@ extern "C" golem_status_t golemRunTensorSoftmaxSfuJob(
     uint32_t rows_per_band,
     uint32_t row_contexts,
     uint32_t physical_engines,
+    uint32_t attention_head_dim,
+    bool attention_causal,
     uint64_t job_id,
     uint64_t tag,
     golem_softmax_launch_timeline_t* timeline) {
@@ -407,23 +418,60 @@ extern "C" golem_status_t golemRunTensorSoftmaxSfuJob(
         set_sfu_softmax_last_error("tensor softmax SFU job received invalid addresses or config");
         return GOLEM_STATUS_INVALID_ARGUMENT;
     }
+    if (attention_causal && attention_head_dim == 0) {
+        set_sfu_softmax_last_error("causal attention requires a non-zero head dimension");
+        return GOLEM_STATUS_INVALID_ARGUMENT;
+    }
+    if (attention_head_dim != 0 && attention_head_dim != 64 && attention_head_dim != 128) {
+        set_sfu_softmax_last_error("attention head dimension must be 64 or 128");
+        return GOLEM_STATUS_INVALID_ARGUMENT;
+    }
 
-    const SFUSoftmaxJobParamsV1 params = {
+    const bool manager_coordinator = GROUP_MANAGER_ENABLED &&
+        executor_core_id >= 0 && executor_core_id < TOTAL_GROUPS;
+    if (manager_coordinator && physical_engines > SFU_WORKER_TOPOLOGY_MAX_WORKERS) {
+        set_sfu_softmax_last_error("manager topology exceeds %u workers",
+                                   SFU_WORKER_TOPOLOGY_MAX_WORKERS);
+        return GOLEM_STATUS_UNSUPPORTED;
+    }
+    const uint64_t topology_gm = params_gm + sizeof(SFUSoftmaxJobParamsV1);
+    SFUSoftmaxJobParamsV1 params = {
         .magic = SFU_SOFTMAX_JOB_PARAMS_MAGIC,
-        .version = SFU_SOFTMAX_JOB_PARAMS_VERSION,
+        .version = manager_coordinator
+            ? SFU_SOFTMAX_JOB_PARAMS_VERSION_MANAGER
+            : attention_head_dim == 0
+            ? SFU_SOFTMAX_JOB_PARAMS_VERSION
+            : SFU_SOFTMAX_JOB_PARAMS_VERSION_ATTENTION,
         .size_bytes = sizeof(SFUSoftmaxJobParamsV1),
-        .mapping_policy = 1,
+        .mapping_policy = manager_coordinator
+            ? SFU_SOFTMAX_MAPPING_EXPLICIT_TOPOLOGY : 1u,
         .tiles_per_row = 1,
         .row_contexts_hint = row_contexts,
         .hbm_layout = SFU_SOFTMAX_HBM_LAYOUT_BAND_STRIPED,
         .data_node_mask = 0x0fu,
-        .flags = 0,
-        .completion_addr = 0,
+        .flags = attention_head_dim == 0 ? 0u :
+            SFU_SOFTMAX_PARAMS_FLAG_ATTENTION |
+                (attention_causal ? SFU_SOFTMAX_PARAMS_FLAG_CAUSAL : 0u),
+        .completion_addr = manager_coordinator ? topology_gm : 0,
         .node_stride_bytes = node_stride_bytes,
         .rows_per_band = rows_per_band,
         .coordinator_core = static_cast<uint32_t>(executor_core_id),
         .reserved0 = rows_per_band,
     };
+    if (attention_head_dim != 0) {
+        params.reserved0 = attention_head_dim;
+    }
+    SFUWorkerTopologyMapV1 topology = {};
+    if (manager_coordinator) {
+        topology.magic = SFU_WORKER_TOPOLOGY_MAP_MAGIC;
+        topology.version = SFU_WORKER_TOPOLOGY_MAP_VERSION;
+        topology.size_bytes = sizeof(SFUWorkerTopologyMapV1);
+        topology.worker_count = physical_engines;
+        for (uint32_t slot = 0; slot < physical_engines; ++slot) {
+            topology.worker_core_ids[slot] = static_cast<uint32_t>(
+                gemm_worker_core_for_slot(static_cast<int>(slot)));
+        }
+    }
     SFUJobDesc desc = {};
     desc.job_id = job_id;
     desc.input0_addr = input_hbm;
@@ -445,6 +493,9 @@ extern "C" golem_status_t golemRunTensorSoftmaxSfuJob(
         timeline->descriptors_ready_cycle = read_cycle_counter();
     }
     write_sfu_tensor_params_to_gm(params_gm, params);
+    if (manager_coordinator) {
+        write_sfu_worker_topology_to_gm(topology_gm, topology);
+    }
     if (timeline != nullptr) {
         timeline->params_write_done_cycle = read_cycle_counter();
     }
@@ -452,12 +503,17 @@ extern "C" golem_status_t golemRunTensorSoftmaxSfuJob(
     if (timeline != nullptr) {
         timeline->desc_write_done_cycle = read_cycle_counter();
     }
-    sfu_job(desc_gm, tag);
+    if (manager_coordinator) {
+        tensor_manager_job(desc_gm, tag);
+    } else {
+        sfu_job(desc_gm, tag);
+    }
     if (timeline != nullptr) {
         timeline->issue_return_cycle = read_cycle_counter();
         timeline->wait_start_cycle = read_cycle_counter();
     }
-    const uint64_t sfu_status = sfu_job_wait(tag);
+    const uint64_t sfu_status = manager_coordinator
+        ? tensor_manager_wait(tag) : sfu_job_wait(tag);
     if (timeline != nullptr) {
         timeline->wait_return_cycle = read_cycle_counter();
     }

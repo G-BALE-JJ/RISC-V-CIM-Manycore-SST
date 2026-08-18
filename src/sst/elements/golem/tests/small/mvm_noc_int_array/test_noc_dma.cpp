@@ -33,6 +33,10 @@ static golem_dtype_t read_dtype_env_or_default(const char* name, golem_dtype_t d
     return default_value;
 }
 
+static int32_t read_flag_env_or_default(const char* name, int32_t default_value) {
+    return static_cast<int32_t>(read_i64_env_or_default(name, default_value));
+}
+
 int main(int argc, char* argv[]) {
     bind_and_resolve_core_from_argv_or_exit(argc, argv, TOTAL_CORES);
     const golem_dtype_t dtype = read_dtype_env_or_default("GOLEM_MATMUL_DTYPE", GOLEM_DTYPE_INT32);
@@ -47,7 +51,7 @@ int main(int argc, char* argv[]) {
         .dtype = dtype,
         .layout = GOLEM_LAYOUT_ROW_MAJOR,
         .transpose_a = 0,
-        .transpose_b = 0,
+        .transpose_b = read_flag_env_or_default("GOLEM_MATMUL_TRANSPOSE_B", 0),
     };
 
     golem_tensor_desc_t a_desc = {
@@ -61,8 +65,14 @@ int main(int argc, char* argv[]) {
     golem_tensor_desc_t b_desc = {
         .data = nullptr,
         .ndim = 2,
-        .shape = {op_desc.k, op_desc.n},
-        .stride = {op_desc.n, 1},
+        .shape = {
+            op_desc.transpose_b ? op_desc.n : op_desc.k,
+            op_desc.transpose_b ? op_desc.k : op_desc.n,
+        },
+        .stride = {
+            op_desc.transpose_b ? op_desc.k : op_desc.n,
+            1,
+        },
         .dtype = dtype,
         .layout = GOLEM_LAYOUT_ROW_MAJOR,
     };

@@ -215,7 +215,7 @@ run_sfu_softmax_offline_verify() {
 
 	echo "[SFU] Verifying full row-wise softmax against A@B golden..."
 	if [[ "$HAS_DRY_RUN" -ne 0 ]]; then
-		echo "[SFU][DRY-RUN] python3 $SCRIPT_DIR/verify_softmax_sfu_against_golden.py --dtype $GOLEM_MATMUL_DTYPE --a-file $GOLEM_TENSOR_A_FILE --b-file $GOLEM_TENSOR_B_FILE --c-file $GOLEM_SOFTMAX_C_FILE --m $GOLEM_GEMM_M --n $GOLEM_GEMM_N --k $GOLEM_GEMM_K --block-m $GOLEM_GEMM_BLOCK_M --block-n $GOLEM_GEMM_BLOCK_N --reference $GOLEM_SOFTMAX_VERIFY_REFERENCE --logits-file ${GOLEM_SOFTMAX_LOGITS_FILE:-} --bias-enable $GOLEM_BIAS_ENABLE --bias-value $GOLEM_BIAS_VALUE"
+		echo "[SFU][DRY-RUN] python3 $SCRIPT_DIR/verify_softmax_sfu_against_golden.py --dtype $GOLEM_MATMUL_DTYPE --a-file $GOLEM_TENSOR_A_FILE --b-file $GOLEM_TENSOR_B_FILE --c-file $GOLEM_SOFTMAX_C_FILE --m $GOLEM_GEMM_M --n $GOLEM_GEMM_N --k $GOLEM_GEMM_K --block-m $GOLEM_GEMM_BLOCK_M --block-n $GOLEM_GEMM_BLOCK_N --reference $GOLEM_SOFTMAX_VERIFY_REFERENCE --logits-file ${GOLEM_SOFTMAX_LOGITS_FILE:-} --bias-enable $GOLEM_BIAS_ENABLE --bias-value $GOLEM_BIAS_VALUE --attention-head-dim ${GOLEM_SFU_ATTENTION_HEAD_DIM:-0} --causal ${GOLEM_SFU_ATTENTION_CAUSAL:-0}"
 	else
 		python3 "$SCRIPT_DIR/verify_softmax_sfu_against_golden.py" \
 			--dtype "$GOLEM_MATMUL_DTYPE" \
@@ -230,7 +230,9 @@ run_sfu_softmax_offline_verify() {
 			--reference "$GOLEM_SOFTMAX_VERIFY_REFERENCE" \
 			--logits-file "$GOLEM_SOFTMAX_LOGITS_FILE" \
 			--bias-enable "$GOLEM_BIAS_ENABLE" \
-			--bias-value "$GOLEM_BIAS_VALUE"
+			--bias-value "$GOLEM_BIAS_VALUE" \
+			--attention-head-dim "${GOLEM_SFU_ATTENTION_HEAD_DIM:-0}" \
+			--causal "${GOLEM_SFU_ATTENTION_CAUSAL:-0}"
 	fi
 }
 
@@ -459,9 +461,15 @@ fi
 GOLEM_GLOBAL_STRIDE_BYTES=$(( GOLEM_GLOBAL_STRIDE_KB * 1024 ))
 mat_slot_bytes=$(align_up_int $(( GOLEM_GEMM_BLOCK_M * GOLEM_GEMM_BLOCK_K * 4 )) 256)
 vec_slot_bytes=$(align_up_int $(( GOLEM_GEMM_BLOCK_N * GOLEM_GEMM_BLOCK_K * 4 )) 256)
-out_scratch_bytes=$(align_up_int $(( GOLEM_ARRAY_OUTPUT_SIZE * 4 )) 256)
 out_tile_bytes=$(align_up_int $(( GOLEM_GEMM_BLOCK_M * GOLEM_GEMM_BLOCK_N * 4 )) 256)
-required_global_stride_bytes=$(( 0x2000 + GOLEM_DMA_SLOT_COUNT * mat_slot_bytes + GOLEM_DMA_SLOT_COUNT * vec_slot_bytes + out_scratch_bytes + out_tile_bytes + 0x40 + 256 ))
+out_vec_bytes=$(align_up_int $(( GOLEM_ARRAY_OUTPUT_SIZE * 4 )) 256)
+out_scratch_bytes=$(( out_vec_bytes > out_tile_bytes ? out_vec_bytes : out_tile_bytes ))
+gemm_m_tiles=$(( GOLEM_GEMM_M / GOLEM_GEMM_BLOCK_M ))
+gemm_n_tiles=$(( GOLEM_GEMM_N / GOLEM_GEMM_BLOCK_N ))
+partial_rows=$(( GOLEM_B_REUSE_M_TILES < gemm_m_tiles ? GOLEM_B_REUSE_M_TILES : gemm_m_tiles ))
+partial_cols=$(( GOLEM_A_REUSE_N_TILES < gemm_n_tiles ? GOLEM_A_REUSE_N_TILES : gemm_n_tiles ))
+partial_tile_count=$(( partial_rows * partial_cols ))
+required_global_stride_bytes=$(( 0x2000 + GOLEM_DMA_SLOT_COUNT * mat_slot_bytes + GOLEM_DMA_SLOT_COUNT * vec_slot_bytes + out_scratch_bytes + partial_tile_count * out_tile_bytes + 0x40 + 256 ))
 if (( GOLEM_GLOBAL_STRIDE_BYTES < required_global_stride_bytes )); then
 	GOLEM_GLOBAL_STRIDE_BYTES=$required_global_stride_bytes
 	GOLEM_GLOBAL_STRIDE_KB=$(( (GOLEM_GLOBAL_STRIDE_BYTES + 1023) / 1024 ))
@@ -469,7 +477,11 @@ if (( GOLEM_GLOBAL_STRIDE_BYTES < required_global_stride_bytes )); then
 fi
 
 if [[ "$GOLEM_CTRL_LINK_ENABLE" == "0" ]]; then
-	GOLEM_ARCH_SCRIPT="small/mvm_noc_softmax_cpu/ncores_selfcom_dma_softmax_archive.py"
+	if [[ "${GOLEM_SFU_MANAGER_COORDINATOR:-0}" == "1" ]]; then
+		GOLEM_ARCH_SCRIPT="small/mvm_noc_softmax_cpu/ncores_selfcom_dma_softmax_archive.py"
+	else
+		GOLEM_ARCH_SCRIPT="small/mvm_noc_softmax_cpu/ncores_selfcom_dma_softmax_archive.py"
+	fi
 	GOLEM_REQUEST_SCHEDULER_ENABLE=0
 	GOLEM_WORKER_COMMAND_PROCESSOR_ENABLE=0
 	GOLEM_MEMORY_ROUTERS=$(derive_memory_routers "$GOLEM_MESH_DIM_X" "$GOLEM_TOTAL_CORES" "$GOLEM_NUM_MEMORY_NODES" "$GOLEM_MEMORY_LAYOUT")

@@ -266,6 +266,31 @@ public:
             });
     }
 
+    virtual bool programMatrixGroupAsync(
+        const std::vector<uint32_t>& arrayIDs,
+        const std::vector<double>& matrix,
+        size_t elemBytes,
+        uint64_t tag,
+        typename ComputeArray::BufferCallback callback) override {
+        if (arrayIDs.empty() ||
+            matrix.size() != inputArraySize * outputArraySize || elemBytes == 0 ||
+            std::any_of(arrayIDs.begin(), arrayIDs.end(),
+                        [this](uint32_t id) { return id >= numArrays; })) {
+            return false;
+        }
+        return enqueueBufferTransfer(
+            matrix.size() * elemBytes, tag,
+            [this, arrayIDs, matrix, tag, callback = std::move(callback)]() {
+                for (uint32_t arrayID : arrayIDs) {
+                    for (size_t index = 0; index < matrix.size(); ++index) {
+                        setMatrixItem(static_cast<int32_t>(arrayID),
+                                      static_cast<int32_t>(index), matrix[index]);
+                    }
+                }
+                if (callback) callback(true, tag);
+            });
+    }
+
     virtual bool programInputAsync(
         uint32_t arrayID,
         const std::vector<double>& input,

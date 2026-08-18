@@ -10,10 +10,13 @@ rows=1024
 cols=4096
 timeout_seconds=1800
 artifact_root=""
+logits_file=""
+attention_head_dim=0
+attention_causal=0
 dry_run=0
 
 usage() {
-	printf 'Usage: %s [--rows N] [--cols N] [--timeout SEC] [--artifact-root DIR] [--dry-run]\n' "$0"
+	printf 'Usage: %s [--rows N] [--cols N] [--timeout SEC] [--artifact-root DIR] [--logits-file FILE] [--attention-head-dim N] [--causal 0|1] [--dry-run]\n' "$0"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -22,6 +25,9 @@ while [[ $# -gt 0 ]]; do
 		--cols) cols="$2"; shift 2 ;;
 		--timeout) timeout_seconds="$2"; shift 2 ;;
 		--artifact-root) artifact_root="$2"; shift 2 ;;
+		--logits-file) logits_file="$2"; shift 2 ;;
+		--attention-head-dim) attention_head_dim="$2"; shift 2 ;;
+		--causal) attention_causal="$2"; shift 2 ;;
 		--dry-run) dry_run=1; shift ;;
 		-h|--help) usage; exit 0 ;;
 		*) echo "[ERROR] unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -34,16 +40,49 @@ for value in "$rows" "$cols" "$timeout_seconds"; do
 		exit 2
 	fi
 done
-if (( rows % 16 != 0 )); then
-	echo "[ERROR] the first Row Engine profile requires rows divisible by 16" >&2
+manager_coordinator="${GOLEM_SFU_MANAGER_COORDINATOR:-0}"
+manager_groups="${GOLEM_SFU_MANAGER_GROUPS:-1}"
+manager_workers="${GOLEM_SFU_MANAGER_WORKERS:-4}"
+export GOLEM_SFU_MANAGER_COORDINATOR="$manager_coordinator"
+if [[ "$manager_coordinator" != 0 && "$manager_coordinator" != 1 ]] ||
+   [[ ! "$manager_groups" =~ ^[1-9][0-9]*$ ]] ||
+   [[ ! "$manager_workers" =~ ^[1-9][0-9]*$ ]] || (( manager_workers > 16 )); then
+	echo "[ERROR] manager mode requires enable=0|1, positive groups, and 1..16 workers" >&2
+	exit 2
+fi
+band_count=16
+total_cores=16
+total_groups=4
+group_manager_enable=0
+if [[ "$manager_coordinator" -eq 1 ]]; then
+	band_count="$manager_workers"
+	total_groups="$manager_groups"
+	total_cores=$(( manager_groups + manager_workers ))
+	group_manager_enable=1
+fi
+if (( rows % band_count != 0 )); then
+	echo "[ERROR] Row Engine rows must be divisible by active worker bands ($band_count)" >&2
 	exit 2
 fi
 if (( cols % 64 != 0 || cols > 4096 )); then
 	echo "[ERROR] the row-local profile requires cols divisible by 64 and <= 4096" >&2
 	exit 2
 fi
+if [[ ! "$attention_head_dim" =~ ^[0-9]+$ ]] ||
+   [[ "$attention_head_dim" != 0 && "$attention_head_dim" != 64 && "$attention_head_dim" != 128 ]]; then
+	echo "[ERROR] attention head dimension must be 0, 64, or 128" >&2
+	exit 2
+fi
+if [[ "$attention_causal" != 0 && "$attention_causal" != 1 ]]; then
+	echo "[ERROR] causal must be 0 or 1" >&2
+	exit 2
+fi
+if [[ "$attention_causal" == 1 && "$attention_head_dim" == 0 ]]; then
+	echo "[ERROR] causal mode requires --attention-head-dim" >&2
+	exit 2
+fi
 
-rows_per_tile=$(( rows / 16 ))
+rows_per_tile=$(( rows / band_count ))
 block_m=1
 if (( rows_per_tile >= 4 && rows_per_tile % 4 == 0 )); then
 	block_m=4
@@ -71,6 +110,9 @@ attempt_id="${run_id}_$(date +%Y%m%d_%H%M%S)_$$"
 attempt_stats="$artifact_root/stats/$attempt_id"
 attempt_stdout="$artifact_root/stdout/$attempt_id"
 mkdir -p "$artifact_root/inputs" "$artifact_root/outputs" "$attempt_stats" "$attempt_stdout"
+if [[ -z "$logits_file" ]]; then
+	logits_file="$artifact_root/inputs/softmax_logits_${rows}x${cols}.bin"
+fi
 
 export TMPDIR="${TMPDIR:-/data4/jjgong/tmp}"
 export GOLEM_RUN_ID="$attempt_id"
@@ -91,9 +133,11 @@ export GOLEM_SFU_JOB_SOFTMAX_DIRECT_ROWMAJOR_HBM=1
 export GOLEM_SFU_JOB_SOFTMAX_DISTRIBUTED_COLUMNS=0
 export GOLEM_SFU_JOB_SOFTMAX_ROW_ENGINE=1
 export GOLEM_SFU_JOB_SOFTMAX_TENSOR_CONTROLLER="${GOLEM_SFU_JOB_SOFTMAX_TENSOR_CONTROLLER:-1}"
+export GOLEM_SFU_ATTENTION_HEAD_DIM="$attention_head_dim"
+export GOLEM_SFU_ATTENTION_CAUSAL="$attention_causal"
 export GOLEM_SFU_SOFTMAX_HBM_LAYOUT=band_striped
-export GOLEM_SFU_JOB_SOFTMAX_WORKER_CORES=1
-export GOLEM_SFU_JOB_SOFTMAX_BAND_CORES=16
+export GOLEM_SFU_JOB_SOFTMAX_WORKER_CORES="$band_count"
+export GOLEM_SFU_JOB_SOFTMAX_BAND_CORES="$band_count"
 export GOLEM_SFU_JOB_SOFTMAX_STAGING_ROWS="$rows_per_tile"
 export GOLEM_SFU_JOB_SOFTMAX_JOB_ROWS="$rows_per_tile"
 export GOLEM_SFU_JOB_SOFTMAX_CHUNK_ELEMS=256
@@ -123,6 +167,7 @@ printf '[ROW-ENGINE] rows=%d cols=%d rows_per_tile=%d global_stride_kb=%d artifa
 for name in \
 	GOLEM_SFU_JOB_SOFTMAX_ROW_ENGINE \
 	GOLEM_SFU_JOB_SOFTMAX_TENSOR_CONTROLLER \
+	GOLEM_SFU_MANAGER_COORDINATOR \
 	GOLEM_SFU_SOFTMAX_HBM_LAYOUT \
 	GOLEM_SFU_JOB_SOFTMAX_DISTRIBUTED_COLUMNS \
 	GOLEM_SFU_JOB_SOFTMAX_WORKER_CORES \
@@ -136,16 +181,16 @@ for name in \
 done
 
 wrapper_args=(
-	--groups 4 --array-in 64 --array-out "$block_m" --num-arrays 64
-	--num-cores 16 --gemm-cores 16 --num-mem-nodes 5 --mesh-dim-x 4
+	--groups "$total_groups" --array-in 64 --array-out "$block_m" --num-arrays 64
+	--num-cores "$total_cores" --gemm-cores "$total_cores" --num-mem-nodes 5 --mesh-dim-x 4
 	--mem-node-size 134217728 --global-stride-kb "$global_stride_kb"
 	--gemm-m "$rows" --gemm-n "$cols" --gemm-k "$cols"
 	--gemm-block-m "$block_m" --gemm-block-n 64 --gemm-block-k 64
-	--dtype fp32 --group-manager-enable 0 --ctrl-link-enable 0
+	--dtype fp32 --group-manager-enable "$group_manager_enable" --ctrl-link-enable 0
 	--noc-in-buf 512KB --noc-out-buf 512KB
 	--noc-link-bw "$noc_link_bw" --noc-xbar-bw "$noc_xbar_bw" --noc-flit-size 128B
 	--gm-buf 1024KB --verify-softmax --softmax-reference logits
-	--softmax-logits-file "$artifact_root/inputs/softmax_logits_${rows}x${cols}.bin"
+	--softmax-logits-file "$logits_file"
 	--softmax-c-file "$artifact_root/outputs/softmax.bin"
 )
 
@@ -178,7 +223,7 @@ sha256sum \
 	"$golem_library" \
 	"$SCRIPT_DIR/run_muticore_softmax.sh" \
 	"$SCRIPT_DIR/parse_muticore_softmax.py" \
-	"$artifact_root/inputs/softmax_logits_${rows}x${cols}.bin" \
+	"$logits_file" \
 	"$artifact_root/outputs/softmax.bin" > "$signature_file"
 
 python3 "$SCRIPT_DIR/parse_muticore_softmax.py" \
@@ -188,4 +233,6 @@ python3 "$SCRIPT_DIR/parse_muticore_softmax.py" \
 	--attempt-id "$attempt_id" \
 	--output "$artifact_root/row_engine_result.json" \
 	$(if [[ "$GOLEM_SFU_JOB_SOFTMAX_TENSOR_CONTROLLER" -eq 1 ]]; then printf '%s' '--tensor-controller'; fi) \
+	$(if [[ "$manager_coordinator" -eq 1 ]]; then printf '%s' '--manager-coordinator'; fi) \
+	--worker-count "$band_count" --manager-count "$(( group_manager_enable * total_groups ))" \
 	--require-contract

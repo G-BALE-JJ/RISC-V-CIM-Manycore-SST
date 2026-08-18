@@ -161,6 +161,11 @@ public:
                                     size_t elemBytes,
                                     uint64_t tag,
                                     BufferCallback callback) = 0;
+    virtual bool programMatrixGroupAsync(const std::vector<uint32_t>& arrayIDs,
+                                         const std::vector<double>& matrix,
+                                         size_t elemBytes,
+                                         uint64_t tag,
+                                         BufferCallback callback) = 0;
     virtual bool programInputAsync(uint32_t arrayID,
                                    const std::vector<double>& input,
                                    size_t elemBytes,

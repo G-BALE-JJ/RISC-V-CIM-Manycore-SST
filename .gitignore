@@ -10,6 +10,7 @@
 Makefile.in
 Makefile
 !src/sst/elements/golem/tests/small/mvm_noc_softmax_sfu/Makefile
+!src/sst/elements/golem/tests/small/muticore_attention/Makefile
 aclocal.m4
 autom4te.cache/
 config.log
@@ -61,3 +62,4 @@ src/sst/elements/memHierarchy/tests/dramsim3*.json
 # Tool caches
 .ruff_cache/
 **/__pycache__/
+src/sst/elements/golem/tests/small/muticore_softmax/figures/**/*.tiff

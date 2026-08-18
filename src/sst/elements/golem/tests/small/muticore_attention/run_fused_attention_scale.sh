@@ -6,17 +6,22 @@ TESTS_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BASE_RUNNER="$TESTS_DIR/run_noc_dma_pipeline.sh"
 ARTIFACT_ROOT=""
 TIMEOUT_SECONDS=7200
+TIMEOUT_EXPLICIT=0
 DRY_RUN=0
 SCALE_POINT=e4
+ALLOW_EXPENSIVE=0
+PV_MATRIX_BROADCAST=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --artifact-root) ARTIFACT_ROOT="$2"; shift 2 ;;
-    --timeout) TIMEOUT_SECONDS="$2"; shift 2 ;;
+    --timeout) TIMEOUT_SECONDS="$2"; TIMEOUT_EXPLICIT=1; shift 2 ;;
     --scale-point) SCALE_POINT="$2"; shift 2 ;;
+    --allow-expensive) ALLOW_EXPENSIVE=1; shift ;;
+    --pv-matrix-broadcast) PV_MATRIX_BROADCAST=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     -h|--help)
-      echo "Usage: run_fused_attention_scale.sh [--scale-point e2|e3|e4] [--artifact-root DIR] [--timeout SEC] [--dry-run]"
+      echo "Usage: run_fused_attention_scale.sh [--scale-point e2|e3|e4|e5] [--allow-expensive] [--pv-matrix-broadcast] [--artifact-root DIR] [--timeout SEC] [--dry-run]"
       exit 0 ;;
     *) echo "Unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -53,8 +58,24 @@ case "$SCALE_POINT" in
     BUILD_TARGET=scale-e4
     GUEST_NAME=fused_attention_scale_e4
     ;;
+  e5)
+    RUN_ID=fused_attention_e5_s4096_d128
+    TOTAL_QUERIES=4096
+    KEYS=4096
+    HEAD_DIM=128
+    MANAGER_QUERIES=1024
+    ARRAY_INPUT=128
+    BUILD_TARGET=scale-e5
+    GUEST_NAME=fused_attention_scale_e5
+    if (( ! TIMEOUT_EXPLICIT )); then TIMEOUT_SECONDS=28800; fi
+    ;;
   *) echo "Unknown scale point: $SCALE_POINT" >&2; exit 2 ;;
 esac
+
+if [[ "$SCALE_POINT" == e5 ]] && (( ! DRY_RUN && ! ALLOW_EXPENSIVE )); then
+  echo "E5 is an expensive full SST run; pass --allow-expensive to execute it" >&2
+  exit 2
+fi
 
 ARTIFACT_ROOT="${ARTIFACT_ROOT:-/data4/jjgong/tmp/$RUN_ID}"
 Q_FILE="$ARTIFACT_ROOT/q_${TOTAL_QUERIES}x${HEAD_DIM}.bin"
@@ -94,6 +115,7 @@ RUN_CMD=(timeout "$TIMEOUT_SECONDS" env
   "GOLEM_ATTENTION_V_OFFSET=$V_OFFSET"
   GOLEM_ATTENTION_WINDOW_OFFSET=0xC0000
   GOLEM_ATTENTION_WINDOW_BYTES=0x10000
+  "GOLEM_ATTENTION_PV_MATRIX_BROADCAST=$PV_MATRIX_BROADCAST"
   GOLEM_SFU_ROW_CONTEXTS=16
   GOLEM_DMA_READ_RETRY_TICKS=4096
   GOLEM_DMA_READ_MAX_RETRIES=32
@@ -124,6 +146,9 @@ VERIFY_STATS_CMD=(python3 "$SCRIPT_DIR/verify_fused_attention_scale_stats.py"
   --accelerator-clock "${VANADIS_CPU_CLOCK:-1.0GHz}"
   --timebase-ticks-per-second 1000000000000
   --result-json "$LIFECYCLE_JSON" "$STATS_FILE")
+if (( PV_MATRIX_BROADCAST )); then
+  VERIFY_STATS_CMD+=(--pv-matrix-broadcast)
+fi
 
 if (( DRY_RUN )); then
   printf '%q ' "${GENERATE_CMD[@]}"; printf '\n'

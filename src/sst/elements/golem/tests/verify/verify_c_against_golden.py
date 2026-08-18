@@ -73,6 +73,7 @@ def main(argv=None):
     parser.add_argument("--m", type=int, required=True)
     parser.add_argument("--n", type=int, required=True)
     parser.add_argument("--k", type=int, required=True)
+    parser.add_argument("--transpose-b", type=int, choices=(0, 1), default=0)
     parser.add_argument(
         "--dtype",
         default=os.getenv("GOLEM_MATMUL_DTYPE", "int32"),
@@ -143,7 +144,9 @@ def main(argv=None):
         )
 
     a = load_matrix(args.a_file, args.m, args.k, "A", dtype)
-    b = load_matrix(args.b_file, args.k, args.n, "B", dtype)
+    b_rows = args.n if args.transpose_b else args.k
+    b_cols = args.k if args.transpose_b else args.n
+    b = load_matrix(args.b_file, b_rows, b_cols, "B", dtype)
     c_loaded = load_matrix(args.c_file, c_rows, c_cols, "C", dtype)
     c = [row[:crop_n] for row in c_loaded[:crop_m]]
     atol, rtol = default_tolerance(dtype)
@@ -163,7 +166,8 @@ def main(argv=None):
         j = rng.randrange(args.n)
         ref_ij = 0.0 if dtype == "fp32" else 0
         for kk in range(args.k):
-            ref_ij += a[i][kk] * b[kk][j]
+            b_value = b[j][kk] if args.transpose_b else b[kk][j]
+            ref_ij += a[i][kk] * b_value
 
         if args.bias_enable != 0:
             ref_ij += bias_value

@@ -71,8 +71,9 @@ class MuticoreSoftmaxTest(unittest.TestCase):
     def test_tensor_parser_requires_the_expected_number_of_control_completions(self):
         with open(PARSER, encoding="utf-8") as source_file:
             source = source_file.read()
-        self.assertIn("expected_control_events = min(args.rows, len(components))", source)
+        self.assertIn("expected_control_events = min(args.rows, args.worker_count)", source)
         self.assertIn('timeline_event_counts["completion_received"] == expected_control_events', source)
+        self.assertIn('parser.add_argument("--manager-coordinator", action="store_true")', source)
 
     def test_parser_takes_critical_max_across_sfus_not_global_sum(self):
         rows = []

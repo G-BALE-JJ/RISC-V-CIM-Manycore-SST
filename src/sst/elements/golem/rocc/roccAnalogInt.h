@@ -57,6 +57,7 @@ public:
         {"outputOperandSize", "Size of output operand in bytes."},
         {"attention_window_offset", "Offset of the fused Attention Local GM window", "0xC0000"},
         {"attention_window_bytes", "Capacity of the fused Attention Local GM window", "0x10000"},
+        {"attention_pv_matrix_broadcast", "Broadcast one PV matrix transfer to all query arrays", "0"},
         {"progress_heartbeat", "Enable lightweight RoCC MVM progress heartbeat logs", "0"},
         {"progress_interval_cycles", "Progress heartbeat interval in RoCC cycles", "50000"},
         {"progress_total_mvm_ops", "Expected total MVM ops for this core", "0"})
@@ -94,6 +95,12 @@ public:
         {"attention_manager_band_completion_received_tick", "Tick for each Attention manager band received by root", "ticks", 1},
         {"attention_tensor_complete_tick", "Tick when root completes the Attention tensor", "ticks", 1},
         {"attention_manager_wait_observed_tick", "Tick when software observes Attention manager completion", "ticks", 1},
+        {"attention_worker_dispatch_accept_tick", "Tick when an Attention worker accepts a dispatch", "ticks", 1},
+        {"attention_worker_qk_tile_complete_tick", "Tick when an Attention worker completes a QK tile", "ticks", 1},
+        {"attention_worker_softmax_tile_complete_tick", "Tick when an Attention worker completes a Softmax tile", "ticks", 1},
+        {"attention_worker_pv_tile_complete_tick", "Tick when an Attention worker completes a PV tile", "ticks", 1},
+        {"attention_worker_output_dma_ack_tick", "Tick when an Attention worker receives an output DMA acknowledgement", "ticks", 1},
+        {"attention_pv_matrix_broadcasts", "PV matrix group broadcasts", "broadcasts", 1},
         {"attention_qk_array_ops", "QK array operations", "operations", 1},
         {"attention_pv_array_ops", "PV array operations", "operations", 1},
         {"attention_sp_hbm_bytes", "Score/probability HBM bytes", "bytes", 1})
