@@ -11,6 +11,17 @@ DRY_RUN=0
 SCALE_POINT=e4
 ALLOW_EXPENSIVE=0
 PV_MATRIX_BROADCAST=0
+QK_MATRIX_BROADCAST=0
+QK_DATAFLOW_TRANSPOSE=0
+KV_TILE_ROTATION=0
+KV_DOUBLE_BUFFER=0
+PV_V_TILE_REUSE=0
+PV_INPUT_PIPELINE=0
+PV_COMPACT_INPUT=0
+PV_RESTORE_PIPELINE=0
+PV_OUTPUT_PIPELINE=0
+PV_EARLY_COMPUTE=0
+PV_MATRIX_SOFTMAX_OVERLAP=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -19,9 +30,20 @@ while [[ $# -gt 0 ]]; do
     --scale-point) SCALE_POINT="$2"; shift 2 ;;
     --allow-expensive) ALLOW_EXPENSIVE=1; shift ;;
     --pv-matrix-broadcast) PV_MATRIX_BROADCAST=1; shift ;;
+    --qk-matrix-broadcast) QK_MATRIX_BROADCAST=1; shift ;;
+    --qk-dataflow-transpose) QK_DATAFLOW_TRANSPOSE=1; QK_MATRIX_BROADCAST=1; shift ;;
+    --kv-tile-rotation) KV_TILE_ROTATION=1; shift ;;
+    --kv-double-buffer) KV_DOUBLE_BUFFER=1; shift ;;
+    --pv-v-tile-reuse) PV_V_TILE_REUSE=1; shift ;;
+    --pv-input-pipeline) PV_INPUT_PIPELINE=1; shift ;;
+    --pv-compact-input) PV_COMPACT_INPUT=1; shift ;;
+    --pv-restore-pipeline) PV_RESTORE_PIPELINE=1; shift ;;
+    --pv-output-pipeline) PV_OUTPUT_PIPELINE=1; shift ;;
+    --pv-early-compute) PV_EARLY_COMPUTE=1; shift ;;
+    --pv-matrix-softmax-overlap) PV_MATRIX_SOFTMAX_OVERLAP=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     -h|--help)
-      echo "Usage: run_fused_attention_scale.sh [--scale-point e2|e3|e4|e5] [--allow-expensive] [--pv-matrix-broadcast] [--artifact-root DIR] [--timeout SEC] [--dry-run]"
+      echo "Usage: run_fused_attention_scale.sh [--scale-point e2|e3|e4|e5] [--allow-expensive] [--pv-matrix-broadcast] [--qk-matrix-broadcast] [--qk-dataflow-transpose] [--kv-tile-rotation] [--kv-double-buffer] [--pv-v-tile-reuse] [--pv-input-pipeline] [--pv-compact-input] [--pv-restore-pipeline] [--pv-output-pipeline] [--pv-early-compute] [--pv-matrix-softmax-overlap] [--artifact-root DIR] [--timeout SEC] [--dry-run]"
       exit 0 ;;
     *) echo "Unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -72,6 +94,11 @@ case "$SCALE_POINT" in
   *) echo "Unknown scale point: $SCALE_POINT" >&2; exit 2 ;;
 esac
 
+ATTENTION_WINDOW_BYTES=0x10000
+if (( KV_DOUBLE_BUFFER )); then
+  ATTENTION_WINDOW_BYTES=0x14880
+fi
+
 if [[ "$SCALE_POINT" == e5 ]] && (( ! DRY_RUN && ! ALLOW_EXPENSIVE )); then
   echo "E5 is an expensive full SST run; pass --allow-expensive to execute it" >&2
   exit 2
@@ -114,8 +141,19 @@ RUN_CMD=(timeout "$TIMEOUT_SECONDS" env
   "GOLEM_ATTENTION_K_OFFSET=$K_OFFSET"
   "GOLEM_ATTENTION_V_OFFSET=$V_OFFSET"
   GOLEM_ATTENTION_WINDOW_OFFSET=0xC0000
-  GOLEM_ATTENTION_WINDOW_BYTES=0x10000
+  "GOLEM_ATTENTION_WINDOW_BYTES=$ATTENTION_WINDOW_BYTES"
+  "GOLEM_ATTENTION_QK_DATAFLOW_TRANSPOSE=$QK_DATAFLOW_TRANSPOSE"
+  "GOLEM_ATTENTION_QK_MATRIX_BROADCAST=$QK_MATRIX_BROADCAST"
   "GOLEM_ATTENTION_PV_MATRIX_BROADCAST=$PV_MATRIX_BROADCAST"
+  "GOLEM_ATTENTION_KV_TILE_ROTATION=$KV_TILE_ROTATION"
+  "GOLEM_ATTENTION_KV_DOUBLE_BUFFER=$KV_DOUBLE_BUFFER"
+  "GOLEM_ATTENTION_PV_V_TILE_REUSE=$PV_V_TILE_REUSE"
+  "GOLEM_ATTENTION_PV_INPUT_PIPELINE=$PV_INPUT_PIPELINE"
+  "GOLEM_ATTENTION_PV_COMPACT_INPUT=$PV_COMPACT_INPUT"
+  "GOLEM_ATTENTION_PV_RESTORE_PIPELINE=$PV_RESTORE_PIPELINE"
+  "GOLEM_ATTENTION_PV_OUTPUT_PIPELINE=$PV_OUTPUT_PIPELINE"
+  "GOLEM_ATTENTION_PV_EARLY_COMPUTE=$PV_EARLY_COMPUTE"
+  "GOLEM_ATTENTION_PV_MATRIX_SOFTMAX_OVERLAP=$PV_MATRIX_SOFTMAX_OVERLAP"
   GOLEM_SFU_ROW_CONTEXTS=16
   GOLEM_DMA_READ_RETRY_TICKS=4096
   GOLEM_DMA_READ_MAX_RETRIES=32
@@ -148,6 +186,33 @@ VERIFY_STATS_CMD=(python3 "$SCRIPT_DIR/verify_fused_attention_scale_stats.py"
   --result-json "$LIFECYCLE_JSON" "$STATS_FILE")
 if (( PV_MATRIX_BROADCAST )); then
   VERIFY_STATS_CMD+=(--pv-matrix-broadcast)
+fi
+if (( QK_MATRIX_BROADCAST )); then
+  VERIFY_STATS_CMD+=(--qk-matrix-broadcast)
+fi
+if (( QK_DATAFLOW_TRANSPOSE )); then
+  VERIFY_STATS_CMD+=(--qk-dataflow-transpose)
+fi
+if (( KV_DOUBLE_BUFFER )); then
+  VERIFY_STATS_CMD+=(--kv-double-buffer)
+fi
+if (( PV_V_TILE_REUSE )); then
+  VERIFY_STATS_CMD+=(--pv-v-tile-reuse)
+fi
+if (( PV_INPUT_PIPELINE )); then
+  VERIFY_STATS_CMD+=(--pv-input-pipeline)
+fi
+if (( PV_RESTORE_PIPELINE )); then
+  VERIFY_STATS_CMD+=(--pv-restore-pipeline)
+fi
+if (( PV_OUTPUT_PIPELINE )); then
+  VERIFY_STATS_CMD+=(--pv-output-pipeline)
+fi
+if (( PV_EARLY_COMPUTE )); then
+  VERIFY_STATS_CMD+=(--pv-early-compute)
+fi
+if (( PV_MATRIX_SOFTMAX_OVERLAP )); then
+  VERIFY_STATS_CMD+=(--pv-matrix-softmax-overlap)
 fi
 
 if (( DRY_RUN )); then

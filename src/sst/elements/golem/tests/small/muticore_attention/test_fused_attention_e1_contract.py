@@ -8,6 +8,9 @@ import attention_case
 import verify_fused_attention_scale_output
 from verify_fused_attention_scale_stats import (
     PROFILES,
+    summarize_intertile_breakdown,
+    summarize_kv_second_lookahead,
+    summarize_tile_pipeline_breakdown,
     summarize_worker_critical_path,
     ticks_to_cycles,
 )
@@ -34,6 +37,12 @@ class FusedAttentionE1ContractTests(unittest.TestCase):
         ).read_text()
         cls.globalmemory = (
             REPO_ROOT / "src/sst/elements/golem/globalmemory/globalmemory.h"
+        ).read_text()
+        cls.memnic_base = (
+            REPO_ROOT / "src/sst/elements/memHierarchy/memNICBase.h"
+        ).read_text()
+        cls.memnic = (
+            REPO_ROOT / "src/sst/elements/memHierarchy/memNIC.h"
         ).read_text()
         cls.compute_array = (
             REPO_ROOT / "src/sst/elements/golem/array/computeArray.h"
@@ -348,6 +357,468 @@ class FusedAttentionE1ContractTests(unittest.TestCase):
         self.assertEqual(optimized_run.returncode, 0, optimized_run.stderr)
         self.assertIn("GOLEM_ATTENTION_PV_MATRIX_BROADCAST=1", optimized_run.stdout)
         self.assertIn("--pv-matrix-broadcast", optimized_run.stdout)
+
+    def test_qk_matrix_broadcast_is_explicit_and_opt_in(self):
+        self.assertIn("attention_qk_matrix_broadcast", self.rocc)
+        self.assertIn("GOLEM_ATTENTION_QK_MATRIX_BROADCAST", self.cpu_builder)
+        self.assertIn("attention_qk_matrix_broadcasts", self.stats_verifier)
+        self.assertIn("programMatrixGroupAsync", self.rocc)
+        self.assertIn("programMatrixAsync", self.rocc)
+
+        default_run = subprocess.run(
+            ["bash", str(RUNNER), "--scale-point", "e2", "--dry-run"],
+            text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(default_run.returncode, 0, default_run.stderr)
+        self.assertIn("GOLEM_ATTENTION_QK_MATRIX_BROADCAST=0", default_run.stdout)
+
+        optimized_run = subprocess.run(
+            [
+                "bash", str(RUNNER), "--scale-point", "e2",
+                "--qk-matrix-broadcast", "--dry-run",
+            ],
+            text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(optimized_run.returncode, 0, optimized_run.stderr)
+        self.assertIn("GOLEM_ATTENTION_QK_MATRIX_BROADCAST=1", optimized_run.stdout)
+        self.assertIn("--qk-matrix-broadcast", optimized_run.stdout)
+
+    def test_qk_transposed_dataflow_is_explicit_and_opt_in(self):
+        self.assertIn("attention_qk_dataflow_transpose", self.rocc)
+        self.assertIn("GOLEM_ATTENTION_QK_DATAFLOW_TRANSPOSE", self.cpu_builder)
+        self.assertIn("readAttentionQkTransposedOutput", self.rocc)
+        self.assertIn("--qk-dataflow-transpose", self.stats_verifier)
+
+        default_run = subprocess.run(
+            ["bash", str(RUNNER), "--scale-point", "e2", "--dry-run"],
+            text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(default_run.returncode, 0, default_run.stderr)
+        self.assertIn("GOLEM_ATTENTION_QK_DATAFLOW_TRANSPOSE=0", default_run.stdout)
+
+        optimized_run = subprocess.run(
+            [
+                "bash", str(RUNNER), "--scale-point", "e2",
+                "--qk-dataflow-transpose", "--dry-run",
+            ],
+            text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(optimized_run.returncode, 0, optimized_run.stderr)
+        self.assertIn("GOLEM_ATTENTION_QK_DATAFLOW_TRANSPOSE=1", optimized_run.stdout)
+        self.assertIn("GOLEM_ATTENTION_QK_MATRIX_BROADCAST=1", optimized_run.stdout)
+        self.assertIn("--qk-dataflow-transpose", optimized_run.stdout)
+
+    def test_kv_tile_rotation_is_explicit_and_preserves_online_tile_order(self):
+        self.assertIn("attention_kv_tile_rotation", self.rocc)
+        self.assertIn("GOLEM_ATTENTION_KV_TILE_ROTATION", self.cpu_builder)
+        self.assertIn("keyTileOrdinal", self.rocc)
+        self.assertIn("attentionPhysicalKeyTile", self.rocc)
+
+        default_run = subprocess.run(
+            ["bash", str(RUNNER), "--scale-point", "e2", "--dry-run"],
+            text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(default_run.returncode, 0, default_run.stderr)
+        self.assertIn("GOLEM_ATTENTION_KV_TILE_ROTATION=0", default_run.stdout)
+
+        optimized_run = subprocess.run(
+            [
+                "bash", str(RUNNER), "--scale-point", "e2",
+                "--kv-tile-rotation", "--dry-run",
+            ],
+            text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(optimized_run.returncode, 0, optimized_run.stderr)
+        self.assertIn("GOLEM_ATTENTION_KV_TILE_ROTATION=1", optimized_run.stdout)
+        self.assertIn("--kv-tile-rotation", RUNNER.read_text())
+
+    def test_pv_v_tile_reuse_is_explicit_and_default_off(self):
+        self.assertIn("attention_pv_v_tile_reuse", self.rocc)
+        self.assertIn("GOLEM_ATTENTION_PV_V_TILE_REUSE", self.cpu_builder)
+
+        default_run = subprocess.run(
+            ["bash", str(RUNNER), "--scale-point", "e2", "--dry-run"],
+            text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(default_run.returncode, 0, default_run.stderr)
+        self.assertIn("GOLEM_ATTENTION_PV_V_TILE_REUSE=0", default_run.stdout)
+
+        optimized_run = subprocess.run(
+            [
+                "bash", str(RUNNER), "--scale-point", "e2",
+                "--pv-v-tile-reuse", "--dry-run",
+            ],
+            text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(optimized_run.returncode, 0, optimized_run.stderr)
+        self.assertIn("GOLEM_ATTENTION_PV_V_TILE_REUSE=1", optimized_run.stdout)
+        self.assertIn("--pv-v-tile-reuse", RUNNER.read_text())
+
+    def test_kv_double_buffer_prefetch_is_explicit_and_capacity_checked(self):
+        self.assertIn("attention_kv_double_buffer", self.rocc)
+        self.assertIn("ATTENTION_E3_DOUBLE_BUFFER_WINDOW_BYTES", self.rocc)
+        self.assertIn("kLocalBuffers", self.rocc)
+        self.assertIn("vLocalBuffers", self.rocc)
+        self.assertIn("attention_kv_prefetch_tiles", self.rocc)
+        self.assertIn("attention_kv_prefetch_hits", self.rocc)
+        self.assertIn("attention_kv_prefetch_waits", self.rocc)
+        self.assertIn("GOLEM_ATTENTION_KV_DOUBLE_BUFFER", self.cpu_builder)
+
+        default_run = subprocess.run(
+            ["bash", str(RUNNER), "--scale-point", "e2", "--dry-run"],
+            text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(default_run.returncode, 0, default_run.stderr)
+        self.assertIn("GOLEM_ATTENTION_KV_DOUBLE_BUFFER=0", default_run.stdout)
+        self.assertIn("GOLEM_ATTENTION_WINDOW_BYTES=0x10000", default_run.stdout)
+
+        optimized_run = subprocess.run(
+            [
+                "bash", str(RUNNER), "--scale-point", "e2",
+                "--kv-double-buffer", "--dry-run",
+            ],
+            text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(optimized_run.returncode, 0, optimized_run.stderr)
+        self.assertIn("GOLEM_ATTENTION_KV_DOUBLE_BUFFER=1", optimized_run.stdout)
+        self.assertIn("GOLEM_ATTENTION_WINDOW_BYTES=0x14880", optimized_run.stdout)
+
+    def test_pv_input_pipeline_is_explicit_and_joins_all_array_programs(self):
+        self.assertIn("attention_pv_input_pipeline", self.rocc)
+        self.assertIn("attentionPvInputsPending", self.rocc)
+        self.assertIn("completeAttentionPvInputProgram", self.rocc)
+        self.assertIn("attention_pv_input_pipeline_rows", self.rocc)
+        self.assertIn("GOLEM_ATTENTION_PV_INPUT_PIPELINE", self.cpu_builder)
+
+        default_run = subprocess.run(
+            ["bash", str(RUNNER), "--scale-point", "e2", "--dry-run"],
+            text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(default_run.returncode, 0, default_run.stderr)
+        self.assertIn("GOLEM_ATTENTION_PV_INPUT_PIPELINE=0", default_run.stdout)
+
+        optimized_run = subprocess.run(
+            [
+                "bash", str(RUNNER), "--scale-point", "e2",
+                "--pv-input-pipeline", "--dry-run",
+            ],
+            text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(optimized_run.returncode, 0, optimized_run.stderr)
+        self.assertIn("GOLEM_ATTENTION_PV_INPUT_PIPELINE=1", optimized_run.stdout)
+        self.assertIn("--pv-input-pipeline", RUNNER.read_text())
+
+    def test_pv_compact_input_is_default_off_and_programs_only_a_bounded_prefix(self):
+        self.assertIn("attention_pv_compact_input", self.rocc)
+        self.assertIn("attentionPvCompactInput_ ? p : input", self.rocc)
+        self.assertIn("GOLEM_ATTENTION_PV_COMPACT_INPUT", self.cpu_builder)
+        for array_source in (self.mvm_array, self.crosssim_array):
+            self.assertIn("input.empty()", array_source)
+            self.assertIn("input.size() > inputArraySize", array_source)
+
+        default_run = subprocess.run(
+            ["bash", str(RUNNER), "--scale-point", "e2", "--dry-run"],
+            text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(default_run.returncode, 0, default_run.stderr)
+        self.assertIn("GOLEM_ATTENTION_PV_COMPACT_INPUT=0", default_run.stdout)
+
+        compact_run = subprocess.run(
+            [
+                "bash", str(RUNNER), "--scale-point", "e2",
+                "--pv-compact-input", "--dry-run",
+            ],
+            text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(compact_run.returncode, 0, compact_run.stderr)
+        self.assertIn("GOLEM_ATTENTION_PV_COMPACT_INPUT=1", compact_run.stdout)
+
+    def test_kv_prefetch_slack_and_memnic_response_queue_are_observable(self):
+        prefetch_statistics = (
+            "attention_kv_prefetch_dma_ticks",
+            "attention_kv_prefetch_ready_lead_ticks",
+            "attention_kv_prefetch_wait_ticks",
+        )
+        for statistic in prefetch_statistics:
+            self.assertIn(statistic, self.rocc)
+            self.assertIn(statistic, self.rocc_float)
+            self.assertIn(statistic, self.rocc_int)
+            self.assertIn(statistic, self.stats_verifier)
+
+        self.assertIn("attentionKvPrefetchIssueTick", self.rocc)
+        self.assertIn("attentionKvPrefetchReadyTick", self.rocc)
+        self.assertIn("attentionKvPrefetchConsumeTick", self.rocc)
+        self.assertIn("GOLEM_MEMNIC_DMA_RESPONSE_STATS", self.memnic_base)
+        for field in ("enqueued=", "high_water=", "queue_wait_ticks="):
+            self.assertIn(field, self.memnic_base)
+        self.assertIn("finishGolemDmaResponseStats", self.memnic)
+
+    def test_kv_second_lookahead_release_window_is_observable(self):
+        release_statistics = (
+            "attention_kv_k_release_ticks",
+            "attention_kv_v_release_ticks",
+            "attention_kv_next_ready_at_release_tiles",
+            "attention_kv_second_lookahead_candidates",
+            "attention_kv_second_lookahead_lead_ticks",
+        )
+        for statistic in release_statistics:
+            self.assertIn(statistic, self.rocc)
+            self.assertIn(statistic, self.rocc_float)
+            self.assertIn(statistic, self.rocc_int)
+            self.assertIn(statistic, self.stats_verifier)
+
+        self.assertIn("recordAttentionKvOperandRelease", self.rocc)
+        self.assertIn("updateAttentionKvSecondLookaheadEligibility", self.rocc)
+        reuse_run = subprocess.run(
+            [
+                "bash", str(RUNNER), "--scale-point", "e2",
+                "--pv-v-tile-reuse", "--dry-run",
+            ],
+            text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(reuse_run.returncode, 0, reuse_run.stderr)
+        self.assertIn(
+            "verify_fused_attention_scale_stats.py --profile e2 ",
+            reuse_run.stdout,
+        )
+        self.assertIn("--pv-v-tile-reuse", reuse_run.stdout)
+
+    def test_kv_second_lookahead_summary_aggregates_worker_windows(self):
+        observed = {
+            ("core4:rocc", "attention_kv_k_release_ticks"): 20,
+            ("core4:rocc", "attention_kv_v_release_ticks"): 40,
+            ("core4:rocc", "attention_kv_second_lookahead_lead_ticks"): 30,
+            ("core4:rocc", "attention_kv_second_lookahead_candidates"): 2,
+            ("core4:rocc", "attention_kv_next_ready_at_release_tiles"): 1,
+            ("core5:rocc", "attention_kv_k_release_ticks"): 10,
+            ("core5:rocc", "attention_kv_v_release_ticks"): 20,
+            ("core5:rocc", "attention_kv_second_lookahead_lead_ticks"): 10,
+            ("core5:rocc", "attention_kv_second_lookahead_candidates"): 1,
+        }
+        counts = {
+            ("core4:rocc", "attention_kv_k_release_ticks"): 2,
+            ("core4:rocc", "attention_kv_v_release_ticks"): 2,
+            ("core4:rocc", "attention_kv_second_lookahead_lead_ticks"): 2,
+            ("core5:rocc", "attention_kv_k_release_ticks"): 1,
+            ("core5:rocc", "attention_kv_v_release_ticks"): 1,
+            ("core5:rocc", "attention_kv_second_lookahead_lead_ticks"): 1,
+        }
+        maxima = {
+            ("core4:rocc", "attention_kv_second_lookahead_lead_ticks"): 18,
+            ("core5:rocc", "attention_kv_second_lookahead_lead_ticks"): 10,
+        }
+        summary = summarize_kv_second_lookahead(
+            observed, counts, maxima, range(4, 6), max_candidates=10,
+            accelerator_clock_hz=1_000,
+            timebase_ticks_per_second=1_000,
+        )
+        self.assertEqual(summary["candidates"], 3)
+        self.assertEqual(summary["ready_at_release"], 1)
+        self.assertEqual(summary["ready_after_release_before_boundary"], 2)
+        self.assertEqual(summary["mean_cycles"]["available_lead"], 40 / 3)
+        self.assertEqual(summary["max_available_lead_cycles"], 18)
+
+    def test_pv_matrix_softmax_overlap_joins_both_async_operations(self):
+        self.assertIn("attention_pv_matrix_softmax_overlap", self.rocc)
+        self.assertIn("attentionSoftmaxComplete", self.rocc)
+        self.assertIn("attentionPvMatrixComplete", self.rocc)
+        self.assertIn("continueAttentionAfterSoftmaxAndPvMatrix", self.rocc)
+        self.assertIn("attention_pv_matrix_overlap_tiles", self.rocc)
+        self.assertIn("attention_pv_matrix_overlap_hits", self.rocc)
+        self.assertIn("attention_pv_matrix_overlap_waits", self.rocc)
+        self.assertIn("GOLEM_ATTENTION_PV_MATRIX_SOFTMAX_OVERLAP", self.cpu_builder)
+        self.assertIn("pv_matrix_softmax_overlap", self.stats_verifier)
+
+        default_run = subprocess.run(
+            ["bash", str(RUNNER), "--scale-point", "e2", "--dry-run"],
+            text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(default_run.returncode, 0, default_run.stderr)
+        self.assertIn(
+            "GOLEM_ATTENTION_PV_MATRIX_SOFTMAX_OVERLAP=0", default_run.stdout
+        )
+
+        optimized_run = subprocess.run(
+            [
+                "bash", str(RUNNER), "--scale-point", "e2",
+                "--pv-matrix-softmax-overlap", "--dry-run",
+            ],
+            text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(optimized_run.returncode, 0, optimized_run.stderr)
+        self.assertIn(
+            "GOLEM_ATTENTION_PV_MATRIX_SOFTMAX_OVERLAP=1", optimized_run.stdout
+        )
+        self.assertIn("--pv-matrix-softmax-overlap", RUNNER.read_text())
+
+    def test_pv_restore_pipeline_joins_all_output_writes(self):
+        self.assertIn("attention_pv_restore_pipeline", self.rocc)
+        self.assertIn("attentionPvRestoresPending", self.rocc)
+        self.assertIn("completeAttentionPvRestore", self.rocc)
+        self.assertIn("attention_pv_restore_pipeline_rows", self.rocc)
+        self.assertIn("GOLEM_ATTENTION_PV_RESTORE_PIPELINE", self.cpu_builder)
+        self.assertIn("pv_restore_pipeline", self.stats_verifier)
+
+        default_run = subprocess.run(
+            ["bash", str(RUNNER), "--scale-point", "e2", "--dry-run"],
+            text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(default_run.returncode, 0, default_run.stderr)
+        self.assertIn("GOLEM_ATTENTION_PV_RESTORE_PIPELINE=0", default_run.stdout)
+
+        optimized_run = subprocess.run(
+            [
+                "bash", str(RUNNER), "--scale-point", "e2",
+                "--pv-restore-pipeline", "--dry-run",
+            ],
+            text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(optimized_run.returncode, 0, optimized_run.stderr)
+        self.assertIn("GOLEM_ATTENTION_PV_RESTORE_PIPELINE=1", optimized_run.stdout)
+        self.assertIn("--pv-restore-pipeline", RUNNER.read_text())
+
+    def test_pv_output_pipeline_retries_backpressure_and_joins_writes(self):
+        self.assertIn("attention_pv_output_pipeline", self.rocc)
+        self.assertIn("attentionPvOutputWritesPending", self.rocc)
+        self.assertIn("attentionPvOutputWriteRetry", self.rocc)
+        self.assertIn("issueAttentionPvOutputWrite", self.rocc)
+        self.assertIn("completeAttentionPvOutputPanel", self.rocc)
+        self.assertIn("attention_pv_output_pipeline_rows", self.rocc)
+        self.assertIn("GOLEM_ATTENTION_PV_OUTPUT_PIPELINE", self.cpu_builder)
+        self.assertIn("pv_output_pipeline", self.stats_verifier)
+        issue_begin = self.rocc.index("void issueAttentionPvOutputWrite()")
+        issue_end = self.rocc.index("void readAttentionPvOutput()", issue_begin)
+        issue_body = self.rocc[issue_begin:issue_end]
+        self.assertLess(
+            issue_body.index("attentionPvOutputWritesPending += 1"),
+            issue_body.index("localWriteAsync"),
+        )
+
+        default_run = subprocess.run(
+            ["bash", str(RUNNER), "--scale-point", "e2", "--dry-run"],
+            text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(default_run.returncode, 0, default_run.stderr)
+        self.assertIn("GOLEM_ATTENTION_PV_OUTPUT_PIPELINE=0", default_run.stdout)
+
+        optimized_run = subprocess.run(
+            [
+                "bash", str(RUNNER), "--scale-point", "e2",
+                "--pv-output-pipeline", "--dry-run",
+            ],
+            text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(optimized_run.returncode, 0, optimized_run.stderr)
+        self.assertIn("GOLEM_ATTENTION_PV_OUTPUT_PIPELINE=1", optimized_run.stdout)
+        self.assertIn("--pv-output-pipeline", RUNNER.read_text())
+
+    def test_pv_early_compute_waits_for_per_array_ready_and_output_join(self):
+        self.assertIn("attention_pv_early_compute", self.rocc)
+        self.assertIn("attentionPvPreparationComplete", self.rocc)
+        self.assertIn("startAttentionPvArrayComputation", self.rocc)
+        self.assertIn("completeAttentionPvPreparation", self.rocc)
+        self.assertIn("attention_pv_early_compute_arrays", self.rocc)
+        self.assertIn("GOLEM_ATTENTION_PV_EARLY_COMPUTE", self.cpu_builder)
+        self.assertIn("pv_early_compute", self.stats_verifier)
+
+        default_run = subprocess.run(
+            ["bash", str(RUNNER), "--scale-point", "e2", "--dry-run"],
+            text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(default_run.returncode, 0, default_run.stderr)
+        self.assertIn("GOLEM_ATTENTION_PV_EARLY_COMPUTE=0", default_run.stdout)
+
+        optimized_run = subprocess.run(
+            [
+                "bash", str(RUNNER), "--scale-point", "e2",
+                "--pv-early-compute", "--dry-run",
+            ],
+            text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(optimized_run.returncode, 0, optimized_run.stderr)
+        self.assertIn("GOLEM_ATTENTION_PV_EARLY_COMPUTE=1", optimized_run.stdout)
+        self.assertIn("--pv-early-compute", RUNNER.read_text())
+
+    def test_intertile_breakdown_is_observation_only_and_conservative(self):
+        statistics = (
+            "attention_worker_intertile_total_ticks",
+            "attention_worker_intertile_output_dma_ticks",
+            "attention_worker_intertile_query_load_ticks",
+            "attention_worker_intertile_kv_load_ticks",
+            "attention_worker_intertile_q_local_read_ticks",
+            "attention_worker_intertile_qk_matrix_program_ticks",
+            "attention_worker_intertile_qk_input_program_ticks",
+            "attention_worker_intertile_qk_compute_readout_ticks",
+        )
+        for statistic in statistics:
+            self.assertIn(statistic, self.rocc)
+            self.assertIn(statistic, self.rocc_float)
+            self.assertIn(statistic, self.rocc_int)
+            self.assertIn(statistic, self.stats_verifier)
+        self.assertIn("inter_tile_breakdown", self.stats_verifier)
+        self.assertIn("unattributed_ticks", self.stats_verifier)
+
+        observed = {
+            ("core5:rocc", "attention_worker_intertile_total_ticks"): 100,
+            ("core5:rocc", "attention_worker_intertile_output_dma_ticks"): 10,
+            ("core5:rocc", "attention_worker_intertile_query_load_ticks"): 15,
+            ("core5:rocc", "attention_worker_intertile_kv_load_ticks"): 20,
+            ("core5:rocc", "attention_worker_intertile_q_local_read_ticks"): 5,
+            ("core5:rocc", "attention_worker_intertile_qk_matrix_program_ticks"): 20,
+            ("core5:rocc", "attention_worker_intertile_qk_input_program_ticks"): 10,
+            ("core5:rocc", "attention_worker_intertile_qk_compute_readout_ticks"): 20,
+        }
+        counts = {key: 3 for key in observed}
+        breakdown = summarize_intertile_breakdown(
+            observed, counts, worker_core=5,
+            accelerator_clock_hz=1_000, timebase_ticks_per_second=1_000,
+        )
+        self.assertEqual(breakdown["total_cycles"], 100)
+        self.assertEqual(breakdown["attributed_ticks"], 100)
+        self.assertEqual(breakdown["unattributed_ticks"], 0)
+        self.assertTrue(breakdown["conservation_valid"])
+
+    def test_tile_pipeline_breakdown_is_complete_and_conservative(self):
+        statistics = (
+            "attention_worker_tile_total_ticks",
+            "attention_worker_tile_kv_load_ticks",
+            "attention_worker_tile_q_local_read_ticks",
+            "attention_worker_tile_qk_matrix_program_ticks",
+            "attention_worker_tile_qk_input_program_ticks",
+            "attention_worker_tile_qk_compute_readout_ticks",
+            "attention_worker_tile_softmax_ticks",
+            "attention_worker_tile_pv_matrix_program_ticks",
+            "attention_worker_tile_pv_input_program_ticks",
+            "attention_worker_tile_pv_restore_output_ticks",
+            "attention_worker_tile_pv_compute_ticks",
+            "attention_worker_tile_pv_output_readwrite_ticks",
+        )
+        for statistic in statistics:
+            self.assertIn(statistic, self.rocc)
+            self.assertIn(statistic, self.rocc_float)
+            self.assertIn(statistic, self.rocc_int)
+            self.assertIn(statistic, self.stats_verifier)
+
+        observed = {
+            ("core5:rocc", "attention_worker_tile_total_ticks"): 110,
+        }
+        for index, statistic in enumerate(statistics[1:], start=1):
+            observed[("core5:rocc", statistic)] = index
+        counts = {key: 3 for key in observed}
+        breakdown = summarize_tile_pipeline_breakdown(
+            observed, counts, worker_core=5,
+            accelerator_clock_hz=1_000, timebase_ticks_per_second=1_000,
+        )
+        self.assertEqual(breakdown["total_cycles"], 110)
+        self.assertEqual(breakdown["attributed_ticks"], 66)
+        self.assertEqual(breakdown["unattributed_ticks"], 44)
+        self.assertFalse(breakdown["conservation_valid"])
+
+    def test_attention_streams_kv_dma_and_joins_before_qk(self):
+        self.assertIn("attentionKvLoadsPending", self.rocc)
+        self.assertIn("beginAttentionKeyTile();", self.rocc)
+        self.assertIn("if (attentionWorker_->attentionKvLoadsPending == 0)", self.rocc)
+        self.assertIn("dma_read_from_host_to_globalmem(", self.rocc)
 
 
 if __name__ == "__main__":

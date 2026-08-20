@@ -39,6 +39,14 @@
 - [x] Phase E3：通过 4 manager + 16 worker 的 `S1024,D128` fused 规模点。
 - [x] Phase E4：通过 4 manager + 16 worker 的 `S2048,D128` fused 规模点。
 - [ ] Phase E5：通过 4 manager + 16 worker 的 `S4096,D128` fused 规模点。
+- [x] Phase F0：建立 QK/Softmax/PV/DMA 的细粒度流水观测和 overlap 上界模型。
+- [x] Phase F1：为每个 worker 增加 K/V 双缓冲，先实现下一 KV tile DMA 与当前
+  QK/Softmax/PV 的预取 overlap。
+- [x] Phase F2：在 F1 回归通过后，评估 QK panel 与 Softmax 的 panel-level overlap；
+  只有 SFU 接口支持增量 `(m,l)` 更新时才实现该阶段。
+- [ ] Phase F3：评估 Softmax/PV 的生产者-消费者 overlap；不满足带宽、buffer
+  容量和 online recurrence 条件时保持串行路径。
+- [ ] Phase F4：在 E2/E3 验证收益稳定后，再决定是否执行 E4/E5 规模回归。
 
 ### Phase C0.1/C0.2 验收结果（2026-07-23）
 
@@ -366,6 +374,545 @@ SST 前先增加容量/地址/精确计数契约和 dry-run，并保持 E3 的 c
 Phase E4 已关闭。下一步 Phase E5 是 `B1,H1,S4096,D128`；真实 SST 工作量约为
 E4 的 4 倍，因此先增加 E5 契约、dry-run、运行成本和 watchdog 门禁，再决定是否
 在当前资源上执行完整规模点。
+
+## Phase F：QK/Softmax/PV 跨阶段流水化计划（2026-08-20）
+
+目标是让不同 Attention tile 的阶段发生时间重叠，优先降低当前 E3 的端到端
+`965,933 cycles`。当前实现已经有 worker 间并行、16 个 Array 间并行和 K/V 两路
+DMA 并行，但单个 worker 仍是：
+
+```text
+K/V load -> QK MVM -> score read/write -> Softmax -> PV MVM -> output restore
+         -> next KV tile
+```
+
+同一 worker 内 QK MVM 与 Softmax 不能直接重叠，因为 Softmax 依赖完整的
+`S[16,32]`；Softmax 与 PV MVM 也不能直接重叠，因为 PV 依赖完整的 `P[16,32]`。
+因此 Phase F 先做跨 tile 的 DMA/compute overlap，再评估 panel-level 算法和接口
+修改，避免把“统计阶段重叠”误认为真实硬件流水。
+
+### F0：观测、约束和理论上界
+
+1. 在 `AttentionWorkerState` 中增加阶段统计：KV DMA、QK matrix/input/compute、
+   score read/write、SFU、PV matrix/input/compute、Oacc restore/read/write。
+2. 为每个 worker 记录 tile ordinal、buffer id、issue tick、complete tick，验证
+   不同阶段是否真实时间重叠，并检查每个 buffer 没有读写冲突。
+3. 根据 E3 的 128 个 KV tile 计算 overlap 上界：当前 KV load=141,982 cycles，
+   QK/Softmax/PV 是串行关键路径；双缓冲的理论收益上限是隐藏可重叠的 KV load，
+   不能把 QK 与 Softmax 的数据依赖周期直接相减。
+4. 验收：E2/E3 输出 mismatch=0，tile 顺序和 online `(m,l)` 结果保持一致，
+   新增统计满足时间守恒；任何仿真超过硬 watchdog 立即停止并分析。
+
+### F1：K/V 双缓冲预取（第一实现目标）
+
+1. 将单一 `kLocal/vLocal` 扩展为两个固定大小的 KV buffer；每个 buffer 包含
+   `K[32,D]` 和 `V[32,D]`，Local GM window 需要重新计算并增加容量检查。
+2. 当前 tile 在 buffer A 执行 QK、Softmax、PV 时，DMA engine 将物理顺序中的
+   下一 tile 预取到 buffer B；当前 tile 完成后交换 A/B。
+3. 预取地址必须继续使用 `keyTile`（物理 tile），SFU/PV recurrence、first/final
+   tile 判定继续使用 `keyTileOrdinal`。
+4. 不允许覆盖仍被 QK/PV 使用的 buffer；预取失败或 buffer ownership 不满足
+   不变量时 fail-fast，稳定回退由默认关闭的单 buffer 开关路径提供。
+5. 验收顺序：契约/dry-run -> E2 180 秒 watchdog -> E3 600 秒 watchdog；比较
+   `inter_tile_pv_to_next_qk` 和总 cycles。若收益小于统计误差或出现 buffer stall，
+   保留功能开关但不进入 E4/E5。
+
+### F2：QK panel 与 Softmax 的增量 overlap（条件阶段）
+
+1. 先确认 SFU 是否能接受一个 KV tile 的多个 score panel，并在 panel 到达时增量
+   更新每行 `(m,l)`；当前 `issueAttentionTile()` 的整 tile 接口不足以实现该阶段。
+2. 若接口可扩展，设计双 score panel buffer：QK panel n 写入 buffer n，SFU 消费
+   buffer n，同时 QK 生成 panel n+1。
+3. 必须处理 running-max 跃迁：后续 panel 发现更大 max 时，要重新缩放此前的
+   `l` 和已生成的 P/partial PV，不能简单地把 panel softmax 结果相加。
+4. 验收必须覆盖 D4 extreme-logit、D2 causal、D3 partial tile；任何数值差异先
+   关闭 overlap，不得以牺牲 online softmax 正确性换周期。
+
+### F3：Softmax/PV overlap（条件阶段）
+
+1. 只有 SFU 能输出可消费的 P panel，并且 PV 允许 panel 级累加时才考虑；否则
+   保持当前“完整 P tile 后启动 PV”的串行路径。
+2. 需要至少两个 P buffer，以及明确的 P panel ready/consume credit，防止 SFU
+   覆盖 PV 尚未读取的 P 数据。
+3. 需要重新处理 Oacc scale：online max/l 更新可能改变整个 tile 的归一化比例，
+   不能在 scale 尚未稳定时提交不可逆 PV 累加。
+4. 该阶段的优先级低于 F1，因为它可能要求修改 SFU ABI、P storage 语义和 PV
+   累加协议，风险明显更高。
+
+### F4：规模回归门禁
+
+1. F1/F2/F3 任一阶段都必须先在 E2/E3 完成严格 A/B，并记录所有 overlap 开关。
+2. 只有 E3 周期、manager skew、Local GM/Array 请求和结果校验均稳定后，才重新
+   评估 E4；E5 仍需显式 `--allow-expensive` 和 watchdog。
+3. 不再使用“仿真跑完即可”的验收标准；必须同时报告 cycle、仿真墙钟时间、
+   watchdog、数值 mismatch、buffer stall 和阶段时间守恒。
+
+### Phase F0 验收结果（2026-08-20）
+
+- RoCC 为每个完成的 Attention tile 记录连续时间轴：KV load、Q local read、QK
+  matrix/input/compute-readout、Softmax、PV matrix/input/restore/compute/output
+  read-write，共 11 个互斥阶段；verifier 强制检查总时长等于所有阶段之和。
+- 每个阶段即使耗时为 0 也写入一次样本，因此每 worker 的统计 Count 必须等于
+  SFU Attention jobs：E2=8，E3=128。
+- E2 保持 29,198 cycles，checked=16,384、mismatch=0；慢 worker tile total=
+  26,011 cycles，8/8 样本齐全，unattributed=0。
+- E3 保持 965,933 cycles，checked=131,072、mismatch=0；慢 worker tile total=
+  951,943 cycles，128/128 样本齐全，unattributed=0。
+- E3 分项为：KV 145,408；Q local 16,640；QK matrix/input/compute-readout
+  66,304/18,432/49,664；Softmax 31,367；PV matrix/input/restore/compute/output
+  165,376/196,608/63,488/133,120/65,536 cycles。
+- 因此同一 tile 的 QK/Softmax overlap 即使完全隐藏 Softmax，理论上也只覆盖
+  31,367 cycles（tile path 的 3.30%）；F1 双缓冲可尝试隐藏的 KV load 上界为
+  145,408 cycles（15.27%）。最大剩余区域仍是 PV 合计 624,128 cycles（65.56%）。
+- F0 artifact：
+  `/data4/jjgong/tmp/fused_attention_e2_phase_f0_stats_20260820`、
+  `/data4/jjgong/tmp/fused_attention_e3_phase_f0_stats_20260820`。
+
+### Phase F1 验收结果（2026-08-20）
+
+- 新增默认关闭的 `attention_kv_double_buffer`。每个 worker 使用两组独立的
+  `K[32,D]`/`V[32,D]` Local GM buffer；首 tile 前台加载，执行当前 tile 的
+  QK/Softmax/PV 时预取下一物理 tile，完成后交换 active/prefetch buffer。
+- `keyTileOrdinal` 仍维护 online softmax 的逻辑顺序，预取地址通过独立的物理
+  `keyTile` 计算，兼容既有 KV tile rotation。DMA 任一路失败或 buffer ownership
+  不满足不变量时 fail-fast；关闭开关时保留原单 buffer 路径。
+- E1/D64 双缓冲 window 为 43,136 bytes，E3/E4/E5 D128 为 84,096 bytes；scale
+  runner 启用 `--kv-double-buffer` 时显式使用 `0x14880`，默认仍为 `0x10000`。
+- 新增 `attention_kv_prefetch_tiles/hits/waits`；verifier 要求每 worker 的预取数
+  等于 `jobs-qblocks`，且 `hits+waits` 与消费数相等。
+
+严格 A/B（其余优化均开启）：
+
+| 负载 | F0 baseline cycles | F1 cycles | 降低 | checked/mismatch |
+|---|---:|---:|---:|---:|
+| E2 `S256,D64` | 29,198 | 26,944 | 2,254（7.72%） | 16,384 / 0 |
+| E3 `S1024,D128` | 965,933 | 849,298 | 116,635（12.08%） | 131,072 / 0 |
+
+- E2 全系统预取 112 tile：99 hit、13 wait；E3 预取 1,984 tile：1,984 hit、
+  0 wait。E3 慢 worker 的 KV tile-path 从 145,408 降至 15,189 cycles，
+  `inter_tile_pv_to_next_qk` 从 301,596 降至 182,163 cycles。
+- E3 剩余最大阶段仍是 PV 五项合计 624,709 cycles；Softmax 为 31,950 cycles。
+  因此 F1 已关闭，但这不等于已经实现 QK/Softmax panel overlap。
+- Attention 83/83、SFU 22/22、multicore Softmax 12/12 通过；canonical
+  `64x64x64` FP32 GEMM sampled=64、mismatch=0、max abs diff=0；`libgolem`
+  build/install SHA-256 均为
+  `5cc8c2ce945dc1f72f1ba4654efc4b26e3d21e5dc38be7d4ed6d3ff0799f2019`。
+- artifact：
+  `/data4/jjgong/tmp/fused_attention_e2_phase_f1_kv_double_buffer_20260820`、
+  `/data4/jjgong/tmp/fused_attention_e3_phase_f1_kv_double_buffer_20260820`。
+
+Phase F1 已关闭。下一步是 F2 可行性门：先审计 SFU 是否能进行 panel 级 online
+`(m,l)` 更新，以及 PV/Oacc 是否允许后续 max 变化时重新缩放；在接口和数值语义
+明确前不修改执行路径，也不运行 E4/E5。
+
+### Phase F2 可行性结论（2026-08-20）
+
+结论：**不实施独立的 QK-panel/Softmax 流水**。现有接口不能安全增量消费 panel，
+而安全的最小 ABI 扩展收益不足以优先于 PV 路径。
+
+1. RoCC 只有在两个 16-key QK panel 均计算并写完 `S[16,32]` 后，才调用一次
+   `issueAttentionTile()`。`AttentionTileRequest` 只有整 tile 地址、rows/cols 和
+   单个完成 callback，没有 panel ready/finalize/consume 协议。
+2. SFU 虽以 16-lane chunk 访问 Local GM，但每行仍严格执行整 tile MAX、整 tile
+   EXP/SUM、整 tile NORMALIZE 三遍；`tensorWorkerOps_` 非空时拒绝新请求，因此
+   不能在同一 tile 内并存 panel producer 和 finalize operation。
+3. online `(m,l)` 在完整 tile EXP/SUM 后才更新，并只返回每行
+   `oldOutputScale`。若把 panel 当成伪 tile，panel 1 提高 running max 后，panel 0
+   已写出的 P 权重需要重新缩放；除非 PV 同时按 panel 消费并重缩放 Oacc，否则
+   数值语义错误。这会把 F2 强制扩展为高风险的 F2+F3 联合改造。
+4. 安全的独立方案只能新增 `ingestMaxPanel()`/`finalizeAttentionTile()`：QK panel
+   完成后让 SFU 提前做 MAX，最终 panel 后仍对整 tile执行 EXP/SUM 和 NORMALIZE。
+   它需要 panel generation、buffer ownership、causal/partial 和 skip-MAX ABI，
+   但只能隐藏 MAX 子阶段。
+
+收益判断基于 F1 E3：
+
+- 总周期 849,298；完整 Softmax 31,950 cycles，仅占 3.762%，这是 F2 的绝对上限。
+- 由 2,048 行的 stage start/done tick 求和，MAX/EXP-SUM/NORMALIZE 服务时间为
+  79,608/180,855/52,643 cycles。MAX 占三阶段服务时间 25.425%；用该比例估计，
+  MAX-only overlap 约 8,123 cycles，即总周期约 0.956%。这是代理估计，不是新的
+  SST 实测值。
+- PV matrix/input/restore/compute/output 仍为
+  165,376/196,608/63,488/133,120/66,117 cycles，其中单独 PV input 就占总周期
+  23.15%，明显高于 F2 的全部理论空间。
+
+因此 F2 以“已评估、不实施”关闭，没有修改生产代码，也没有启动新 SST。下一步
+先设计低风险的 PV input 并行 issue/批量编程方案；F3 Softmax/PV panel overlap
+保留为后续联合 ABI 研究，不作为当前实现目标，E4/E5 继续冻结。
+
+### Phase G1 验收结果：PV input 两级流水（2026-08-20）
+
+- 新增默认关闭的 `attention_pv_input_pipeline`。原路径逐行串行执行
+  `P Local GM read -> Array input program -> wait`；新路径在当前行的 Array input
+  请求被接受后，立即用独立的 Local GM read port 读取下一行，使第 `i+1` 行读取
+  与第 `i` 行 Array 编程重叠。没有新增 Array batch API，也没有改变 P、PV 或 Oacc
+  的数据布局和数值语义。
+- `attentionPvInputsPending` 在每行 Local GM read 开始前递增，在对应 Array program
+  callback 后递减，因此覆盖 read 和 program 两个阶段。只有所有行均已提交且
+  pending=0，才进入 PV output restore；这避免“最后一行仍在读取、前一行 callback
+  已耗尽”导致的提前完成竞态。
+- 新增 `attention_pv_input_pipeline_rows`，verifier 要求开启时每 worker 精确为
+  E2=512、E3=16,384，关闭时为 0。
+
+严格 A/B（F1 的全部优化保持开启）：
+
+| 负载 | F1 cycles | G1 cycles | 总周期降低 | PV input 降低 | checked/mismatch |
+|---|---:|---:|---:|---:|---:|
+| E2 `S256,D64` | 26,944 | 26,571 | 373（1.38%） | 4,096 -> 2,656（35.16%） | 16,384 / 0 |
+| E3 `S1024,D128` | 849,298 | 799,873 | 49,425（5.82%） | 196,608 -> 150,528（23.44%） | 131,072 / 0 |
+
+- E3 慢 worker tile path 为 779,473 cycles，11 阶段守恒、unattributed=0；流水
+  行计数在 16 个 worker 上均为 16,384。总周期收益主要由 PV input 的 46,080
+  cycles 降低解释，没有出现异常长 cycle。
+- Attention 84/84、SFU row-engine 22/22、multicore Softmax 12/12 通过；canonical
+  `64x64x64` FP32 GEMM sampled=64、mismatch=0、max abs diff=0。build/install
+  `libgolem.so` SHA-256 均为
+  `50c34631d1ad20d9021dfbbd2afcdac9344f046841da96a99c9fafae1d05bac1`。
+- artifact：
+  `/data4/jjgong/tmp/fused_attention_e2_pv_input_pipeline_20260820`、
+  `/data4/jjgong/tmp/fused_attention_e3_pv_input_pipeline_20260820`、
+  `/data4/jjgong/tmp/attention_pv_input_pipeline_gemm_20260820`。
+
+Phase G1 已关闭。下一步 G2 优先评估“Softmax 与 PV V-matrix programming
+overlap”：QK readout 完成后 Array 已不再执行 QK，而 SFU 正在生成 P，此时可提前
+把已驻留 Local GM 的 V 编程到 PV Array。E3 中 Softmax=31,926 cycles、PV matrix
+program=165,376 cycles，因此可隐藏量上限约 31,926 cycles（总周期 3.99%）。先审计
+Array ownership、V buffer 生命周期和 SFU failure rollback，再实现默认关闭开关并做
+E2/E3 严格 A/B；不恢复高风险 panel ABI，也不运行 E4/E5。
+
+### Phase G2 验收结果：Softmax/PV matrix overlap（2026-08-20）
+
+- 新增默认关闭的 `attention_pv_matrix_softmax_overlap`。SFU 接受整 tile Softmax
+  后，RoCC 立即读取 active V tile 并编程首个 PV panel；后续 PV panels 保持原顺序，
+  没有改变 SFU ABI、P layout 或 online `(m,l)` 语义。
+- `attentionSoftmaxComplete` 与 `attentionPvMatrixComplete` join 两个异步操作。矩阵
+  先完成记为 hit，SFU 先完成记为 wait 并只把矩阵剩余尾部计入 PV matrix 阶段。
+  任一路失败仍 fail-fast；另一条晚到 callback 在 worker 已释放后直接返回。
+- 关键路径统计仍互斥守恒：overlap 开始后继续计入 Softmax；SFU 完成时若矩阵未
+  完成，才切换到 PV matrix；二者均完成后进入 PV input。
+
+严格 A/B（G1 及此前全部优化保持开启）：
+
+| 负载 | G1 cycles | G2 cycles | 降低 | checked/mismatch |
+|---|---:|---:|---:|---:|
+| E2 `S256,D64` | 26,571 | 26,408 | 163（0.61%） | 16,384 / 0 |
+| E3 `S1024,D128` | 799,873 | 790,516 | 9,357（1.17%） | 131,072 / 0 |
+
+- E2 全系统 128/128 tiles 为 hit。E3 为 2,048 tiles、411 hits、1,637 waits，hit
+  率 20.1%；所有 worker 均满足 `tiles=hits+waits=128`。
+- E3 慢 worker 的 PV matrix 尾部从 165,376 降至 116,340 cycles，减少 49,036；
+  但 overlap 对共享 Local GM 施压，Softmax 关键路径归因从 31,926 增至 64,917。
+  因此净收益远低于无争用理论上限 31,926 cycles，这是架构资源竞争而非统计遗漏。
+- E3 manager local-complete skew 从 14,489 增至 16,400 cycles；生命周期顺序、
+  11 阶段守恒和数值结果仍全部有效，没有出现异常长 cycle。
+- Attention 85/85、SFU row-engine 22/22、multicore Softmax 12/12、canonical
+  `64x64x64` FP32 GEMM 均通过。build/install `libgolem.so` SHA-256 均为
+  `3aa9a5b3ee6827c8774d2ceac457af6fd7d4dc3fe0d38648376e1bd6b10ad3c4`。
+- artifact：
+  `/data4/jjgong/tmp/fused_attention_e2_pv_matrix_softmax_overlap_20260820`、
+  `/data4/jjgong/tmp/fused_attention_e3_pv_matrix_softmax_overlap_20260820`、
+  `/data4/jjgong/tmp/attention_pv_matrix_softmax_overlap_gemm_20260820`。
+
+Phase G2 已关闭。下一步 G3 优先评估 PV output restore 两级流水：当前非首 key
+tile 逐 array 串行执行 `Oacc Local GM read -> scale -> Array output write -> wait`，
+可复用 G1 的 pending join，使下一 array 的 Oacc read 与当前 Array write 重叠。
+E3 restore 当前为 63,488 cycles；先确认 `writeOutputAsync` 对不同 array 的独立
+ownership，再用默认关闭开关做 E2/E3 A/B。E4/E5 继续冻结。
+
+### Phase G3 验收结果：PV output restore 两级流水（2026-08-20）
+
+- 新增默认关闭的 `attention_pv_restore_pipeline`。非首 key tile 原先逐 array 串行
+  执行 `Oacc Local GM read -> scale -> writeOutputAsync -> wait`；新路径在当前 Array
+  output write 被有界 buffer queue 接受后立即读取下一 Array 的 Oacc，使单 Local GM
+  read port 与单 Array-buffer port 重叠，没有增加端口数或绕过传输延迟。
+- `attentionPvRestoresPending` 在每行 read 开始前递增，在对应 output write callback
+  后递减。只有全部行均已提交且 pending=0 才启动 PV compute，避免最后一次 read
+  尚未完成时提前计算。首 key tile 不需要 restore，继续直接设置 overwrite mode。
+- verifier 要求每 worker 的 `attention_pv_restore_pipeline_rows` 精确为 E2=448、
+  E3=15,872；两个实测 artifact 的 16 个 worker 均满足。
+
+严格 A/B（G2 及此前全部优化保持开启）：
+
+| 负载 | G2 cycles | G3 cycles | 降低 | restore 前后 | checked/mismatch |
+|---|---:|---:|---:|---:|---:|
+| E2 `S256,D64` | 26,408 | 26,168 | 240（0.91%） | 1,792 -> 952 | 16,384 / 0 |
+| E3 `S1024,D128` | 790,516 | 759,338 | 31,178（3.94%） | 63,488 -> 33,728 | 131,072 / 0 |
+
+- E3 restore 减少 29,760 cycles（46.88%），基本解释 31,178 cycles 的总收益；
+  慢 worker tile path=735,604 cycles，11 阶段 unattributed=0。manager local-complete
+  skew 从 16,400 降至 14,680 cycles，没有发现异常 cycle 或新负载失衡。
+- Attention 86/86、SFU row-engine 22/22、multicore Softmax 12/12、canonical
+  `64x64x64` FP32 GEMM 均通过。build/install `libgolem.so` SHA-256 均为
+  `ee725b2dff73acc7602c67e9b84876825f821bbcd7f1a47f009d182b369c7e92`。
+- artifact：
+  `/data4/jjgong/tmp/fused_attention_e2_pv_restore_pipeline_20260820`、
+  `/data4/jjgong/tmp/fused_attention_e3_pv_restore_pipeline_20260820`、
+  `/data4/jjgong/tmp/attention_pv_restore_pipeline_gemm_20260820`。
+
+Phase G3 已关闭。下一步 G4 先做 PV output read/write 流水可行性审计：当前 E3
+阶段为 70,658 cycles，路径为 `Array readOutputAsync -> Local GM write -> wait`。
+只有证明下一 Array readout 可与当前 Local GM write 并行、且单 Local GM write port
+有明确的 backpressure/join 语义后才实现；否则转向剩余的 PV input/matrix 资源
+竞争分析。继续只跑 E2/E3，不运行 E4/E5。
+
+### Phase G4 验收结果：PV output read/write 流水（2026-08-20）
+
+- 审计确认 Array `readOutputAsync` 有界排队，GlobalMemory 有独立 Local write FIFO、
+  单 write port、32-entry 总队列和完成 callback；但原 `attentionLocalWrite` 只有一份
+  transfer state，不能承载多笔在途写。因此 G4 只在 PV output 路径直接提交固定
+  64-byte Local write，不修改共享传输 helper，也不增加端口。
+- 新增默认关闭的 `attention_pv_output_pipeline`。当前行写请求被真实 Local write
+  FIFO 接受后立即发起下一 Array readout；`attentionPvOutputWritesPending` 在全部
+  写回完成前阻止 panel/tile 前进。若队列拒绝，payload/address 保留并由 RoCC
+  时钟重试，index/stat 不前进。
+- 独立审查发现 `GlobalMemoryLocal` 允许同步 callback。最终实现改为提交前预建
+  pending/index，拒绝时事务式回滚，并在 API 返回后重新验证 job/phase/panel，
+  避免同步完成导致悬空 state。修复后 E2/E3 cycle 与修复前事件化结果完全一致。
+- verifier 要求每 worker 的 `attention_pv_output_pipeline_rows` 精确为 E2=512、
+  E3=16,384；实测 16 个 worker 全部满足。Local GM queue rejected 均为 0，worker
+  queue high-water 为 17--18，低于深度 32。
+
+严格 A/B（G3 及此前全部优化保持开启）：
+
+| 负载 | G3 cycles | G4 cycles | 降低 | PV output read/write 前后 | checked/mismatch |
+|---|---:|---:|---:|---:|---:|
+| E2 `S256,D64` | 26,168 | 25,915 | 253（0.97%） | 2,621 -> 1,173 | 16,384 / 0 |
+| E3 `S1024,D128` | 759,338 | 729,683 | 29,655（3.91%） | 70,658 -> 39,287 | 131,072 / 0 |
+
+- E3 PV output read/write 减少 31,371 cycles（44.40%），基本解释 29,655 cycles
+  的全局收益；慢 worker tile path=705,176 cycles，11 阶段 unattributed=0，没有
+  异常长 cycle。manager local-complete skew 从 14,680 增至 19,046 cycles，记录为
+  后续负载均衡风险，但不抵消总 cycle 收益。
+- Attention 87/87、SFU row-engine 22/22、multicore Softmax 12/12、canonical
+  `64x64x64` FP32 GEMM 均通过。最终 artifact：
+  `/data4/jjgong/tmp/fused_attention_e2_pv_output_pipeline_syncsafe_20260820`、
+  `/data4/jjgong/tmp/fused_attention_e3_pv_output_pipeline_syncsafe_20260820`、
+  `/data4/jjgong/tmp/attention_pv_output_pipeline_gemm_20260820`。
+
+Phase G4 已关闭。下一步 G5 先审计按 Array 提前启动 PV compute 的可行性：E3
+剩余最大阶段为 PV input=150,528、PV compute=133,120、PV matrix=116,291 cycles。
+只有证明每个 Array 的 matrix/input/restore ready 可以独立触发 compute，且不会破坏
+output accumulate 与 Array-done join，才实现 input/compute overlap；否则转向 PV
+matrix 与 Softmax 的共享 Local GM 竞争和 manager completion skew 分析。仍只跑
+E2/E3，不运行 E4/E5。
+
+### Phase G5 验收结果：按 Array 提前启动 PV compute（2026-08-20）
+
+- 审计确认仅把现有“一次启动全部 Array”改成逐 Array 调用不会产生收益：16 个
+  Array 原本已并行计算，关键路径仍由最后 ready 的 Array 决定。G5 因此新增默认
+  关闭的 `attention_pv_early_compute`，把每个 Array 的 compute 启动点前移到其真实
+  operand ready callback，而不是增加 compute 单元或缩短 MVM 固有延迟。
+- 首个 key tile 在该 Array 的 P input programming callback 完成后启动；后续 key
+  tile 在该 Array 的 Oacc restore `writeOutputAsync` callback 完成后启动。matrix
+  仍使用现有 broadcast 路径，compute 仍是原 Array 模型。
+- `attentionPvPreparationComplete` 作为全体 input/restore barrier。barrier 前允许已
+  ready Array 计算，但不读取 output，避免 readout 与尚未完成的 input/restore 竞争
+  单 Array-buffer port。barrier 后按 Array index 读取；若当前 Array 尚未完成则等待
+  其 done callback。全部 Local GM output writes join 后才推进 panel/tile。
+- QK Array-done 路径保持不变；`arraysPending` 与逐 Array pending 成对维护。verifier
+  要求每 worker 的 `attention_pv_early_compute_arrays` 精确为 E2=512、E3=16,384，
+  两个 artifact 的 16 个 worker 均满足。
+
+严格 A/B（G4 及此前全部优化保持开启）：
+
+| 负载 | G4 cycles | G5 cycles | 降低 | checked/mismatch |
+|---|---:|---:|---:|---:|
+| E2 `S256,D64` | 25,915 | 25,705 | 210（0.81%） | 16,384 / 0 |
+| E3 `S1024,D128` | 729,683 | 699,750 | 29,933（4.10%） | 131,072 / 0 |
+
+- E3 慢 worker tile path=678,049 cycles，阶段为 PV input=150,528、restore=33,728、
+  compute=99,200、output read/write=46,683，11 阶段 unattributed=0。manager
+  local-complete skew 从 19,046 降至 13,034 cycles；没有异常长 cycle。
+- Attention 88/88、SFU row-engine 22/22、multicore Softmax 12/12、canonical
+  `64x64x64` FP32 GEMM 均通过；GEMM sampled=64、mismatch=0、max abs diff=0。
+- artifact：
+  `/data4/jjgong/tmp/fused_attention_e2_pv_early_compute_20260820`、
+  `/data4/jjgong/tmp/fused_attention_e3_pv_early_compute_20260820`、
+  `/data4/jjgong/tmp/attention_pv_early_compute_gemm_20260820`。
+
+Phase G5 已关闭。下一步 G6 是 PV operand delivery 瓶颈审计，而不是直接新增端口。
+E3 剩余 PV input=150,528 cycles，且 PV matrix 仍占约 116k cycles；先拆分 Local GM
+读取、Array-buffer 单端口占用和 callback/调度空洞，再评估双 bank matrix/input
+programming 是否符合目标硬件，或是否存在不复制 matrix 流量的 operand fusion。
+只有资源模型和收益上限成立才实现默认关闭的机制并做 E2/E3 A/B；E4/E5 继续冻结。
+
+### Phase G6 验收结果：PV operand delivery 审计与负结果（2026-08-20）
+
+- 审计确认 PV 的有效 `keyCols=32`，但 E3 Array 物理输入宽度为 128。每行 input
+  原本搬运 512 B（9 buffer cycles），其中 96 个 padding 元素不参与 PV。matrix
+  与 input 不能同时省略尾部，因为 QK 会在同一 Array 留下非零旧值；只压缩 input
+  前缀是安全候选，完整 PV matrix 已将无效 K 行写零。
+- 实验性 `attention_pv_compact_input` 把 PV input 改为只写 32 元素，不新增端口。
+  E3 每 worker Array-buffer bytes 从 22,249,472 降到 15,958,016，transfer cycles
+  从 403,712 降到 305,408；PV input 阶段从 150,528 降到 52,224 cycles，局部减少
+  98,304 cycles（65.31%）。E2 PV input 从 2,656 降到 1,632 cycles。
+- 端到端严格 A/B 未通过验收：
+
+| 负载 | G5 cycles | compact-input cycles | 变化 | checked/mismatch |
+|---|---:|---:|---:|---:|
+| E2 `S256,D64` | 25,705 | 25,481 | -224（-0.87%） | 16,384 / 0 |
+| E3 `S1024,D128` | 699,750 | 700,212 | +462（+0.07%） | 131,072 / 0 |
+
+- E3 中更短的 PV 路径伴随 KV prefetch slack 坍缩：hit/wait 从 G5 的
+  1,313/671 变为 338/1,646，全局 DMA strict 平均 RTT 从 3,522 增至
+  4,257 cycles；慢核 KV-load 归因由约 15k 增至约 120k cycles，manager
+  local-complete skew 从 13,034 增至 16,690 cycles。结果与更同步地进入下一 KV
+  tile 后产生共享回包压力的解释一致，但 G6 当时没有 MemNIC response queue 直接
+  计数，因此该解释尚不是闭合的唯一因果。11 阶段仍 unattributed=0。
+- 按 cycle-first 边界，compact-input 生产代码、开关、统计和测试均已撤回，当前生产
+  状态仍是 G5。负结果 artifact 保留：
+  `/data4/jjgong/tmp/fused_attention_e2_pv_compact_input_20260820`、
+  `/data4/jjgong/tmp/fused_attention_e3_pv_compact_input_20260820`。
+
+Phase G6 以“已审计、实验拒绝”关闭。下一步 G7 审计共享 KV prefetch burst 和
+worker 同步：按 HBM node/worker 对齐 KV 请求时间、queue wait 与 completion skew，
+评估现有 credit 或确定性 worker-slot stagger 是否能平滑突发。只有先证明全局等待
+下降，才把 compact input 作为配套机制重新做 E2/E3 A/B；不单独增加 Array 端口，
+E4/E5 继续冻结。
+
+### Phase G7 验收结果：KV prefetch slack 与 MemNIC response queue（2026-08-20）
+
+- 仅增加观测，不改变调度。RoCC 记录每次 prefetch 的 issue、K/V 均 ready 和
+  consume 时刻，导出 DMA latency、ready lead、consumer wait；verifier 强制
+  `dma count=tiles`、`ready-lead count=hits`、`wait count=waits`。
+- MemNIC highlink 记录 read response attempted/immediate/enqueued/drained、队列
+  high-water、累计/最大 queue wait；结束时仅对有 DMA response 的组件输出，且
+  E2/E3 的 pending 均为 0。
+- G5 全开关 E2/E3 分别保持 25,705/699,750 cycles，输出检查 16,384/131,072，
+  mismatch=0，证明统计没有扰动模拟事件时序。E3 由 300 秒 watchdog 保护，约
+  115 秒完成；E4/E5 未运行。
+- E3 的 1,984 次 prefetch 中 1,313 hit、671 wait；平均 DMA latency=4,286、平均
+  ready lead=1,426、平均 consumer wait=176 cycles，最大 consumer wait=1,485。
+  慢核 core19 为 85 hit/39 wait，累计 wait=6,366 cycles。所有累计时间跨并行
+  worker，只用于压力归因，不等同于端到端 cycle。
+- MemNIC 从 E2 的 38/272 response 入队（14.0%、high-water=3、平均等待约
+  261 cycles）增长为 E3 的 3,485/4,160（83.8%、high-water=7、平均等待约
+  1,798 cycles、最大 4,121）。这证明 G5/E3 已有显著 response backpressure，
+  但旧 G6 artifact 没有同一队列统计，尚不能直接给出 compact-input 的队列增量。
+- artifact：`/data4/jjgong/tmp/fused_attention_e2_g7_observe_20260820`、
+  `/data4/jjgong/tmp/fused_attention_e3_g7_observe_20260820`。
+
+Phase G7 以“观测链闭合、G6 增量因果待测”关闭。下一步 G8 仅在实验代码中恢复
+compact-input 并保持 G7 统计，做一次 E2/E3 严格 A/B。若 response queue 与
+prefetch wait 同时恶化，再以确定性 worker-slot stagger 做最小机制实验；若队列
+不恶化，则转向 prefetch launch distance。不得先调 credit、增加端口或运行 E4/E5。
+
+### Phase G8 验收结果：compact-input 因果 A/B（2026-08-20）
+
+- 恢复默认关闭的 `attention_pv_compact_input`。Array `programInputAsync` 接受
+  非空、且不超过物理宽度的 input prefix，并只覆盖该前缀；普通路径仍传完整
+  vector。PV matrix 继续完整清零无效 K 行，所以 input 尾部保留不会影响结果。
+- E2/E3 精确复现旧 G6 的 25,481/700,212 cycles，输出检查 16,384/131,072，
+  mismatch=0；E3 受 300 秒 watchdog 保护，约 115 秒完成。E4/E5 未运行。
+- E3 PV input 从 150,528 降到 52,224 cycles，但 prefetch hit/wait 从
+  1,313/671 变为 338/1,646；平均 DMA latency 从 4,286 增至 4,981，平均实际
+  consumer wait 从 176 增至 1,024 cycles。
+- 同一次 A/B 中，MemNIC response 入队由 3,485/4,160（83.8%）增至
+  3,809/4,160（91.6%），平均 queue wait 从 1,799 增至 2,375 cycles，
+  high-water 从 7 增至 9，最大等待从 4,121 增至 5,487 cycles。结束时均
+  drained=all、pending=0。
+- Array 局部 bytes 22,249,472 -> 15,958,016、transfer cycles
+  403,712 -> 305,408，证明局部优化兑现。与之同时发生的 prefetch slack 坍缩和
+  MemNIC queue 放大解释了为何 98,304-cycle 局部减少没有形成端到端收益，最终反而
+  +462 cycles。累计 queue/prefetch wait 跨并行 worker，不能直接加到总 cycle。
+- E2 queue 基本不变（38 -> 39 个 response 入队，平均等待 261 -> 243 cycles），
+  且端到端减少 224 cycles，确认同步/回包压力是 E3 规模下才显著的系统效应。
+- artifact：`/data4/jjgong/tmp/fused_attention_e2_g8_compact_observe_20260820`、
+  `/data4/jjgong/tmp/fused_attention_e3_g8_compact_observe_20260820`。
+
+Phase G8 以“因果 A/B 闭合、compact 不进入默认配置”关闭。实验开关保留为默认
+关闭，交付配置仍为 G5。下一步 G9 先审计并实现最小确定性 worker-slot phase
+stagger，只在 compact 实验中做 E2/E3 A/B。验收要求 response queue wait 与
+consumer wait 同时下降且 E3 总 cycle 优于 699,750；否则撤回 stagger，转向更早
+prefetch launch。不得以增大 credit/queue 或新增端口掩盖问题，E4/E5 继续冻结。
+
+### Phase G9 验收结果：worker-slot stagger 被拒绝（2026-08-20）
+
+- 实验采用全局 worker slot × 128 RoCC cycles 的一次性启动延迟，仅在 compact
+  开启时生效。开发中发现并修复了 cycle 与 SST timebase tick 的单位混用；第一次
+  无效的逐 cycle 相同结果不进入性能决策。
+- 修正后 E2=27,094、E3=702,693 cycles，输出检查 16,384/131,072，mismatch=0。
+  相比 G8 分别退化 1,613/2,481 cycles，E3 也比 G5 慢 2,943 cycles。
+- E3 response 入队 3,809 -> 3,746，平均 queue wait 2,375 -> 2,350 cycles；
+  prefetch hit 338 -> 448，累计 consumer wait 下降 2.3%，说明错峰有轻微削峰效果。
+  但平均 consumer wait 1,024 -> 1,072，manager skew 16,690 -> 18,502，关键路径
+  没有兑现收益。
+- 按预设三重门槛拒绝 G9，并撤回全部 stagger 生产代码和配置链；不做参数 sweep。
+  artifact 保留在 `/data4/jjgong/tmp/fused_attention_e{2,3}_g9_stagger128_observe_20260820`。
+
+Phase G9 以“假设部分成立、端到端失败、机制撤回”关闭。下一步 G10 先做 prefetch
+launch-distance/双 buffer ownership 审计：确认首次 tile 的 K/V 子请求或后续 swap
+前是否存在安全提前点。若现有两 buffer 已使后续 launch 最早，则转向 response
+服务顺序或 rotation 映射，不能通过增加 buffer、credit、queue 或端口掩盖瓶颈。
+compact 默认关闭，交付仍为 G5，E4/E5 继续冻结。
+
+### Phase G10 验收结果：最早 launch 点与两级驻留候选（2026-08-20）
+
+- 在现有 tile-atomic ownership 下，首 tile 在 K/V 均完成后立即 prefetch N+1；
+  后续 tile 在 swap 后立即用另一个 buffer prefetch N+1。现有单级 prefetch 没有可
+  通过移动调用获得的更早安全点。
+- 首 tile 按 K/V 子请求分别提前最多覆盖 E3 的 64/1,984 次 prefetch（3.23%），且
+  会在初始 load 未完成时增加共享 response 压力，拒绝实现。
+- 存在同容量的两级驻留候选：当前 tile 的最后 K read callback 已返回、首 PV panel
+  已把 V 复制到 `vPayload`，并且另一个 buffer 的 N+1 已 ready 时，可将旧 active
+  buffer 用于 N+2。N+1 pending 时禁止发 N+2，避免延迟关键请求。
+- 当前仅有一组 prefetch ordinal/tile/pending/ready/timing，不能表达两个未来 tile；
+  若实现，必须改成按 buffer descriptor 管理。G8 core10 的非 KV-wait tile 时间约
+  4,329 cycles，prefetch DMA 平均约 4,907 cycles，候选可能有 lead 收益，但目前
+  缺少 V-release 时刻和 ready-at-release 覆盖率，不能直接进入机制实现。
+
+Phase G10 以只读审计关闭，无生产代码和配置变化、无新增 SST。下一步 G11 先增加
+release/ready-at-release/available-lead 观测并仅跑受 watchdog 保护的 compact E2/E3。
+只有候选覆盖率与理论 lead 足以覆盖已测 consumer wait，才实现 per-buffer descriptor
+两级驻留；否则转向 response 服务顺序/rotation 映射。不得增加 buffer、credit、
+queue 或端口，E4/E5 继续冻结。
+
+### Phase G11 验收结果：release-window 证据支持机制 A/B（2026-08-20）
+
+- 新增 K/V release timing、N+1 ready-at-release、N+2 candidate 和 candidate-to-
+  boundary lead 统计；eligibility 取 K/V 均释放与 N+1 ready 两事件中的较晚时刻。
+  verifier 检查 release 精确计数、candidate 上限和 candidate/lead 守恒。
+- 正式 compact E2/E3 为 25,481/700,212 cycles，与 G8 逐 cycle 相同；输出分别
+  checked=16,384/131,072、mismatch=0，证明观测无调度扰动。
+- E2 candidate=12/96（12.50%），平均/最大 lead=518/891 cycles。E3 candidate=
+  305/1,920（15.89%），其中 ready-at-release=27、release 后 ready=278，平均/最大
+  lead=1,099/2,784 cycles。
+- E3 全部 worker 都有机会（每核 13--26）；慢核 core10 有 18 个 candidate，平均
+  lead=1,091 cycles，对应 miss 平均 wait=992 cycles。累计 candidate lead=335,241，
+  是累计 consumer wait=1,685,193 的 19.9%，足以进行机制实验，但不是端到端收益。
+- Attention tests 92/92 通过；build/install `libgolem.so` SHA-256 均为
+  `787fd479bf69872fae80b35dea40c1347918143dee4edde696782ba801e92dc2`。
+- artifact：`/data4/jjgong/tmp/fused_attention_e{2,3}_g11_release_observe_20260820`。
+  E2 `run_summary.csv` 首行来自一次漏开 PV broadcast 的无效探针，权威结果为当前
+  lifecycle/stats 和最后一行 summary。
+
+Phase G11 关闭。下一步 G12 实现默认关闭的 per-buffer descriptor 两级驻留，仅在
+K/V 已释放、N+1 ready、N+2 存在时提前发出 N+2；N+1 pending 时禁止抢发。先验证
+descriptor ownership、query-block 尾部、失败路径与无重复 DMA，再做 compact E2/E3
+A/B。验收要求 E3 < 699,750 cycles，且 response queue、consumer wait、数值正确性
+均不退化；否则撤回。不得增加 buffer、credit、queue 或端口，E4/E5 继续冻结。
+
+### Phase G12 验收结果：两级 KV 驻留被拒绝（2026-08-21）
+
+- per-buffer descriptor 机制在 K/V release 且 N+1 ready 后向旧 active buffer 发出
+  N+2，不增加物理存储或传输资源；实际触发 E2 21 次、E3 538 次。
+- 正式 compact E2=25,471 cycles，较 G11 25,481 降低 10；E3=706,255 cycles，
+  较 G11 700,212 增加 6,043，较 G5 699,750 增加 6,505。两者输出均 mismatch=0。
+- E3 累计 consumer wait 降低约 8.1%，但平均 miss wait 约 1,024 -> 1,107 cycles，
+  manager skew 16,690 -> 21,431 cycles；慢核 KV 改善被 query/output DMA 延迟抵消。
+- 最初 E2=25,481/E3=700,212 的两次运行加载了 build tree 中未同步的 G11 头文件
+  副本，新增统计缺失，已判为无效探针，不参与性能结论。
+- 按验收门槛撤回 descriptor、统计、参数与 runner 开关；最终交付仍为 G5，最终
+  build/install SHA-256 均为
+  `2fe2e09107e4b64e48e2ee827b2abcd562f5f4f893bfd2ffff1f6f0a57b30be8`。
+- 有效 artifact：`/data4/jjgong/tmp/fused_attention_e2_g12_real_20260820`、
+  `/data4/jjgong/tmp/fused_attention_e3_g12_real_20260821`。
+- 撤回后的 G5 E2 复核为 25,705 cycles、mismatch=0，artifact：
+  `/data4/jjgong/tmp/fused_attention_e2_g12_rollback_g5_20260821`。
+
+Phase G12 关闭。下一步 G13 仅归因 G5/G12 的 manager skew、query/output DMA 与
+response 服务顺序；先形成 demand-response 优先级的确定性契约，再决定是否修改
+MemNIC。不得继续扩大 lookahead、增加 queue/credit/port 或运行 E4/E5。
 
 ## Phase C0 验证边界
 

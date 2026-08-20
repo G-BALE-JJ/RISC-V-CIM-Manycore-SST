@@ -450,6 +450,39 @@ roccarrayParams = {
     "workerCommandProcessorEnable": worker_command_processor_enable,
     "attention_window_offset": int(os.getenv("GOLEM_ATTENTION_WINDOW_OFFSET", "0xC0000"), 0),
     "attention_window_bytes": int(os.getenv("GOLEM_ATTENTION_WINDOW_BYTES", "0x10000"), 0),
+    "attention_kv_tile_rotation": int(
+        os.getenv("GOLEM_ATTENTION_KV_TILE_ROTATION", "0")
+    ),
+    "attention_kv_double_buffer": int(
+        os.getenv("GOLEM_ATTENTION_KV_DOUBLE_BUFFER", "0")
+    ),
+    "attention_pv_v_tile_reuse": int(
+        os.getenv("GOLEM_ATTENTION_PV_V_TILE_REUSE", "0")
+    ),
+    "attention_pv_input_pipeline": int(
+        os.getenv("GOLEM_ATTENTION_PV_INPUT_PIPELINE", "0")
+    ),
+    "attention_pv_compact_input": int(
+        os.getenv("GOLEM_ATTENTION_PV_COMPACT_INPUT", "0")
+    ),
+    "attention_pv_restore_pipeline": int(
+        os.getenv("GOLEM_ATTENTION_PV_RESTORE_PIPELINE", "0")
+    ),
+    "attention_pv_output_pipeline": int(
+        os.getenv("GOLEM_ATTENTION_PV_OUTPUT_PIPELINE", "0")
+    ),
+    "attention_pv_early_compute": int(
+        os.getenv("GOLEM_ATTENTION_PV_EARLY_COMPUTE", "0")
+    ),
+    "attention_pv_matrix_softmax_overlap": int(
+        os.getenv("GOLEM_ATTENTION_PV_MATRIX_SOFTMAX_OVERLAP", "0")
+    ),
+    "attention_qk_dataflow_transpose": int(
+        os.getenv("GOLEM_ATTENTION_QK_DATAFLOW_TRANSPOSE", "0")
+    ),
+    "attention_qk_matrix_broadcast": int(
+        os.getenv("GOLEM_ATTENTION_QK_MATRIX_BROADCAST", "0")
+    ),
     "attention_pv_matrix_broadcast": int(
         os.getenv("GOLEM_ATTENTION_PV_MATRIX_BROADCAST", "0")
     ),

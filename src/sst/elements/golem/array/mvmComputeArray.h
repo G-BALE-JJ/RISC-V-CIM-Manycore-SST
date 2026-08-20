@@ -159,8 +159,8 @@ public:
         size_t elemBytes,
         uint64_t tag,
         typename ComputeArray::BufferCallback callback) override {
-        if (arrayID >= inputVectors.size() || input.size() != inputArraySize ||
-            elemBytes == 0) {
+        if (arrayID >= inputVectors.size() || input.empty() ||
+            input.size() > inputArraySize || elemBytes == 0) {
             return false;
         }
         return enqueueBufferTransfer(

@@ -550,7 +550,17 @@ class MemNICBase : public MemLinkBase {
                     }
                 }
                 const int vn = static_cast<int>(head->vn);
+                auto golemDmaEnqueue = golem_dma_read_response_enqueue_ticks_.find(head);
                 if (linkcontrol->spaceToSend(vn, head->size_in_bits) && linkcontrol->send(head, vn)) {
+                    if (golemDmaEnqueue != golem_dma_read_response_enqueue_ticks_.end()) {
+                        const uint64_t waitTicks =
+                            getCurrentSimCycle() - golemDmaEnqueue->second;
+                        golem_dma_read_response_queue_wait_ticks_ += waitTicks;
+                        golem_dma_read_response_queue_wait_max_ticks_ = std::max(
+                            golem_dma_read_response_queue_wait_max_ticks_, waitTicks);
+                        golem_dma_read_response_drained_++;
+                        golem_dma_read_response_enqueue_ticks_.erase(golemDmaEnqueue);
+                    }
                     if (golem_dma_trace && golemTraceReq != 0) {
                         fprintf(stderr, "[memNICBase bridge] TRACE_REQ_RESP_CHUNK_SEND cycle=%" PRIu64
                                         " req=%" PRIu64 " trace_id=%d addr=0x%" PRIx64
@@ -677,6 +687,15 @@ class MemNICBase : public MemLinkBase {
 
         std::map<SST::Event::id_type, GolemDmaBridgeInfo> golem_dma_pending;
         std::queue<SST::Interfaces::SimpleNetwork::Request*> golem_dma_send_queue_;
+        std::unordered_map<SST::Interfaces::SimpleNetwork::Request*, uint64_t>
+            golem_dma_read_response_enqueue_ticks_;
+        uint64_t golem_dma_read_response_attempted_ = 0;
+        uint64_t golem_dma_read_response_immediate_ = 0;
+        uint64_t golem_dma_read_response_enqueued_ = 0;
+        uint64_t golem_dma_read_response_drained_ = 0;
+        uint64_t golem_dma_read_response_queue_high_water_ = 0;
+        uint64_t golem_dma_read_response_queue_wait_ticks_ = 0;
+        uint64_t golem_dma_read_response_queue_wait_max_ticks_ = 0;
 
         std::string lookupNetworkName(uint64_t addr) const {
             for (const auto& entry : networkAddressMap) {
@@ -697,9 +716,11 @@ class MemNICBase : public MemLinkBase {
 
             auto sendOrQueue = [&](SST::Interfaces::SimpleNetwork::Request* req) -> bool {
                 const int vn = static_cast<int>(req->vn);
+                if (!info.isWrite) golem_dma_read_response_attempted_++;
                 if (golem_dma_send_queue_.empty() &&
                     linkcontrol->spaceToSend(vn, req->size_in_bits) &&
                     linkcontrol->send(req, vn)) {
+                    if (!info.isWrite) golem_dma_read_response_immediate_++;
                     if (golem_dma_trace && info.requestId != 0) {
                         fprintf(stderr, "[memNICBase bridge] TRACE_REQ_RESP_CHUNK_SEND cycle=%" PRIu64
                                         " req=%" PRIu64 " trace_id=%d addr=0x%" PRIx64
@@ -711,6 +732,15 @@ class MemNICBase : public MemLinkBase {
                 } else {
                     dbg.debug(_L2_, "%s failed to send bridged DMA response (buffer full), queueing retry.\n", getName().c_str());
                     golem_dma_send_queue_.push(req);
+                    if (!info.isWrite) {
+                        golem_dma_read_response_enqueued_++;
+                        golem_dma_read_response_enqueue_ticks_[req] =
+                            getCurrentSimCycle();
+                        golem_dma_read_response_queue_high_water_ = std::max(
+                            golem_dma_read_response_queue_high_water_,
+                            static_cast<uint64_t>(
+                                golem_dma_read_response_enqueue_ticks_.size()));
+                    }
                     return true;
                 }
             };
@@ -774,6 +804,24 @@ class MemNICBase : public MemLinkBase {
 
             golem_dma_pending.erase(it);
             return true;
+        }
+
+        void finishGolemDmaResponseStats() {
+            if (golem_dma_read_response_attempted_ == 0) return;
+            std::printf(
+                "GOLEM_MEMNIC_DMA_RESPONSE_STATS component=%s attempted=%" PRIu64
+                " immediate=%" PRIu64 " enqueued=%" PRIu64
+                " drained=%" PRIu64 " high_water=%" PRIu64
+                " queue_wait_ticks=%" PRIu64 " queue_wait_max_ticks=%" PRIu64
+                " pending=%zu\n",
+                getName().c_str(), golem_dma_read_response_attempted_,
+                golem_dma_read_response_immediate_,
+                golem_dma_read_response_enqueued_,
+                golem_dma_read_response_drained_,
+                golem_dma_read_response_queue_high_water_,
+                golem_dma_read_response_queue_wait_ticks_,
+                golem_dma_read_response_queue_wait_max_ticks_,
+                golem_dma_read_response_enqueue_ticks_.size());
         }
 
         /*** Data Members ***/

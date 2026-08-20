@@ -40,6 +40,30 @@ PROFILES = {
     },
 }
 
+INTER_TILE_PHASE_STATS = (
+    ("output_dma", "attention_worker_intertile_output_dma_ticks"),
+    ("query_load", "attention_worker_intertile_query_load_ticks"),
+    ("kv_load", "attention_worker_intertile_kv_load_ticks"),
+    ("q_local_read", "attention_worker_intertile_q_local_read_ticks"),
+    ("qk_matrix_program", "attention_worker_intertile_qk_matrix_program_ticks"),
+    ("qk_input_program", "attention_worker_intertile_qk_input_program_ticks"),
+    ("qk_compute_readout", "attention_worker_intertile_qk_compute_readout_ticks"),
+)
+
+TILE_PIPELINE_PHASE_STATS = (
+    ("kv_load", "attention_worker_tile_kv_load_ticks"),
+    ("q_local_read", "attention_worker_tile_q_local_read_ticks"),
+    ("qk_matrix_program", "attention_worker_tile_qk_matrix_program_ticks"),
+    ("qk_input_program", "attention_worker_tile_qk_input_program_ticks"),
+    ("qk_compute_readout", "attention_worker_tile_qk_compute_readout_ticks"),
+    ("softmax", "attention_worker_tile_softmax_ticks"),
+    ("pv_matrix_program", "attention_worker_tile_pv_matrix_program_ticks"),
+    ("pv_input_program", "attention_worker_tile_pv_input_program_ticks"),
+    ("pv_restore_output", "attention_worker_tile_pv_restore_output_ticks"),
+    ("pv_compute", "attention_worker_tile_pv_compute_ticks"),
+    ("pv_output_readwrite", "attention_worker_tile_pv_output_readwrite_ticks"),
+)
+
 
 def parse_frequency_hz(value):
     match = re.fullmatch(r"\s*([0-9]+(?:\.[0-9]+)?)\s*([kKmMgGtT]?)Hz\s*", value)
@@ -54,6 +78,132 @@ def parse_frequency_hz(value):
 
 def ticks_to_cycles(ticks, clock_hz, timebase_ticks_per_second):
     return (ticks * clock_hz + timebase_ticks_per_second - 1) // timebase_ticks_per_second
+
+
+def summarize_intertile_breakdown(observed, counts, worker_core,
+                                  accelerator_clock_hz,
+                                  timebase_ticks_per_second):
+    component = f"core{worker_core}:rocc"
+    total_stat = "attention_worker_intertile_total_ticks"
+    total_ticks = observed.get((component, total_stat))
+    if total_ticks is None:
+        return {}
+    phase_ticks = {
+        label: observed.get((component, statistic), 0)
+        for label, statistic in INTER_TILE_PHASE_STATS
+    }
+    attributed_ticks = sum(phase_ticks.values())
+    unattributed_ticks = total_ticks - attributed_ticks
+    return {
+        "worker_core": worker_core,
+        "transition_count": counts.get((component, total_stat), 0),
+        "total_ticks": total_ticks,
+        "total_cycles": ticks_to_cycles(
+            total_ticks, accelerator_clock_hz, timebase_ticks_per_second
+        ),
+        "phase_ticks": phase_ticks,
+        "phase_cycles": {
+            label: ticks_to_cycles(
+                ticks, accelerator_clock_hz, timebase_ticks_per_second
+            )
+            for label, ticks in phase_ticks.items()
+        },
+        "phase_counts": {
+            label: counts.get((component, statistic), 0)
+            for label, statistic in INTER_TILE_PHASE_STATS
+        },
+        "attributed_ticks": attributed_ticks,
+        "unattributed_ticks": unattributed_ticks,
+        "conservation_valid": unattributed_ticks == 0,
+    }
+
+
+def summarize_tile_pipeline_breakdown(observed, counts, worker_core,
+                                      accelerator_clock_hz,
+                                      timebase_ticks_per_second):
+    component = f"core{worker_core}:rocc"
+    total_stat = "attention_worker_tile_total_ticks"
+    total_ticks = observed.get((component, total_stat))
+    if total_ticks is None:
+        return {}
+    phase_ticks = {
+        label: observed.get((component, statistic), 0)
+        for label, statistic in TILE_PIPELINE_PHASE_STATS
+    }
+    attributed_ticks = sum(phase_ticks.values())
+    unattributed_ticks = total_ticks - attributed_ticks
+    return {
+        "worker_core": worker_core,
+        "tile_count": counts.get((component, total_stat), 0),
+        "total_ticks": total_ticks,
+        "total_cycles": ticks_to_cycles(
+            total_ticks, accelerator_clock_hz, timebase_ticks_per_second
+        ),
+        "phase_ticks": phase_ticks,
+        "phase_cycles": {
+            label: ticks_to_cycles(
+                ticks, accelerator_clock_hz, timebase_ticks_per_second
+            )
+            for label, ticks in phase_ticks.items()
+        },
+        "phase_counts": {
+            label: counts.get((component, statistic), 0)
+            for label, statistic in TILE_PIPELINE_PHASE_STATS
+        },
+        "attributed_ticks": attributed_ticks,
+        "unattributed_ticks": unattributed_ticks,
+        "conservation_valid": unattributed_ticks == 0,
+    }
+
+
+def summarize_kv_second_lookahead(observed, counts, maxima, worker_cores,
+                                  max_candidates, accelerator_clock_hz,
+                                  timebase_ticks_per_second):
+    components = [f"core{core}:rocc" for core in worker_cores]
+    timing_stats = {
+        "k_release": "attention_kv_k_release_ticks",
+        "v_release": "attention_kv_v_release_ticks",
+        "available_lead": "attention_kv_second_lookahead_lead_ticks",
+    }
+    timing_ticks = {
+        label: sum(observed.get((component, statistic), 0)
+                   for component in components)
+        for label, statistic in timing_stats.items()
+    }
+    timing_counts = {
+        label: sum(counts.get((component, statistic), 0)
+                   for component in components)
+        for label, statistic in timing_stats.items()
+    }
+    candidates = sum(observed.get(
+        (component, "attention_kv_second_lookahead_candidates"), 0
+    ) for component in components)
+    ready_at_release = sum(observed.get(
+        (component, "attention_kv_next_ready_at_release_tiles"), 0
+    ) for component in components)
+    max_lead_ticks = max((maxima.get(
+        (component, "attention_kv_second_lookahead_lead_ticks"), 0
+    ) for component in components), default=0)
+    return {
+        "max_candidates": max_candidates,
+        "candidates": candidates,
+        "candidate_rate": candidates / max_candidates if max_candidates else 0.0,
+        "ready_at_release": ready_at_release,
+        "ready_after_release_before_boundary": candidates - ready_at_release,
+        "timing_ticks": timing_ticks,
+        "timing_counts": timing_counts,
+        "mean_cycles": {
+            label: (
+                ticks_to_cycles(timing_ticks[label], accelerator_clock_hz,
+                                timebase_ticks_per_second) / count
+                if count else 0.0
+            )
+            for label, count in timing_counts.items()
+        },
+        "max_available_lead_cycles": ticks_to_cycles(
+            max_lead_ticks, accelerator_clock_hz, timebase_ticks_per_second
+        ),
+    }
 
 
 def summarize_worker_critical_path(observed, minima, maxima, worker_cores,
@@ -221,7 +371,12 @@ def summarize_system_frontier(observed, maxima, accelerator_clock_hz,
 
 
 def verify(path, profile, accelerator_clock_hz=1_000_000_000,
-           timebase_ticks_per_second=10**12, pv_matrix_broadcast=False):
+           timebase_ticks_per_second=10**12, pv_matrix_broadcast=False,
+           qk_matrix_broadcast=False, qk_dataflow_transpose=False,
+           kv_double_buffer=False, pv_input_pipeline=False,
+           pv_matrix_softmax_overlap=False, pv_restore_pipeline=False,
+           pv_output_pipeline=False, pv_early_compute=False,
+           pv_v_tile_reuse=False):
     activity = PROFILES[profile]
     observed = {}
     counts = {}
@@ -266,6 +421,41 @@ def verify(path, profile, accelerator_clock_hz=1_000_000_000,
         expected[(component, "attention_qk_array_ops")] = activity["qk"]
         expected[(component, "attention_pv_array_ops")] = activity["pv"]
         expected[(component, "attention_sp_hbm_bytes")] = 0
+        expected_prefetches = activity["jobs"] - activity["qblocks"]
+        expected[(component, "attention_kv_prefetch_tiles")] = (
+            expected_prefetches if kv_double_buffer else 0
+        )
+        expected_counts[(component, "attention_kv_prefetch_dma_ticks")] = (
+            expected_prefetches if kv_double_buffer else 0
+        )
+        expected_counts[(component, "attention_kv_k_release_ticks")] = (
+            activity["jobs"] if kv_double_buffer and qk_dataflow_transpose else 0
+        )
+        expected_counts[(component, "attention_kv_v_release_ticks")] = (
+            activity["jobs"] if kv_double_buffer and pv_v_tile_reuse else 0
+        )
+        expected[(component, "attention_pv_input_pipeline_rows")] = (
+            activity["pv"] if pv_input_pipeline else 0
+        )
+        restore_rows = activity["pv"] * (
+            activity["jobs"] - activity["qblocks"]
+        ) // activity["jobs"]
+        expected[(component, "attention_pv_restore_pipeline_rows")] = (
+            restore_rows if pv_restore_pipeline else 0
+        )
+        expected[(component, "attention_pv_output_pipeline_rows")] = (
+            activity["pv"] if pv_output_pipeline else 0
+        )
+        expected[(component, "attention_pv_early_compute_arrays")] = (
+            activity["pv"] if pv_early_compute else 0
+        )
+        expected[(component, "attention_pv_matrix_overlap_tiles")] = (
+            activity["jobs"] if pv_matrix_softmax_overlap else 0
+        )
+        expected[(component, "attention_qk_matrix_broadcasts")] = (
+            (activity["qk"] // 16 if qk_dataflow_transpose else activity["jobs"])
+            if qk_matrix_broadcast else 0
+        )
         expected[(component, "attention_pv_matrix_broadcasts")] = (
             activity["pv"] // 16 if pv_matrix_broadcast else 0
         )
@@ -279,6 +469,16 @@ def verify(path, profile, accelerator_clock_hz=1_000_000_000,
         expected_counts[(component, "attention_worker_output_dma_ack_tick")] = (
             activity["qblocks"]
         )
+        for stat in (
+            "attention_worker_intertile_total_ticks",
+            *(statistic for _, statistic in INTER_TILE_PHASE_STATS),
+        ):
+            expected_counts[(component, stat)] = activity["jobs"] - 1
+        for stat in (
+            "attention_worker_tile_total_ticks",
+            *(statistic for _, statistic in TILE_PIPELINE_PHASE_STATS),
+        ):
+            expected_counts[(component, stat)] = activity["jobs"]
         expected[(f"core{core}:rocc:sfu", "sfu_attention_jobs")] = activity["jobs"]
         expected[(f"core{core}:rocc:sfu", "sfu_softmax_rows")] = activity["rows"]
         expected[(f"core{core}:rocc:sfu", "sfu_attention_scaled_elements")] = activity["scaled"]
@@ -295,6 +495,88 @@ def verify(path, profile, accelerator_clock_hz=1_000_000_000,
         for (component, stat), value in expected_counts.items()
         if counts.get((component, stat)) != value
     })
+    for core in range(4, 20):
+        component = f"core{core}:rocc"
+        expected_consumed = (
+            activity["jobs"] - activity["qblocks"] if kv_double_buffer else 0
+        )
+        hits = observed.get((component, "attention_kv_prefetch_hits"), 0)
+        waits = observed.get((component, "attention_kv_prefetch_waits"), 0)
+        if hits + waits != expected_consumed:
+            mismatches[f"{component}/attention_kv_prefetch_consumed"] = {
+                "expected": expected_consumed,
+                "actual": hits + waits,
+            }
+        timing_counts = (
+            ("attention_kv_prefetch_ready_lead_ticks", hits),
+            ("attention_kv_prefetch_wait_ticks", waits),
+        )
+        for statistic, expected_count in timing_counts:
+            if counts.get((component, statistic)) != expected_count:
+                mismatches[f"{component}/{statistic}.Count"] = {
+                    "expected": expected_count,
+                    "actual": counts.get((component, statistic)),
+                }
+        candidates = observed.get(
+            (component, "attention_kv_second_lookahead_candidates"), 0
+        )
+        ready_at_release = observed.get(
+            (component, "attention_kv_next_ready_at_release_tiles"), 0
+        )
+        candidate_count = counts.get(
+            (component, "attention_kv_second_lookahead_lead_ticks"), 0
+        )
+        max_candidates = max(activity["jobs"] - 2 * activity["qblocks"], 0)
+        observation_enabled = (
+            kv_double_buffer and qk_dataflow_transpose and pv_v_tile_reuse
+        )
+        if not observation_enabled:
+            max_candidates = 0
+        if candidates > max_candidates or ready_at_release > candidates or \
+                candidate_count != candidates:
+            mismatches[f"{component}/attention_kv_second_lookahead_window"] = {
+                "expected": {
+                    "candidates_at_most": max_candidates,
+                    "ready_at_release_at_most": candidates,
+                    "lead_count": candidates,
+                },
+                "actual": {
+                    "candidates": candidates,
+                    "ready_at_release": ready_at_release,
+                    "lead_count": candidate_count,
+                },
+            }
+        overlap_hits = observed.get(
+            (component, "attention_pv_matrix_overlap_hits"), 0
+        )
+        overlap_waits = observed.get(
+            (component, "attention_pv_matrix_overlap_waits"), 0
+        )
+        expected_overlaps = activity["jobs"] if pv_matrix_softmax_overlap else 0
+        if overlap_hits + overlap_waits != expected_overlaps:
+            mismatches[f"{component}/attention_pv_matrix_overlap_consumed"] = {
+                "expected": expected_overlaps,
+                "actual": overlap_hits + overlap_waits,
+            }
+    for core in range(4, 20):
+        breakdown = summarize_intertile_breakdown(
+            observed, counts, core, accelerator_clock_hz,
+            timebase_ticks_per_second,
+        )
+        if breakdown and not breakdown["conservation_valid"]:
+            mismatches[f"core{core}:rocc/attention_worker_intertile_conservation"] = {
+                "expected": 0,
+                "actual": breakdown["unattributed_ticks"],
+            }
+        tile_breakdown = summarize_tile_pipeline_breakdown(
+            observed, counts, core, accelerator_clock_hz,
+            timebase_ticks_per_second,
+        )
+        if tile_breakdown and not tile_breakdown["conservation_valid"]:
+            mismatches[f"core{core}:rocc/attention_worker_tile_conservation"] = {
+                "expected": 0,
+                "actual": tile_breakdown["unattributed_ticks"],
+            }
     for core in range(4, 20):
         key = (f"core{core}:rocc:sfu", "sfu_attention_rsqrt_ready_tick")
         if counts.get(key) != 1:
@@ -387,8 +669,48 @@ def verify(path, profile, accelerator_clock_hz=1_000_000_000,
                 observed, maxima, accelerator_clock_hz,
                 timebase_ticks_per_second,
             ),
+            "kv_second_lookahead_window": summarize_kv_second_lookahead(
+                observed, counts, maxima, range(4, 20),
+                16 * max(activity["jobs"] - 2 * activity["qblocks"], 0)
+                if kv_double_buffer and qk_dataflow_transpose and pv_v_tile_reuse
+                else 0,
+                accelerator_clock_hz, timebase_ticks_per_second,
+            ),
         }
         critical_path = lifecycle["worker_critical_path"]
+        if critical_path:
+            critical_path["inter_tile_breakdown"] = summarize_intertile_breakdown(
+                observed, counts, critical_path["slowest_worker_core"],
+                accelerator_clock_hz, timebase_ticks_per_second,
+            )
+            critical_path["tile_pipeline_breakdown"] = \
+                summarize_tile_pipeline_breakdown(
+                    observed, counts, critical_path["slowest_worker_core"],
+                    accelerator_clock_hz, timebase_ticks_per_second,
+                )
+            component = f"core{critical_path['slowest_worker_core']}:rocc"
+            prefetch_stats = {
+                "dma": "attention_kv_prefetch_dma_ticks",
+                "ready_lead": "attention_kv_prefetch_ready_lead_ticks",
+                "wait": "attention_kv_prefetch_wait_ticks",
+            }
+            critical_path["kv_prefetch_timing"] = {
+                "ticks": {
+                    label: observed.get((component, statistic), 0)
+                    for label, statistic in prefetch_stats.items()
+                },
+                "cycles": {
+                    label: ticks_to_cycles(
+                        observed.get((component, statistic), 0),
+                        accelerator_clock_hz, timebase_ticks_per_second,
+                    )
+                    for label, statistic in prefetch_stats.items()
+                },
+                "counts": {
+                    label: counts.get((component, statistic), 0)
+                    for label, statistic in prefetch_stats.items()
+                },
+            }
         if critical_path and not critical_path.get("order_valid", False):
             mismatches["attention_worker_critical_path_order"] = {
                 "expected": "dispatch <= final_qk <= final_softmax <= final_pv <= output_ack",
@@ -414,11 +736,25 @@ def main():
                         default=parse_frequency_hz("1.0GHz"))
     parser.add_argument("--timebase-ticks-per-second", type=int, default=10**12)
     parser.add_argument("--pv-matrix-broadcast", action="store_true")
+    parser.add_argument("--qk-matrix-broadcast", action="store_true")
+    parser.add_argument("--qk-dataflow-transpose", action="store_true")
+    parser.add_argument("--kv-double-buffer", action="store_true")
+    parser.add_argument("--pv-v-tile-reuse", action="store_true")
+    parser.add_argument("--pv-input-pipeline", action="store_true")
+    parser.add_argument("--pv-restore-pipeline", action="store_true")
+    parser.add_argument("--pv-output-pipeline", action="store_true")
+    parser.add_argument("--pv-early-compute", action="store_true")
+    parser.add_argument("--pv-matrix-softmax-overlap", action="store_true")
     parser.add_argument("--result-json")
     parser.add_argument("stats_file")
     args = parser.parse_args()
     result = verify(args.stats_file, args.profile, args.accelerator_clock,
-                    args.timebase_ticks_per_second, args.pv_matrix_broadcast)
+                    args.timebase_ticks_per_second, args.pv_matrix_broadcast,
+                    args.qk_matrix_broadcast, args.qk_dataflow_transpose,
+                    args.kv_double_buffer, args.pv_input_pipeline,
+                    args.pv_matrix_softmax_overlap, args.pv_restore_pipeline,
+                    args.pv_output_pipeline, args.pv_early_compute,
+                    args.pv_v_tile_reuse)
     print(json.dumps(result, indent=2))
     if args.result_json:
         output = Path(args.result_json)
