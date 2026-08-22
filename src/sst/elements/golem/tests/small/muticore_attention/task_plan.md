@@ -914,6 +914,34 @@ Phase G12 关闭。下一步 G13 仅归因 G5/G12 的 manager skew、query/outpu
 response 服务顺序；先形成 demand-response 优先级的确定性契约，再决定是否修改
 MemNIC。不得继续扩大 lookahead、增加 queue/credit/port 或运行 E4/E5。
 
+### Phase G13 验收结果：G5/G12 关键路径只读归因（2026-08-21）
+
+- 使用既有 G5/G7 与正式 G12 lifecycle/stats artifact 离线比较；未重新运行 SST，
+  没有生产代码改动。
+- E3 G12 从 G5 的 699,750 增至 706,255 cycles（+0.93%），数值检查仍为 0 mismatch。
+- 关键核 inter-tile KV load 从 11,435 增至 112,392 cycles，query load 从 5,848
+  增至 11,306，output DMA 从 10,958 增至 18,138；manager local-complete skew
+  从 13,034 增至 21,431 cycles。慢核由 core19 迁移到 core10。
+- 结论是 N+2 lookahead 改变了共享 MemNIC/HBM response 服务顺序，降低局部 KV
+  等待但放大 query/output 竞争；不是 PV compute 的计算吞吐瓶颈。G12 因此不应继续
+  增大 lookahead 距离。
+- G13 关闭。下一步先写出 demand-response priority contract 并做 trace/replay 或
+  最小 fake-queue 验证，再决定是否改 MemNIC；不得增加 queue、credit、port 或
+  physical buffer，E4/E5 继续冻结，交付保持 G5。
+
+G13 的第一步已完成：新增独立的 `demand_response_priority_contract.py` 与
+`test_demand_response_priority_contract.py`。它定义 consumer → query → output →
+prefetch 的固定等级、issue sequence/request ID tie-break 和有限 trace 的
+exactly-once 检查；该模型不改变 MemNIC。下一步是把同一契约映射到可导出的真实
+response trace，并用压力 trace 检查关键读不会被 N+2 prefetch 延迟；在此之前不改
+MemNIC，也不运行 E4/E5。
+
+补充的 E2 trace-only 运行表明当前 MemNIC 日志缺少 request-kind 元数据：272 个 read
+response 中有 23 个排队、high-water=17，但仅能看到地址/长度/request ID，不能可靠
+区分 query、output 和 prefetch。该运行因关闭 G5 开关得到 91,288 cycles，仅作日志
+格式探针。下一步先增加非时序性的 kind 标记与 focused trace parser，再用完整 G5
+配置复跑 E2；kind 标记验证前不修改 response arbitration。
+
 ## Phase C0 验证边界
 
 进入首个 fused SST 前必须证明：
@@ -927,6 +955,35 @@ MemNIC。不得继续扩大 lookahead、增加 queue/credit/port 或运行 E4/E5
    regression 全部通过。
 
 ## 恢复入口
+
+### G13 当前完成点与下一步
+
+- 已完成 DMA read semantic kind 的非时序性透传和真实 trace 验证。
+- G5 E2：25,705 cycles，16,384 项检查，0 mismatch。
+- 已补齐 `AttentionOutput` 和 `dma_kind_trace.py`；按唯一完成事件统计，Query/KV/KV
+  prefetch/Output 为 16/32/224/16，Unknown=0。旧的 16/36/296 包含 enqueue 重复行，废弃。
+- priority contract 尚未接入 MemNIC arbitration。下一步用有限压力 trace/replay 验证
+  确定性排序、无死锁、exactly-once completion；通过后才评估最小化调度改动，
+  不增加 queue/credit/port，E4/E5 保持冻结。
+
+### G13 有限压力验证结果
+
+- `dma_priority_replay.py` 已用真实 G5 E2 的 288 个唯一完成事件做三档到达压缩。
+- 三档均完成 288/288、exactly-once、最终排空；queue high-water 为 65/263/286，
+  prefetch 最大等待为 80/266/285 replay ticks。
+- 已证明有限任务无饥饿；不声称严格优先级对无限高优先级流量具有公平性。
+- 下一步允许实现最小 MemNIC arbitration A/B：先 E2，保持 25,705-cycle 基线和
+  0 mismatch；通过后再决定是否运行 E3。不得增加物理资源，E4/E5 继续冻结。
+
+### G13 MemNIC priority A/B 决策
+
+- 默认关闭的 priority 开关已实现；只重排已有 retry queue，同级 FIFO，无新增资源。
+- E2 off/on 均为 25,705 cycles，实际重排 0。
+- E3 off/on 为 699,750/699,133 cycles，实际重排 6，均 131,072 checked、0 mismatch。
+- 虽净改善 617 cycles（0.088%），但 KV load +3,676、prefetch wait +3,688，未稳定改善
+  consumer 关键路径。
+- 结论：仅保留默认关闭的实验开关，不进入正式 G5，不运行 E4/E5。下一步回到请求
+  产生端寻找结构性方案，不继续 sweep response priority。
 
 继续实现前依次阅读：
 

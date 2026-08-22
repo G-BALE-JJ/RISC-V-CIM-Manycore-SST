@@ -1373,3 +1373,121 @@ Phase G12 以“机制有效但端到端退化，完整撤回”关闭。下一�
 距离；先做 G13 只读关键路径归因，比较 G5 与 G12 的 manager skew、query/output
 DMA 和各 HBM 节点 response 服务顺序，判断是否存在不增加资源的 demand-response
 优先级方案。没有确定性优先级契约前不修改 MemNIC，E4/E5 继续冻结。
+
+## 2026-08-21：完成 Phase G13 只读关键路径归因
+
+G13 使用已存在的 G5/G7 观测 artifact 与正式 G12 artifact 做离线对比，没有重新
+运行 SST，也没有修改生产代码。两组结果均为 `PASS` 且数值检查为 0 mismatch。
+
+| 指标 | E3 G5/G7 | E3 G12 | 变化 |
+|---|---:|---:|---:|
+| 端到端 cycles | 699,750 | 706,255 | +6,505（+0.93%） |
+| 慢核 | core19 | core10 | 关键核发生迁移 |
+| manager local-complete skew | 13,034 cycles | 21,431 cycles | +8,397 |
+| inter-tile PV→next-QK | 180,112 cycles | 292,021 cycles | +111,909 |
+| inter-tile KV load | 11,435 cycles | 112,392 cycles | +100,957 |
+| inter-tile query load | 5,848 cycles | 11,306 cycles | +5,458 |
+| inter-tile output DMA | 10,958 cycles | 18,138 cycles | +7,180 |
+| final PV→output ACK | 290 cycles | 278 cycles | -12 |
+| KV prefetch wait | 6,367 cycles | 99,225 cycles | +92,858 |
+
+G12 的 lookahead 确实降低了部分慢核 KV 等待，但提前发起的 N+2 请求与 query、output
+DMA 共享相同的 MemNIC/HBM 回包资源，导致关键核的 KV load 和 query/output load
+同时变长；因此收益没有转化为端到端周期下降。G12 的 manager skew 增大和慢核从
+core19 迁移到 core10 进一步说明这是共享 response 服务顺序变化，而不是 PV 计算
+本身变慢。E2 只获得 10-cycle 的 G12 微小收益，不能改变 E3 的拒绝结论。
+
+G13 结论：当前首要瓶颈是 demand-response 竞争和服务顺序，不是继续增加 KV
+lookahead 距离。下一步只定义可观测、可回归的确定性优先级契约（当前 tile 的
+consumer-critical read 高于非关键 N+2 prefetch；query/output DMA 的优先级和
+tie-break 固定），先用 trace/replay 或最小 fake queue 验证公平性、无死锁和
+response 顺序，再决定是否修改 MemNIC。不得增加 queue、credit、port 或物理 buffer；
+E4/E5 继续冻结，正式交付仍为 G5（E2=25,705，E3=699,750）。
+
+已加入不接入生产代码的最小契约模型与测试：
+`demand_response_priority_contract.py` 和
+`test_demand_response_priority_contract.py`。该模型只验证有限 trace 的确定性排序
+与 exactly-once completion，不代表 MemNIC 已经采用该策略；后续若进入实现阶段，
+必须在真实 response queue 上复用相同规则并增加竞争压力测试。
+
+随后完成一次 E2 `GOLEM_DMA_TRACE=1` trace-only 运行，artifact 为
+`/data4/jjgong/tmp/fused_attention_e2_g13_dma_trace_20260821`。该运行没有打开 G5
+优化开关，端到端为 `91,288 cycles`，因此不作为性能 A/B 或正式基线。trace 记录了
+272 个 DMA read response，其中 23 个进入 MemNIC retry queue，最大 queue high-water
+为 17；但每条事件只有地址、长度和按 worker 重置的 request ID，没有 query/output/
+consumer/prefetch semantic kind，无法离线验证优先级契约。下一步必须先给 DMA trace
+增加不改变时序的 request-kind 元数据，再做一次完整 G5 E2 trace；在此之前不修改
+MemNIC 的调度行为。
+
+## 2026-08-21：G13 DMA semantic kind trace 完成
+
+已加入非时序性的 `DmaRequestKind` 元数据并沿 MemNIC response 路径透传。编号为
+`1=AttentionQuery`、`2=AttentionKv`、`3=AttentionKvPrefetch`，没有改变 queue、
+credit 或 response arbitration。完整 G5 E2 artifact 为
+`/data4/jjgong/tmp/fused_attention_e2_g13_kind_trace_20260821c`。
+
+结果保持正式基线：`25,705 cycles`，`16,384 checked`，`mismatches=0`。运行时 trace
+早期按全部 `kind=` 行统计得到 16/36/296，其中包含 enqueue 重复行。现已补齐
+`4=AttentionOutput`，并加入 `dma_kind_trace.py` 按唯一完成事件类型
+`send READ_RESP/WRITE_COMPLETE` 解析。最终 G5 E2 artifact 为
+`/data4/jjgong/tmp/fused_attention_e2_g13_output_kind_20260821b`，仍为 `25,705 cycles`、
+0 mismatch；机器可复现统计为 Query 16、KV 32、KV prefetch 224、Output 16、Unknown 0。
+这完成了四类 DMA 观测闭环，但仍未改变 MemNIC arbitration。下一步用有限压力
+trace/replay 验证 priority contract，E4/E5 继续冻结。
+
+## 2026-08-21：G13 有限竞争 trace/replay 通过
+
+新增 `dma_priority_replay.py`，复用 `demand_response_priority_contract.py` 的
+consumer > query > output > prefetch 顺序。模型把真实 G5 E2 的 288 个唯一 DMA 完成
+事件按 cycle 压缩为到达流，每个 replay tick 只服务一个当前已到达 response；不修改
+生产 MemNIC。三档 `arrival_quantum` 压力结果如下：
+
+| quantum | issued/completed | exactly-once/drained | queue high-water | prefetch max wait |
+|---:|---:|---|---:|---:|
+| 100,000 | 288/288 | true/true | 65 | 80 ticks |
+| 1,000,000 | 288/288 | true/true | 263 | 266 ticks |
+| 10,000,000 | 288/288 | true/true | 286 | 285 ticks |
+
+四类完成数始终为 consumer 32、query 16、output 16、prefetch 224。由此可确认固定
+tie-break、有限任务 exactly-once、排空和有限 trace 无饥饿。边界是：严格优先级对
+无限持续的高优先级流量不保证 prefetch 公平性；当前结论仅适用于有限 Attention
+任务。下一步可进入最小 MemNIC arbitration A/B，但必须先做 E2，周期或正确性退化即
+回退；E2 通过后才允许 E3，E4/E5 继续冻结。
+
+## 2026-08-21：G13 最小 MemNIC priority A/B 完成
+
+实现了默认关闭的 `GOLEM_DMA_RESPONSE_PRIORITY_ENABLE`：只在已有 DMA response retry
+queue 中按 consumer > query > output > prefetch 选择下一个请求，同级保持 FIFO；没有
+增加 queue、credit、port 或 buffer。新增 `priority_reorders` 统计实际越过次数。
+
+| 配置 | E2 cycles | E3 cycles | E3 实际重排 | 数值检查 |
+|---|---:|---:|---:|---|
+| priority off | 25,705 | 699,750 | 0 | E2/E3 均 0 mismatch |
+| priority on | 25,705 | 699,133 | 6 | E2/E3 均 0 mismatch |
+
+E3 净减少 617 cycles（0.088%），manager skew 减少 506，query load 减少 638，output
+DMA 减少 1,546；但 KV load 增加 3,676、prefetch wait 增加 3,688，prefetch DMA 增加
+27,240。说明 6 次重排会改变全局到达时序，但没有稳定改善目标 consumer 路径，净收益
+太小，不足以成为正式架构机制。
+
+决策：保留代码作为默认关闭的实验/诊断开关，不纳入 G5 正式配置；正式结果仍是
+E2=25,705、E3=699,750。停止扩大到 E4/E5。下一步应回到请求产生端，寻找能同时降低
+KV load/prefetch wait 和端到端周期的结构性方案，而不是继续调整 response queue 顺序。
+
+## 2026-08-21：建立 PyTorch V100 GPU baseline
+
+新增 `gpu_baseline/`，固定与正式 E3 相同的 `B1,H1,S1024,D128,FP32`、非 causal、
+`1/sqrt(128)` scale 和项目 Q/K/V 生成公式。主机环境为 2 张 Tesla V100-SXM2-32GB，
+PyTorch 2.10.0+cu128，CUDA 可用。使用默认
+`torch.nn.functional.scaled_dot_product_attention`，50 次 warmup、200 次 CUDA Event
+计时；不包含 allocation、H2D 和 correctness reference。
+
+旧 GPU kernel-only 运行的 median/p95 为 0.2048/0.2335 ms，显式 GPU reference 最大误差
+1.91e-9；该数字不再作为端到端 SST/GPU 结论。正式 SST G5 E3 为 699,750 cycles @ 1 GHz。
+旧 GPU cycle 估算为 264,192，但只覆盖 kernel，且 GPU 时钟是动态的。
+
+随后按端到端对齐要求修改 `gpu_baseline/benchmark_attention.py`：计时区间现在包含
+Q/K/V H2D、SDPA、输出 D2H 和 host synchronization，输入构造、一次性 buffer 分配和
+correctness reference 仍在计时外；CUDA event kernel-only latency 仅保留为诊断字段。
+当前工作区无法访问 CUDA，新的端到端 V100 结果尚未重跑；现有 JSON 中的旧数字仍是
+kernel-only 结果，不得用于新的 SST/GPU 端到端结论。

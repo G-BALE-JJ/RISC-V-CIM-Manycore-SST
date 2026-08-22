@@ -1809,7 +1809,7 @@ public:
                 if (!attentionWorker_ || !ok) { finishAttentionWorker(false); return; }
                 recordAttentionInterTilePhase(AttentionInterTilePhase::QueryLoad);
                 loadAttentionKeyTile();
-            });
+            }, DmaRequestKind::AttentionQuery);
     }
 
     void beginAttentionKeyTile() {
@@ -1878,10 +1878,10 @@ public:
         state.attentionKvLoadsPending = 2;
         globalMem->dma_read_from_host_to_globalmem(
             attentionKvHostAddr(state, state.dispatch.kAddr), tileBytes, state.kLocal,
-            [this](bool ok) { completeAttentionKvLoad(ok); });
+            [this](bool ok) { completeAttentionKvLoad(ok); }, DmaRequestKind::AttentionKv);
         globalMem->dma_read_from_host_to_globalmem(
             attentionKvHostAddr(state, state.dispatch.vAddr), tileBytes, state.vLocal,
-            [this](bool ok) { completeAttentionKvLoad(ok); });
+            [this](bool ok) { completeAttentionKvLoad(ok); }, DmaRequestKind::AttentionKv);
     }
 
     void completeAttentionKvLoad(bool ok) {
@@ -1927,12 +1927,12 @@ public:
             attentionKvHostAddrForTile(
                 state, state.dispatch.kAddr, state.prefetchedKeyTile),
             tileBytes, state.kLocalBuffers[state.prefetchKvBuffer],
-            [this](bool ok) { completeAttentionKvPrefetch(ok); });
+            [this](bool ok) { completeAttentionKvPrefetch(ok); }, DmaRequestKind::AttentionKvPrefetch);
         globalMem->dma_read_from_host_to_globalmem(
             attentionKvHostAddrForTile(
                 state, state.dispatch.vAddr, state.prefetchedKeyTile),
             tileBytes, state.vLocalBuffers[state.prefetchKvBuffer],
-            [this](bool ok) { completeAttentionKvPrefetch(ok); });
+            [this](bool ok) { completeAttentionKvPrefetch(ok); }, DmaRequestKind::AttentionKvPrefetch);
     }
 
     void completeAttentionKvPrefetch(bool ok) {
@@ -2692,7 +2692,7 @@ public:
                         const uint32_t queryBlocks = attentionQueryBlocks(state);
                         if (++state.queryBlock < queryBlocks) beginAttentionQueryBlock();
                         else finishAttentionWorker(true);
-                    });
+                    }, DmaRequestKind::AttentionOutput);
         }
     }
 
@@ -2921,8 +2921,8 @@ public:
                     attentionWorker_->vLocal, [this](bool vOk) {
                         if (!attentionWorker_ || !vOk) { finishAttentionWorker(false); return; }
                         beginAttentionQueryBlock();
-                    });
-            });
+                    }, DmaRequestKind::AttentionKv);
+            }, DmaRequestKind::AttentionKv);
     }
 
     void progressAttentionWorker() {

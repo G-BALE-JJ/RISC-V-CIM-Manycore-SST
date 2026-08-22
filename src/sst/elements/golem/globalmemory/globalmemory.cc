@@ -995,7 +995,8 @@ void GlobalMemoryImplement::issue_dma_read_chunk(PendingDmaOp& op, const char* r
         network_id,
         0,
         0,
-        op.request_id);
+        op.request_id,
+        op.dmaRequestKind);
     req->givePayload(payload);
 
     dma_read_req_to_key[req] = op.request_id;
@@ -1332,15 +1333,17 @@ void GlobalMemoryImplement::StdMemHandlers::handle(SST::Interfaces::StandardMem:
     delete ev;
 }
 
-void GlobalMemoryImplement::dma_write_to_host(uint64_t dst_pa, size_t length, const std::vector<uint8_t>& data, DmaCallback cb)
+void GlobalMemoryImplement::dma_write_to_host(uint64_t dst_pa, size_t length, const std::vector<uint8_t>& data, DmaCallback cb,
+                                              DmaRequestKind kind)
 {
-    dma_write_to_host_impl(dst_pa, length, data, cb, 0);
+    dma_write_to_host_impl(dst_pa, length, data, cb, 0, kind);
 }
 
 void GlobalMemoryImplement::dma_write_from_globalmem_to_host(uint64_t gm_src_addr,
                                                               uint64_t dst_pa,
                                                               size_t length,
-                                                              DmaCallback cb)
+                                                              DmaCallback cb,
+                                                              DmaRequestKind kind)
 {
     struct TransferState {
         uint64_t gmSrc = 0;
@@ -1364,7 +1367,7 @@ void GlobalMemoryImplement::dma_write_from_globalmem_to_host(uint64_t gm_src_add
     state->length = length;
     state->callback = std::move(cb);
     auto pump = std::make_shared<std::function<void()>>();
-    *pump = [this, state, pump]() {
+    *pump = [this, state, pump, kind]() {
         const size_t remaining = state->length - state->offset;
         const size_t chunkBytes = std::min<size_t>(remaining, localAccessMaxRequestBytes_);
         const uint64_t localTag = nextLocalDmaTag_++;
@@ -1373,7 +1376,7 @@ void GlobalMemoryImplement::dma_write_from_globalmem_to_host(uint64_t gm_src_add
             chunkBytes,
             LocalMemoryClient::Dma,
             localTag,
-            [this, state, pump, chunkBytes](bool ok,
+            [this, state, pump, chunkBytes, kind](bool ok,
                                             uint64_t,
                                             const std::vector<uint8_t>& data) {
                 if (!ok || data.size() != chunkBytes) {
@@ -1401,7 +1404,8 @@ void GlobalMemoryImplement::dma_write_from_globalmem_to_host(uint64_t gm_src_add
                             return;
                         }
                         (*pump)();
-                    });
+                    },
+                    kind);
             });
         if (!accepted) {
             auto callback = std::move(state->callback);
@@ -1429,10 +1433,11 @@ uint64_t GlobalMemoryImplement::dma_write_to_host_async(uint64_t dst_pa, size_t 
     return token;
 }
 
-uint64_t GlobalMemoryImplement::dma_read_from_host_to_globalmem_async(uint64_t src_pa, size_t length, uint64_t gm_dst_addr)
+uint64_t GlobalMemoryImplement::dma_read_from_host_to_globalmem_async(uint64_t src_pa, size_t length, uint64_t gm_dst_addr,
+                                                                      DmaRequestKind kind)
 {
     const uint64_t token = allocate_dma_completion_token();
-    dma_read_from_host_to_globalmem_impl(src_pa, length, gm_dst_addr, nullptr, token);
+    dma_read_from_host_to_globalmem_impl(src_pa, length, gm_dst_addr, nullptr, token, kind);
     if (length == 0) {
         dma_completion_tokens[token] = true;
     }
@@ -1456,7 +1461,8 @@ void GlobalMemoryImplement::dma_completion_retire(uint64_t token)
     dma_completion_tokens.erase(token);
 }
 
-void GlobalMemoryImplement::dma_write_to_host_impl(uint64_t dst_pa, size_t length, const std::vector<uint8_t>& data, DmaCallback cb, uint64_t completion_token)
+void GlobalMemoryImplement::dma_write_to_host_impl(uint64_t dst_pa, size_t length, const std::vector<uint8_t>& data, DmaCallback cb,
+                                                   uint64_t completion_token, DmaRequestKind kind)
 {
     if (!link_control) {
         output->fatal(CALL_INFO, -1,
@@ -1539,12 +1545,14 @@ void GlobalMemoryImplement::dma_write_to_host_impl(uint64_t dst_pa, size_t lengt
         op.completion_flag_addr = flag_addr;
         op.completion_value = seq_value;
         op.completion_token = ctx ? ctx->completion_token : completion_token;
+        op.dmaRequestKind = kind;
 
         req->vn = request_vn;
         req->size_in_bits = (sizeof(dst_pa) + sizeof(xfer) + xfer) * 8;
 
         // 创建 DMA_WRITE 负载
-        auto* payload = new NetworkDataEvent(NetworkDataEvent::DMA_WRITE, dst_pa + offset, xfer, chunk);
+        auto* payload = new NetworkDataEvent(NetworkDataEvent::DMA_WRITE, dst_pa + offset, xfer, chunk,
+                                             0, -1, 0, 0, op.request_id, op.dmaRequestKind);
         req->givePayload(payload);
 
         const uint64_t pending_key = op.host_addr;
@@ -1569,12 +1577,14 @@ void GlobalMemoryImplement::dma_write_to_host_impl(uint64_t dst_pa, size_t lengt
     }
 }
 
-void GlobalMemoryImplement::dma_read_from_host_to_globalmem(uint64_t src_pa, size_t length, uint64_t gm_dst_addr, DmaCallback cb)
+void GlobalMemoryImplement::dma_read_from_host_to_globalmem(uint64_t src_pa, size_t length, uint64_t gm_dst_addr, DmaCallback cb,
+                                                            DmaRequestKind kind)
 {
-    dma_read_from_host_to_globalmem_impl(src_pa, length, gm_dst_addr, cb, 0);
+    dma_read_from_host_to_globalmem_impl(src_pa, length, gm_dst_addr, cb, 0, kind);
 }
 
-void GlobalMemoryImplement::dma_read_from_host_to_globalmem_impl(uint64_t src_pa, size_t length, uint64_t gm_dst_addr, DmaCallback cb, uint64_t completion_token)
+void GlobalMemoryImplement::dma_read_from_host_to_globalmem_impl(uint64_t src_pa, size_t length, uint64_t gm_dst_addr, DmaCallback cb,
+                                                                 uint64_t completion_token, DmaRequestKind kind)
 {
     if (!link_control) {
         output->fatal(CALL_INFO, -1,
@@ -1630,6 +1640,7 @@ void GlobalMemoryImplement::dma_read_from_host_to_globalmem_impl(uint64_t src_pa
         op.request_id = next_dma_request_id++;
         op.host_addr = src_pa + offset;
         op.gm_dst_addr = gm_dst_addr + offset;
+        op.dmaRequestKind = kind;
         op.cb = ctx ? DmaCallback() : cb;
         op.length = xfer;
         op.ctx = ctx;
@@ -2394,7 +2405,7 @@ void GlobalMemoryLocal::rd_to_network(uint64_t, size_t, uint64_t)
     // No network in local mode; ignore.
 }
 
-void GlobalMemoryLocal::dma_write_to_host(uint64_t, size_t, const std::vector<uint8_t>&, DmaCallback)
+void GlobalMemoryLocal::dma_write_to_host(uint64_t, size_t, const std::vector<uint8_t>&, DmaCallback, DmaRequestKind)
 {
     assert(false && "GlobalMemoryLocal does not support dma_write_to_host (no StandardMem interface wired)");
 }
@@ -2402,14 +2413,15 @@ void GlobalMemoryLocal::dma_write_to_host(uint64_t, size_t, const std::vector<ui
 void GlobalMemoryLocal::dma_write_from_globalmem_to_host(uint64_t,
                                                           uint64_t,
                                                           size_t,
-                                                          DmaCallback cb)
+                                                          DmaCallback cb,
+                                                          DmaRequestKind)
 {
     if (cb) {
         cb(false);
     }
 }
 
-void GlobalMemoryLocal::dma_read_from_host_to_globalmem(uint64_t, size_t, uint64_t, DmaCallback)
+void GlobalMemoryLocal::dma_read_from_host_to_globalmem(uint64_t, size_t, uint64_t, DmaCallback, DmaRequestKind)
 {
     assert(false && "GlobalMemoryLocal does not support dma_read_from_host_to_globalmem (no StandardMem interface wired)");
 }
@@ -2421,7 +2433,7 @@ uint64_t GlobalMemoryLocal::dma_write_to_host_async(uint64_t, size_t, const std:
     return token;
 }
 
-uint64_t GlobalMemoryLocal::dma_read_from_host_to_globalmem_async(uint64_t, size_t, uint64_t)
+uint64_t GlobalMemoryLocal::dma_read_from_host_to_globalmem_async(uint64_t, size_t, uint64_t, DmaRequestKind)
 {
     const uint64_t token = next_dma_completion_token++;
     dma_completion_tokens[token] = true;

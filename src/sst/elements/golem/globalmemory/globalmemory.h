@@ -46,6 +46,14 @@ enum class LocalMemoryClient : uint8_t {
     Control,
 };
 
+enum class DmaRequestKind : uint8_t {
+    Unknown,
+    AttentionQuery,
+    AttentionKv,
+    AttentionKvPrefetch,
+    AttentionOutput,
+};
+
 using LocalReadCallback =
     std::function<void(bool, uint64_t, const std::vector<uint8_t>&)>;
 using LocalWriteCallback = std::function<void(bool, uint64_t)>;
@@ -162,7 +170,7 @@ public:
     enum Type { READ, WRITE, DMA_WRITE, DMA_READ_COMPLETE, DMA_WRITE_COMPLETE };
 
     // 默认构造函数 (序列化需要)
-    NetworkDataEvent() : Event(), type(READ), addr(0), length(0), data(), returnAddr(0), returnEndpoint(-1), completionFlagAddr(0), completionValue(0), requestId(0) {}
+    NetworkDataEvent() : Event(), type(READ), addr(0), length(0), data(), returnAddr(0), returnEndpoint(-1), completionFlagAddr(0), completionValue(0), requestId(0), dmaRequestKind(DmaRequestKind::Unknown) {}
 
     // 带参数构造函数
     NetworkDataEvent(Type type, uint64_t addr, size_t length, const std::vector<uint8_t>& data)
@@ -173,9 +181,9 @@ public:
 
     NetworkDataEvent(Type type, uint64_t addr, size_t length, const std::vector<uint8_t>& data,
                      uint64_t returnAddr, int returnEndpoint, uint64_t completionFlagAddr, uint64_t completionValue,
-                     uint64_t requestId = 0)
+                     uint64_t requestId = 0, DmaRequestKind dmaRequestKind = DmaRequestKind::Unknown)
         : Event(), type(type), addr(addr), length(length), data(data), returnAddr(returnAddr),
-          returnEndpoint(returnEndpoint), completionFlagAddr(completionFlagAddr), completionValue(completionValue), requestId(requestId) {}
+          returnEndpoint(returnEndpoint), completionFlagAddr(completionFlagAddr), completionValue(completionValue), requestId(requestId), dmaRequestKind(dmaRequestKind) {}
 
     // 获取事件类型
     Type getType() const { return type; }
@@ -191,6 +199,7 @@ public:
     uint64_t getCompletionFlagAddr() const { return completionFlagAddr; }
     uint64_t getCompletionValue() const { return completionValue; }
     uint64_t getRequestId() const { return requestId; }
+    DmaRequestKind getDmaRequestKind() const { return dmaRequestKind; }
     // 序列化函数: 序列化所有字段以支持跨节点传输
     void serialize_order(SST::Core::Serialization::serializer &ser) override {
         Event::serialize_order(ser);
@@ -203,6 +212,7 @@ public:
         ser & completionFlagAddr;
         ser & completionValue;
         ser & requestId;
+        ser & dmaRequestKind;
     }
 
     ImplementSerializable(SST::Golem::NetworkDataEvent);
@@ -217,6 +227,7 @@ private:
     uint64_t completionFlagAddr;    // optional direct-completion flag address on receiver
     uint64_t completionValue;       // optional direct-completion flag value on receiver
     uint64_t requestId;             // optional scheduler transaction identifier
+    DmaRequestKind dmaRequestKind;  // semantic tag for DMA response trace attribution
 };
 
 
@@ -249,12 +260,15 @@ public:
     virtual void setBaseAddr(uint64_t addr) = 0;
     virtual uint64_t getBaseAddr() const = 0;
     virtual uint64_t getSize() const = 0;
-    virtual void dma_write_to_host(uint64_t dst_pa, size_t length, const std::vector<uint8_t>& data, DmaCallback cb) = 0;
+    virtual void dma_write_to_host(uint64_t dst_pa, size_t length, const std::vector<uint8_t>& data, DmaCallback cb,
+                                   DmaRequestKind kind = DmaRequestKind::Unknown) = 0;
     virtual void dma_write_from_globalmem_to_host(uint64_t gm_src_addr,
                                                    uint64_t dst_pa,
                                                    size_t length,
-                                                   DmaCallback cb) = 0;
-    virtual void dma_read_from_host_to_globalmem(uint64_t src_pa, size_t length, uint64_t gm_dst_addr, DmaCallback cb) = 0;
+                                                   DmaCallback cb,
+                                                   DmaRequestKind kind = DmaRequestKind::Unknown) = 0;
+    virtual void dma_read_from_host_to_globalmem(uint64_t src_pa, size_t length, uint64_t gm_dst_addr, DmaCallback cb,
+                                                 DmaRequestKind kind = DmaRequestKind::Unknown) = 0;
     virtual uint64_t dma_write_to_host_async(uint64_t dst_pa, size_t length,
                                              const std::vector<uint8_t>& data) = 0;
     virtual bool dma_completion_done(uint64_t token) const = 0;
@@ -352,19 +366,23 @@ public:
     // 获取全局内存容量大小
     uint64_t getSize() const override;
 
-    void dma_write_to_host(uint64_t dst_pa, size_t length, const std::vector<uint8_t>& data, DmaCallback cb) override;
+    void dma_write_to_host(uint64_t dst_pa, size_t length, const std::vector<uint8_t>& data, DmaCallback cb,
+                           DmaRequestKind kind = DmaRequestKind::Unknown) override;
     void dma_write_from_globalmem_to_host(uint64_t gm_src_addr,
                                            uint64_t dst_pa,
                                            size_t length,
-                                           DmaCallback cb) override;
-    void dma_read_from_host_to_globalmem(uint64_t src_pa, size_t length, uint64_t gm_dst_addr, DmaCallback cb) override;
+                                           DmaCallback cb,
+                                           DmaRequestKind kind = DmaRequestKind::Unknown) override;
+    void dma_read_from_host_to_globalmem(uint64_t src_pa, size_t length, uint64_t gm_dst_addr, DmaCallback cb,
+                                         DmaRequestKind kind = DmaRequestKind::Unknown) override;
     bool reductionNetworkAvailable() const override;
     bool sendReductionMessage(uint32_t destinationCore,
                               const ReductionTransportMessage& message) override;
     void setReductionMessageHandler(ReductionMessageHandler handler) override;
     uint64_t dma_write_to_host_async(uint64_t dst_pa, size_t length,
                                      const std::vector<uint8_t>& data) override;
-    uint64_t dma_read_from_host_to_globalmem_async(uint64_t src_pa, size_t length, uint64_t gm_dst_addr);
+    uint64_t dma_read_from_host_to_globalmem_async(uint64_t src_pa, size_t length, uint64_t gm_dst_addr,
+                                                  DmaRequestKind kind = DmaRequestKind::Unknown);
     bool dma_completion_done(uint64_t token) const override;
     void dma_completion_retire(uint64_t token) override;
 
@@ -418,6 +436,7 @@ private:
         uint64_t host_addr = 0;
         uint64_t gm_dst_addr = 0;
         size_t length = 0;
+        DmaRequestKind dmaRequestKind = DmaRequestKind::Unknown;
         DmaCallback cb;
         struct DmaContext {
             uint64_t host_base = 0;
@@ -565,8 +584,10 @@ private:
     size_t count_issued_dma_reads() const;
     void issue_pending_dma_read_window();
     uint64_t allocate_dma_completion_token();
-    void dma_write_to_host_impl(uint64_t dst_pa, size_t length, const std::vector<uint8_t>& data, DmaCallback cb, uint64_t completion_token);
-    void dma_read_from_host_to_globalmem_impl(uint64_t src_pa, size_t length, uint64_t gm_dst_addr, DmaCallback cb, uint64_t completion_token);
+    void dma_write_to_host_impl(uint64_t dst_pa, size_t length, const std::vector<uint8_t>& data, DmaCallback cb,
+                                uint64_t completion_token, DmaRequestKind kind = DmaRequestKind::Unknown);
+    void dma_read_from_host_to_globalmem_impl(uint64_t src_pa, size_t length, uint64_t gm_dst_addr, DmaCallback cb,
+                                              uint64_t completion_token, DmaRequestKind kind);
 
     uint64_t read_u64_from_storage(uint64_t addr) const;
     void write_u64_to_storage(uint64_t addr, uint64_t value);
@@ -674,15 +695,19 @@ public:
     void setBaseAddr(uint64_t addr) override { baseAddr = addr; }
     uint64_t getBaseAddr() const override { return baseAddr; }
     uint64_t getSize() const override { return size; }
-    void dma_write_to_host(uint64_t, size_t, const std::vector<uint8_t>&, DmaCallback) override;
-    void dma_write_from_globalmem_to_host(uint64_t, uint64_t, size_t, DmaCallback) override;
-    void dma_read_from_host_to_globalmem(uint64_t, size_t, uint64_t, DmaCallback) override;
+    void dma_write_to_host(uint64_t, size_t, const std::vector<uint8_t>&, DmaCallback,
+                           DmaRequestKind = DmaRequestKind::Unknown) override;
+    void dma_write_from_globalmem_to_host(uint64_t, uint64_t, size_t, DmaCallback,
+                                          DmaRequestKind = DmaRequestKind::Unknown) override;
+    void dma_read_from_host_to_globalmem(uint64_t, size_t, uint64_t, DmaCallback,
+                                         DmaRequestKind = DmaRequestKind::Unknown) override;
     bool reductionNetworkAvailable() const override { return false; }
     bool sendReductionMessage(uint32_t, const ReductionTransportMessage&) override { return false; }
     void setReductionMessageHandler(ReductionMessageHandler) override {}
     uint64_t dma_write_to_host_async(uint64_t dst_pa, size_t length,
                                      const std::vector<uint8_t>& data) override;
-    uint64_t dma_read_from_host_to_globalmem_async(uint64_t src_pa, size_t length, uint64_t gm_dst_addr);
+    uint64_t dma_read_from_host_to_globalmem_async(uint64_t src_pa, size_t length, uint64_t gm_dst_addr,
+                                                  DmaRequestKind kind = DmaRequestKind::Unknown);
     bool dma_completion_done(uint64_t token) const override;
     void dma_completion_retire(uint64_t token) override;
 
