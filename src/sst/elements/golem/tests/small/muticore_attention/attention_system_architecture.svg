@@ -1,0 +1,99 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1040" viewBox="0 0 1600 1040">
+  <defs>
+    <marker id="arr" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto"><path d="M0,0 L9,3.5 L0,7 z" fill="#263746"/></marker>
+    <marker id="arrBlue" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto"><path d="M0,0 L9,3.5 L0,7 z" fill="#2b5c8a"/></marker>
+    <marker id="arrOrange" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto"><path d="M0,0 L9,3.5 L0,7 z" fill="#b45f06"/></marker>
+    <style>
+      .t { font-family: "STIX Two Text", "Times New Roman", serif; fill:#1d2935; }
+      .title { font-size:27px; font-weight:700; }
+      .panel { font-size:18px; font-weight:700; }
+      .h { font-size:16px; font-weight:700; }
+      .body { font-size:14px; }
+      .small { font-size:12px; fill:#536372; }
+      .tiny { font-size:11px; fill:#536372; }
+      .outline { fill:#fff; stroke:#394b59; stroke-width:1.6; }
+      .control { fill:#eaf2f8; stroke:#2b5c8a; stroke-width:1.5; }
+      .compute { fill:#edf5ef; stroke:#3c7655; stroke-width:1.5; }
+      .data { fill:#fbf0df; stroke:#b45f06; stroke-width:1.5; }
+      .light { fill:#f7f8f9; stroke:#9aa8b3; stroke-width:1.2; }
+      .dash { fill:none; stroke:#8896a1; stroke-width:1.2; stroke-dasharray:6 5; }
+      .line { fill:none; stroke:#263746; stroke-width:1.8; marker-end:url(#arr); }
+      .blue { fill:none; stroke:#2b5c8a; stroke-width:1.8; marker-end:url(#arrBlue); }
+      .orange { fill:none; stroke:#b45f06; stroke-width:1.8; marker-end:url(#arrOrange); }
+      .thin { fill:none; stroke:#71808c; stroke-width:1.2; }
+      .math { font-family:"STIX Two Math", "Times New Roman", serif; font-size:15px; font-style:italic; fill:#1d2935; }
+    </style>
+  </defs>
+
+  <rect width="1600" height="1040" fill="#fff"/>
+  <text x="70" y="48" class="t title">图 1｜多核 Fused Attention 系统架构与执行流程</text>
+
+  <rect x="55" y="78" width="1490" height="300" class="outline"/>
+  <text x="75" y="108" class="t panel">(a) 系统级组织结构</text>
+  <rect x="85" y="138" width="245" height="82" class="control"/>
+  <text x="105" y="166" class="t h">Manager cores (0–3)</text>
+  <text x="105" y="190" class="t body">分配 Query block</text>
+  <text x="105" y="209" class="t body">收集完成 bitmap</text>
+  <rect x="85" y="248" width="245" height="88" class="light"/>
+  <text x="105" y="276" class="t h">控制消息</text>
+  <text x="105" y="300" class="t body">Worker slot → physical core</text>
+  <text x="105" y="319" class="t body">band 完成 → tensor 完成</text>
+  <rect x="410" y="125" width="695" height="225" class="dash"/>
+  <text x="430" y="151" class="t h">Worker 集群（cores 4–19）</text>
+  <rect x="440" y="175" width="145" height="66" class="compute"/><text x="460" y="202" class="t h">Worker 4–7</text><text x="460" y="224" class="t small">Query blocks</text>
+  <rect x="605" y="175" width="145" height="66" class="compute"/><text x="625" y="202" class="t h">Worker 8–11</text><text x="625" y="224" class="t small">Query blocks</text>
+  <rect x="770" y="175" width="145" height="66" class="compute"/><text x="790" y="202" class="t h">Worker 12–15</text><text x="790" y="224" class="t small">Query blocks</text>
+  <rect x="935" y="175" width="145" height="66" class="compute"/><text x="955" y="202" class="t h">Worker 16–19</text><text x="955" y="224" class="t small">Query blocks</text>
+  <text x="440" y="276" class="t body">每个 Worker 拥有本地 tile buffer，执行相同的 QK–Softmax–PV 流程。</text>
+  <text x="440" y="300" class="t small">S/P 在本地流式处理；完整的 score/probability 矩阵不写回 HBM。</text>
+  <rect x="1175" y="138" width="325" height="198" class="data"/>
+  <text x="1200" y="166" class="t h">共享存储系统</text>
+  <text x="1200" y="193" class="t body">HBM：输入 Q/K/V 与输出 O</text>
+  <text x="1200" y="217" class="t body">NoC：连接 core 与 memory</text>
+  <text x="1200" y="241" class="t body">MemNIC：DMA 请求与返回</text>
+  <text x="1200" y="275" class="t small">HBM 节点采用轮转访问顺序</text>
+  <text x="1200" y="294" class="t small">减少多个 Worker 同时突发访问。</text>
+  <path d="M330 179 L410 179" class="blue"/><path d="M330 291 L410 291" class="blue"/><path d="M1105 212 L1175 212" class="orange"/>
+  <text x="345" y="168" class="t tiny">dispatch</text><text x="345" y="282" class="t tiny">completion</text><text x="1115" y="202" class="t tiny">DMA</text>
+
+  <rect x="55" y="405" width="735" height="300" class="outline"/>
+  <text x="75" y="435" class="t panel">(b) Worker 内部结构</text>
+  <rect x="85" y="470" width="165" height="92" class="control"/><text x="122" y="501" class="t h">RoCC</text><text x="102" y="526" class="t body">任务 FSM</text><text x="102" y="547" class="t body">DMA 回调</text>
+  <rect x="285" y="470" width="165" height="92" class="data"/><text x="318" y="501" class="t h">Local GM</text><text x="302" y="526" class="t body">Q/K/V tile</text><text x="302" y="547" class="t body">Oacc / 暂存</text>
+  <rect x="485" y="470" width="125" height="92" class="compute"/><text x="516" y="501" class="t h">Array</text><text x="505" y="526" class="t body">QK、PV</text><text x="505" y="547" class="t body">矩阵乘</text>
+  <rect x="645" y="470" width="115" height="92" class="compute"/><text x="664" y="501" class="t h">Softmax</text><text x="659" y="526" class="t body">max/exp</text><text x="659" y="547" class="t body">sum/norm</text>
+  <path d="M250 516 L285 516" class="line"/><path d="M450 516 L485 516" class="line"/><path d="M610 516 L645 516" class="line"/>
+  <path d="M702 562 C702 610 368 610 368 562" class="orange"/>
+  <text x="95" y="620" class="t body">Local GM 使用有界的异步读写。</text>
+  <text x="95" y="644" class="t body">Array 和 Softmax 只保存 tile 与行级状态。</text>
+  <text x="95" y="668" class="t small">只有所有 DMA 回调完成后，任务才进入下一阶段。</text>
+
+  <rect x="820" y="405" width="725" height="300" class="outline"/>
+  <text x="840" y="435" class="t panel">(c) Tile 级数据流</text>
+  <text x="850" y="472" class="t small">B=1, H=1, S=1024, D=128; Br=16, Bc=32</text>
+  <rect x="850" y="500" width="92" height="58" class="data"/><text x="878" y="533" class="t h">Q</text>
+  <rect x="970" y="500" width="92" height="58" class="data"/><text x="998" y="533" class="t h">K</text>
+  <rect x="1090" y="500" width="92" height="58" class="data"/><text x="1118" y="533" class="t h">V</text>
+  <rect x="1210" y="500" width="115" height="58" class="compute"/><text x="1240" y="533" class="t h">QK</text>
+  <rect x="1355" y="500" width="115" height="58" class="compute"/><text x="1382" y="533" class="t h">Softmax</text>
+  <path d="M942 529 L1210 529" class="orange"/><path d="M1062 529 L1210 529" class="orange"/><path d="M1182 529 L1210 529" class="orange"/><path d="M1325 529 L1355 529" class="line"/>
+  <rect x="1210" y="605" width="115" height="58" class="compute"/><text x="1242" y="638" class="t h">PV</text>
+  <rect x="1355" y="605" width="115" height="58" class="data"/><text x="1378" y="638" class="t h">Oacc</text>
+  <path d="M1412 558 L1412 605" class="line"/><path d="M1355 634 L1325 634" class="line"/>
+  <text x="850" y="595" class="t body">1. 读取 Q/K/V tile</text><text x="850" y="620" class="t body">2. 计算分数并完成行归一化</text><text x="850" y="645" class="t body">3. 概率 × V，并累加到 O</text>
+  <text x="850" y="678" class="t small">当前 tile 计算时，可以同时准备下一个 K/V tile。</text>
+
+  <rect x="55" y="735" width="1490" height="240" class="outline"/>
+  <text x="75" y="765" class="t panel">(d) 任务时序与完成条件</text>
+  <text x="90" y="804" class="t h">数据搬运</text><line x1="210" y1="800" x2="1430" y2="800" class="thin"/>
+  <rect x="250" y="785" width="150" height="28" fill="#f8e6c7" stroke="#b45f06"/><text x="277" y="804" class="t small">Q/K/V DMA</text>
+  <rect x="410" y="785" width="270" height="28" fill="#e5f0e8" stroke="#3c7655"/><text x="492" y="804" class="t small">QK + Softmax</text>
+  <rect x="690" y="785" width="300" height="28" fill="#e5f0e8" stroke="#3c7655"/><text x="815" y="804" class="t small">PV + Oacc</text>
+  <rect x="1000" y="785" width="180" height="28" fill="#f8e6c7" stroke="#b45f06"/><text x="1041" y="804" class="t small">输出 DMA</text>
+  <line x1="400" y1="825" x2="400" y2="915" class="thin"/><line x1="680" y1="825" x2="680" y2="915" class="thin"/><line x1="990" y1="825" x2="990" y2="915" class="thin"/><line x1="1180" y1="825" x2="1180" y2="915" class="thin"/>
+  <text x="90" y="851" class="t h">控制事件</text><text x="250" y="851" class="t small">输入就绪</text><text x="430" y="851" class="t small">QK 完成</text><text x="710" y="851" class="t small">PV 完成</text><text x="1020" y="851" class="t small">ACK</text><text x="1210" y="851" class="t small">Worker 完成</text>
+  <path d="M250 865 L1180 865" class="blue"/>
+  <text x="90" y="910" class="t h">逐 tile 更新</text><text x="250" y="910" class="t math">m ← max(m, max(S))</text><text x="530" y="910" class="t math">l ← exp-scale(l) + sum(exp(S−m))</text><text x="950" y="910" class="t math">Oacc ← exp-scale(Oacc) + P·V</text>
+  <text x="90" y="946" class="t small">只有输出 DMA 返回 ACK 后，Worker 才向 Manager 报告完成；根 Manager 最终只发布一次 tensor 完成。</text>
+  <text x="70" y="1015" class="t small">颜色说明：蓝色—控制与同步；绿色—计算；橙色—数据搬运与存储。为保持图面清晰，重复的 Worker 采用抽象表示。</text>
+</svg>
