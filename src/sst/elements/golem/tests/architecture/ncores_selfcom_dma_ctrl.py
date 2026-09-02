@@ -81,6 +81,10 @@ STATS_DIR = os.getenv("GOLEM_STATS_DIR", os.path.join(ARTIFACT_ROOT, "stats"))
 STATS_FILE = os.getenv(
     "GOLEM_STATS_FILE", os.path.join(STATS_DIR, "stats_selfcom_ctrl.txt")
 )
+DRAMSIM3_OUT_DIR = os.getenv(
+    "GOLEM_DRAMSIM3_OUT_DIR", os.path.join(STATS_DIR, "dramsim3")
+)
+MPI_PARTITIONING = _env_flag("GOLEM_MPI_PARTITIONING", False)
 DRAMSIM3_CONFIG = os.getenv(
     "GOLEM_DRAMSIM3_CONFIG",
     os.path.join(TESTS_DIR, "architecture", "dram", "HBM_4Gb_x128.ini"),
@@ -243,6 +247,7 @@ print(
     f"[NoC] inter_router_no_cut={int(noc_inter_router_no_cut)}, "
     f"local_no_cut={int(noc_local_no_cut)}"
 )
+print(f"[MPI] partitioning={int(MPI_PARTITIONING)} dramsim3_out_dir={DRAMSIM3_OUT_DIR}")
 
 noc = MeshNoCBuilder(
     dim_x=MESH_DIM_X,
@@ -420,7 +425,13 @@ for idx, router_id in enumerate(MEMORY_ROUTERS):
     memctrl.addParams(mem_params)
     mem_hi = memctrl.setSubComponent("highlink", "memHierarchy.MemLink")
     mem_backend = memctrl.setSubComponent("backend", "memHierarchy.dramsim3")
-    mem_backend.addParams({"mem_size": memSizePerNode, "config_ini": DRAMSIM3_CONFIG})
+    backend_params = {"mem_size": memSizePerNode, "config_ini": DRAMSIM3_CONFIG}
+    if MPI_PARTITIONING:
+        # DRAMSim3 uses fixed filenames, so isolate each memory node in MPI runs.
+        node_output_dir = os.path.join(DRAMSIM3_OUT_DIR, f"node{idx}")
+        os.makedirs(node_output_dir, exist_ok=True)
+        backend_params["output_dir"] = node_output_dir
+    mem_backend.addParams(backend_params)
 
     link_dir_mem = sst.Link(f"link_dir{idx}_to_mem{idx}")
     link_dir_mem.connect((dir_lo, "port", "1ns"), (mem_hi, "port", "1ns"))
@@ -433,15 +444,18 @@ for core_id, ports in enumerate(cpu_ports):
     os_link, dtlb, itlb = ports[0], ports[2], ports[3]
     link_core_os = sst.Link(f"link_core{core_id}_os")
     link_core_os.connect(os_link, (node_os, f"core{core_id}", "5ns"))
-    link_core_os.setNoCut()
+    if not MPI_PARTITIONING:
+        link_core_os.setNoCut()
 
     link_mmu_dtlb = sst.Link(f"link_core{core_id}_mmu_dtlb")
     link_mmu_dtlb.connect((node_os_mmu, f"core{core_id}.dtlb", "1ns"), dtlb)
-    link_mmu_dtlb.setNoCut()
+    if not MPI_PARTITIONING:
+        link_mmu_dtlb.setNoCut()
 
     link_mmu_itlb = sst.Link(f"link_core{core_id}_mmu_itlb")
     link_mmu_itlb.connect((node_os_mmu, f"core{core_id}.itlb", "1ns"), itlb)
-    link_mmu_itlb.setNoCut()
+    if not MPI_PARTITIONING:
+        link_mmu_itlb.setNoCut()
 
 
 def group_id_of_core(core_id: int) -> int:

@@ -9,8 +9,8 @@ Prepare a local SST source/build tree under this full-layout worktree.
 
 Defaults:
   BUILD_ROOT          ./build/sst-elements
-  SST_CORE_PREFIX     /data4/lishun/pkg/sst_install
-  SST_DRAMSIM3_PREFIX /data4/lishun/pkg/DRAMsim3
+  SST_CORE_PREFIX     /local/sstcore
+  SST_DRAMSIM3_PREFIX /local/packages/dramsim3
 
 The prepared tree copies this worktree into BUILD_ROOT so generated files stay
 inside the local build tree.
@@ -27,8 +27,8 @@ WORKTREE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 ELEMENTS_SOURCE="$WORKTREE_ROOT/src/sst/elements"
 BUILD_ROOT="${1:-$WORKTREE_ROOT/build/sst-elements}"
 INSTALL_PREFIX="$WORKTREE_ROOT/install"
-SST_CORE_PREFIX="${SST_CORE_PREFIX:-/data4/jjgong/local/sstcore}"
-SST_DRAMSIM3_PREFIX="${SST_DRAMSIM3_PREFIX:-/data4/lishun/pkg/DRAMsim3}"
+SST_CORE_PREFIX="${SST_CORE_PREFIX:-/local/sstcore}"
+SST_DRAMSIM3_PREFIX="${SST_DRAMSIM3_PREFIX:-/local/packages/dramsim3}"
 
 if [[ ! -d "$ELEMENTS_SOURCE/golem" || ! -f "$WORKTREE_ROOT/autogen.sh" || ! -f "$WORKTREE_ROOT/configure.ac" ]]; then
 	echo "[ERROR] This must be run from a full SST source layout with src/sst/elements." >&2
@@ -86,12 +86,6 @@ if [[ -f "$WORKTREE_ROOT/src/sst/elements/golem/tests/small/mvm_noc_int_array/Ma
 	install -D -m 644 \
 		"$WORKTREE_ROOT/src/sst/elements/golem/tests/small/mvm_noc_int_array/Makefile" \
 		"$BUILD_ROOT/src/sst/elements/golem/tests/small/mvm_noc_int_array/Makefile"
-fi
-
-if [[ -f "$WORKTREE_ROOT/src/sst/elements/golem/tests/small/mvm_noc_softmax_cpu/Makefile" ]]; then
-	install -D -m 644 \
-		"$WORKTREE_ROOT/src/sst/elements/golem/tests/small/mvm_noc_softmax_cpu/Makefile" \
-		"$BUILD_ROOT/src/sst/elements/golem/tests/small/mvm_noc_softmax_cpu/Makefile"
 fi
 
 cat <<EOF

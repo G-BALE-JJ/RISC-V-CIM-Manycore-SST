@@ -10,7 +10,7 @@ from pathlib import Path
 TESTS_DIR = Path(__file__).resolve().parent
 RUNNER = TESTS_DIR / "run_noc_dma_pipeline.sh"
 MAKEFILE = TESTS_DIR / "small" / "mvm_noc_int_array" / "Makefile"
-TOOLCHAIN_BIN = "/data/lzq/packages/install/riscv64_musl_toolchain/bin"
+TOOLCHAIN_BIN = "/local/scratch/src/riscv64-linux-musl-cross/bin"
 COMPILER = "riscv64-linux-musl-g++"
 
 
@@ -19,14 +19,14 @@ class RiscvToolchainContractTest(unittest.TestCase):
         source = RUNNER.read_text(encoding="utf-8")
 
         self.assertIn(
-            'SST_CORE_HOME="${SST_CORE_HOME:-/data4/jjgong/local/sstcore}"',
+            'SST_CORE_HOME="${SST_CORE_HOME:-/local/sstcore}"',
             source,
         )
         self.assertIn(
             'REAL_SST_BIN="${REAL_SST_BIN:-$SST_CORE_HOME/bin/sst}"',
             source,
         )
-        self.assertIn('SST_CMD=("$REAL_SST_BIN")', source)
+        self.assertIn('SST_BASE_CMD=("$REAL_SST_BIN")', source)
         self.assertNotIn("SST_CMD=(sst)", source)
 
     def test_generic_gemm_runner_exports_default_toolchain_to_make(self):
@@ -43,15 +43,15 @@ class RiscvToolchainContractTest(unittest.TestCase):
         source = RUNNER.read_text(encoding="utf-8")
 
         self.assertIn(
-            'SST_ELEMENTS_HOME="${SST_ELEMENTS_HOME:-/data4/jjgong/RISC-V-CIM-Manycore-SST/install}"',
+            'SST_ELEMENTS_HOME="${SST_ELEMENTS_HOME:-$REPO_ROOT/install}"',
             source,
         )
         self.assertIn(
-            'SST_BUILD_LIB_PATH="${SST_BUILD_LIB_PATH:-/data4/jjgong/RISC-V-CIM-Manycore-SST/build/sst-elements/src/sst/elements/golem/.libs}"',
+            'SST_BUILD_LIB_PATH="${SST_BUILD_LIB_PATH:-$REPO_ROOT/build/sst-elements/src/sst/elements/golem/.libs}"',
             source,
         )
         self.assertIn(
-            'SST_INSTALL_LIB_PATH="${SST_INSTALL_LIB_PATH:-/data4/jjgong/RISC-V-CIM-Manycore-SST/install/lib/sst-elements-library}"',
+            'SST_INSTALL_LIB_PATH="${SST_INSTALL_LIB_PATH:-$REPO_ROOT/install/lib/sst-elements-library}"',
             source,
         )
         self.assertIn('if [[ -z "${SST_LIB_PATH+x}" ]]; then', source)
@@ -59,7 +59,7 @@ class RiscvToolchainContractTest(unittest.TestCase):
         self.assertIn('SST_LIB_PATH="$SST_BUILD_LIB_PATH"', source)
         self.assertIn('SST_LIB_PATH="$SST_INSTALL_LIB_PATH"', source)
         self.assertIn(
-            'CONDA_LIB_DIR="${CONDA_LIB_DIR:-/data4/jjgong/miniconda3/lib}"',
+            'CONDA_LIB_DIR="${CONDA_LIB_DIR:-/usr/lib/x86_64-linux-gnu}"',
             source,
         )
         self.assertIn(
@@ -69,7 +69,7 @@ class RiscvToolchainContractTest(unittest.TestCase):
         self.assertIn('export LD_LIBRARY_PATH="$SST_SOFTMAX_LD_LIBRARY_PATH"', source)
 
     def test_generic_gemm_runner_restores_caller_architecture_after_default_preset(self):
-        archive_script = "small/mvm_noc_softmax_cpu/ncores_selfcom_dma_softmax_archive.py"
+        archive_script = "architecture/archive/ncores_selfcom_dma.py"
         source = RUNNER.read_text(encoding="utf-8")
 
         self.assertIn("CALLER_SET_GOLEM_ARCH_SCRIPT=0", source)

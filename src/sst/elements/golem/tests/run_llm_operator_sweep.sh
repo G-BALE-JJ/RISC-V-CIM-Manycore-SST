@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ARTIFACT_ROOT="${GOLEM_ARTIFACT_ROOT:-$SCRIPT_DIR/artifacts}"
-SHAPES_FILE="${GOLEM_LLM_SHAPES_FILE:-/data4/lishun/pkg/gpu_baseline/llm_gemm_operator_shapes.txt}"
+SHAPES_FILE="${GOLEM_LLM_SHAPES_FILE:-}"
 SWEEP_ROOT="${GOLEM_SWEEP_ROOT:-$ARTIFACT_ROOT/stats/sweeps/llm_operator_shapes}"
 SWEEP_TAG="${GOLEM_SWEEP_TAG:-$(date +%Y%m%d_%H%M%S)}"
 SWEEP_RUN_DIR="${GOLEM_SWEEP_RUN_DIR:-$SWEEP_ROOT/run_$SWEEP_TAG}"
@@ -26,7 +26,7 @@ unique padded architecture shapes as --gemm-m M --gemm-n N --gemm-k K, then
 weights the summaries by B.
 
 Options:
-  --shapes-file PATH       Shape file, default /data4/lishun/pkg/gpu_baseline/llm_gemm_operator_shapes.txt
+  --shapes-file PATH       Shape file (or set GOLEM_LLM_SHAPES_FILE)
   --sweep-root DIR         Sweep root directory
   --sweep-run-dir DIR      Exact output directory for this run
   --tag TAG                Sweep tag, default timestamp

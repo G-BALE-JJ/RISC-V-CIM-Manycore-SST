@@ -8,15 +8,23 @@ set -euo pipefail
 # 4) 运行 SST 架构配置脚本
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../../../../.." && pwd -P)"
 cd "$SCRIPT_DIR"
+
+# Preparation and post-processing must run once, outside the MPI ranks.
+if [[ "${OMPI_COMM_WORLD_SIZE:-1}" != "1" || "${PMI_SIZE:-1}" != "1" ]]; then
+	echo "[ERROR] Do not launch run_noc_dma_pipeline.sh under mpirun; use --mpi-ranks N or GOLEM_MPI_RANKS=N." >&2
+	exit 2
+fi
+
 RUN_START_EPOCH="$(date +%s)"
 RUN_ID="${GOLEM_RUN_ID:-run_$(date +%Y%m%d_%H%M%S)_$$}"
-DRAMSIM3_LIB_DIR="${DRAMSIM3_LIB_DIR:-/data4/lishun/pkg/DRAMsim3}"
-RISCV_MUSL_TOOLCHAIN_BIN="${RISCV_MUSL_TOOLCHAIN_BIN:-/data/lzq/packages/install/riscv64_musl_toolchain/bin}"
-SST_CORE_HOME="${SST_CORE_HOME:-/data4/jjgong/local/sstcore}"
-SST_ELEMENTS_HOME="${SST_ELEMENTS_HOME:-/data4/jjgong/RISC-V-CIM-Manycore-SST/install}"
-SST_BUILD_LIB_PATH="${SST_BUILD_LIB_PATH:-/data4/jjgong/RISC-V-CIM-Manycore-SST/build/sst-elements/src/sst/elements/golem/.libs}"
-SST_INSTALL_LIB_PATH="${SST_INSTALL_LIB_PATH:-/data4/jjgong/RISC-V-CIM-Manycore-SST/install/lib/sst-elements-library}"
+DRAMSIM3_LIB_DIR="${DRAMSIM3_LIB_DIR:-/local/packages/dramsim3}"
+RISCV_MUSL_TOOLCHAIN_BIN="${RISCV_MUSL_TOOLCHAIN_BIN:-/local/scratch/src/riscv64-linux-musl-cross/bin}"
+SST_CORE_HOME="${SST_CORE_HOME:-/local/sstcore}"
+SST_ELEMENTS_HOME="${SST_ELEMENTS_HOME:-$REPO_ROOT/install}"
+SST_BUILD_LIB_PATH="${SST_BUILD_LIB_PATH:-$REPO_ROOT/build/sst-elements/src/sst/elements/golem/.libs}"
+SST_INSTALL_LIB_PATH="${SST_INSTALL_LIB_PATH:-$REPO_ROOT/install/lib/sst-elements-library}"
 if [[ -z "${SST_LIB_PATH+x}" ]]; then
 	if [[ -f "$SST_BUILD_LIB_PATH/libgolem.so" ]]; then
 		SST_LIB_PATH="$SST_BUILD_LIB_PATH"
@@ -24,7 +32,7 @@ if [[ -z "${SST_LIB_PATH+x}" ]]; then
 		SST_LIB_PATH="$SST_INSTALL_LIB_PATH"
 	fi
 fi
-CONDA_LIB_DIR="${CONDA_LIB_DIR:-/data4/jjgong/miniconda3/lib}"
+CONDA_LIB_DIR="${CONDA_LIB_DIR:-/usr/lib/x86_64-linux-gnu}"
 REAL_SST_BIN="${REAL_SST_BIN:-$SST_CORE_HOME/bin/sst}"
 export RISCV_MUSL_TOOLCHAIN_BIN
 
@@ -190,6 +198,10 @@ GOLEM_MVM_DUMP_MODE="${GOLEM_MVM_DUMP_MODE:-overwrite}"
 GOLEM_PROGRESS_HEARTBEAT="${GOLEM_PROGRESS_HEARTBEAT:-0}"
 GOLEM_PROGRESS_INTERVAL_CYCLES="${GOLEM_PROGRESS_INTERVAL_CYCLES:-50000}"
 GOLEM_SST_ARGS="${GOLEM_SST_ARGS:-}"
+GOLEM_MPI_RANKS="${GOLEM_MPI_RANKS:-1}"
+GOLEM_MPI_LAUNCHER="${GOLEM_MPI_LAUNCHER:-mpirun}"
+GOLEM_MPI_ARGS="${GOLEM_MPI_ARGS:---bind-to core --map-by core}"
+GOLEM_MPI_PARTITIONER="${GOLEM_MPI_PARTITIONER:-sst.simple}"
 GOLEM_SST_STAT_LOAD_LEVEL="${GOLEM_SST_STAT_LOAD_LEVEL:-16}"
 GOLEM_SST_ENABLE_ALL_STATS="${GOLEM_SST_ENABLE_ALL_STATS:-1}"
 GOLEM_EXPORT_NOC_HEATMAPS="${GOLEM_EXPORT_NOC_HEATMAPS:-0}"
@@ -585,9 +597,16 @@ estimate_sst_progress_info() {
 	# [MILESTONE] stage=conv1|conv2|fc1|fc2|fc3 status=start|done|fail cycle=...
 	local ms
 	ms="$(tail -n 6000 "$log_file" 2>/dev/null | awk '
+		function token_value(key,    i,n,a) {
+			n = split($0, a, /[[:space:]]+/);
+			for (i = 1; i <= n; i++) {
+				if (index(a[i], key "=") == 1) return substr(a[i], length(key) + 2);
+			}
+			return "";
+		}
 		/\[MILESTONE\]/ {
-			if (match($0, /stage=([a-zA-Z0-9_]+)/, s) && match($0, /status=([a-zA-Z0-9_]+)/, t)) {
-				stage=s[1]; st=t[1];
+			stage = token_value("stage"); st = token_value("status");
+			if (stage != "" && st != "") {
 				seen=1;
 				if (st == "start") start[stage]=1;
 				if (st == "done") done[stage]=1;
@@ -654,20 +673,31 @@ estimate_sst_progress_info() {
 	# 优先使用轻量心跳日志估算真实进度（需要 --progress-heartbeat 1）
 	local hb
 	hb="$(tail -n 4000 "$log_file" 2>/dev/null | awk '
+		function token_value(key,    i,n,a,v) {
+			n = split($0, a, /[[:space:]]+/);
+			for (i = 1; i <= n; i++) {
+				if (index(a[i], key "=") == 1) return substr(a[i], length(key) + 2);
+			}
+			return "";
+		}
 		BEGIN {
 			dma_sum_c = 0; dma_sum_t = 0;
 			mvm_sum_c = 0; mvm_sum_t = 0;
 		}
 		/GlobalMemory core=[0-9]+ DMA_PROGRESS(_FINAL)?:/ {
-			if (match($0, /core=([0-9]+)/, c) && match($0, /completed=([0-9]+)\/([0-9]+)/, p)) {
-				dma_c[c[1]] = p[1];
-				dma_t[c[1]] = p[2];
+			core = token_value("core"); completed = token_value("completed");
+			if (core != "" && completed != "") {
+				split(completed, p, "/");
+				dma_c[core] = p[1];
+				dma_t[core] = p[2];
 			}
 		}
 		/RoCC core=[0-9]+ MVM_PROGRESS:/ {
-			if (match($0, /core=([0-9]+)/, c) && match($0, /completed=([0-9]+)\/([0-9]+)/, p)) {
-				mvm_c[c[1]] = p[1];
-				mvm_t[c[1]] = p[2];
+			core = token_value("core"); completed = token_value("completed");
+			if (core != "" && completed != "") {
+				split(completed, p, "/");
+				mvm_c[core] = p[1];
+				mvm_t[core] = p[2];
 			}
 		}
 		END {
@@ -739,6 +769,29 @@ render_inline_progress_bar() {
 		empty_seg+="-"
 	done
 	printf "[%s%s]" "$filled_seg" "$empty_seg"
+}
+
+merge_ranked_stats() {
+	local base_file="$1"
+	local base_dir="${base_file%/*}"
+	local base_name="${base_file##*/}"
+	local stem="${base_name%.*}"
+	local ext="${base_name##*.}"
+	local merged_file="${base_file}.merge.$$"
+	local files=()
+
+	shopt -s nullglob
+	files=("$base_dir/${stem}"_*."$ext")
+	shopt -u nullglob
+	if [[ "${#files[@]}" -eq 0 ]]; then
+		echo "[ERROR] MPI 统计文件不存在: $base_dir/${stem}_*.${ext}" >&2
+		return 1
+	fi
+
+	# SST writes one CSV header per rank; keep only the first header.
+	awk 'FNR == 1 && NR != 1 { next } { print }' "${files[@]}" > "$merged_file"
+	mv "$merged_file" "$base_file"
+	echo "[INFO] Merged ${#files[@]} MPI statistic files into $base_file"
 }
 
 resolve_stage_clock_ghz() {
@@ -854,6 +907,10 @@ Options:
 	--hbm-dump-output N  是否生成 hbm_out_node*.bin（0/1，默认: 1）
 	--no-hbm-dump-output 等价 --hbm-dump-output 0
 	--log FILE           SST 输出日志文件名或绝对路径（默认: test.log，存放到 artifacts/logs）
+	--mpi-ranks N        SST MPI rank 数（默认: 1；N>1 时由 mpirun 启动 SST）
+	--mpi-launcher FILE  MPI 启动器（默认: mpirun）
+	--mpi-args STRING    传给 MPI 启动器的参数（默认: --bind-to core --map-by core）
+	--mpi-partitioner N  MPI 分区器（默认: sst.simple）
 	--dry-run            仅打印配置与命令，不实际执行
 	环境变量 GOLEM_SKIP_TENSOR_GEN=1 可跳过 sample tensor 生成
 	环境变量 GOLEM_SKIP_HBM_GEN=1 可复用现有 hbm_init/out_node*.bin
@@ -1015,6 +1072,14 @@ while [[ $# -gt 0 ]]; do
 			GOLEM_HBM_DUMP_OUTPUT=0; shift ;;
 		--log)
 			LOG_FILE="$2"; shift 2 ;;
+		--mpi-ranks)
+			GOLEM_MPI_RANKS="$2"; shift 2 ;;
+		--mpi-launcher)
+			GOLEM_MPI_LAUNCHER="$2"; shift 2 ;;
+		--mpi-args)
+			GOLEM_MPI_ARGS="$2"; shift 2 ;;
+		--mpi-partitioner)
+			GOLEM_MPI_PARTITIONER="$2"; shift 2 ;;
 		--dry-run)
 			DRY_RUN=1; shift ;;
 		-h|--help)
@@ -1025,6 +1090,15 @@ while [[ $# -gt 0 ]]; do
 			exit 1 ;;
 	esac
 done
+
+if ! [[ "$GOLEM_MPI_RANKS" =~ ^[0-9]+$ ]] || [[ "$GOLEM_MPI_RANKS" -le 0 ]]; then
+	echo "[ERROR] --mpi-ranks/GOLEM_MPI_RANKS 必须为正整数，收到: $GOLEM_MPI_RANKS" >&2
+	exit 1
+fi
+if [[ "$GOLEM_MPI_RANKS" -gt 1 ]] && ! command -v "$GOLEM_MPI_LAUNCHER" >/dev/null 2>&1; then
+	echo "[ERROR] MPI 启动器不可执行: $GOLEM_MPI_LAUNCHER" >&2
+	exit 1
+fi
 
 if [[ "$ARRAY_IN_SET" -eq 0 ]]; then
 	GOLEM_ARRAY_INPUT_SIZE="${GOLEM_ARRAY_INPUT_SIZE:-4}"
@@ -1615,6 +1689,7 @@ export GOLEM_STATS_DIR="$STATS_DIR"
 export GOLEM_STATS_FILE="$STATS_FILE"
 export GOLEM_STDOUT_DIR="$STDOUT_DIR"
 export GOLEM_RUN_ID="$RUN_ID"
+export GOLEM_DRAMSIM3_OUT_DIR="$DRAMSIM_STATS_DIR"
 export GOLEM_CORE_MAP_FILE="$CORE_MAP_FILE"
 export GOLEM_PRINT_CORE_MAP="$PRINT_CORE_MAP"
 export GOLEM_MVM_VERIFY_SUMMARY_FILE="$MVM_VERIFY_SUMMARY_FILE"
@@ -1688,6 +1763,11 @@ export GOLEM_MEMCTRL_CLOCK
 export GOLEM_PROGRESS_HEARTBEAT
 export GOLEM_PROGRESS_INTERVAL_CYCLES
 export GOLEM_SST_ARGS
+export GOLEM_MPI_RANKS
+export GOLEM_MPI_LAUNCHER
+export GOLEM_MPI_ARGS
+export GOLEM_MPI_PARTITIONER
+export GOLEM_MPI_PARTITIONING=0
 export GOLEM_SST_STAT_LOAD_LEVEL
 export GOLEM_SST_ENABLE_ALL_STATS
 export GOLEM_EXPORT_NOC_HEATMAPS
@@ -1787,6 +1867,10 @@ echo "  GOLEM_ARRAY_PIPELINE_DEPTH=$GOLEM_ARRAY_PIPELINE_DEPTH"
 echo "  GOLEM_PROGRESS_HEARTBEAT=$GOLEM_PROGRESS_HEARTBEAT"
 echo "  GOLEM_PROGRESS_INTERVAL_CYCLES=$GOLEM_PROGRESS_INTERVAL_CYCLES"
 echo "  GOLEM_SST_ARGS=${GOLEM_SST_ARGS:-<none>}"
+echo "  GOLEM_MPI_RANKS=$GOLEM_MPI_RANKS"
+echo "  GOLEM_MPI_LAUNCHER=$GOLEM_MPI_LAUNCHER"
+echo "  GOLEM_MPI_ARGS=${GOLEM_MPI_ARGS:-<none>}"
+echo "  GOLEM_MPI_PARTITIONER=$GOLEM_MPI_PARTITIONER"
 echo "  GOLEM_SST_STAT_LOAD_LEVEL=$GOLEM_SST_STAT_LOAD_LEVEL"
 echo "  GOLEM_SST_ENABLE_ALL_STATS=$GOLEM_SST_ENABLE_ALL_STATS"
 echo "  GOLEM_EXPORT_NOC_HEATMAPS=$GOLEM_EXPORT_NOC_HEATMAPS"
@@ -1845,12 +1929,25 @@ echo "  GOLEM_DUMP_C_FILE=${GOLEM_DUMP_C_FILE:-<none>}"
 	echo "  LOG_PATH=$LOG_PATH"
 
 GEN_HBM_CMD=(python3 tools/gen_hbm_init.py)
-SST_CMD=("$REAL_SST_BIN")
+SST_BASE_CMD=("$REAL_SST_BIN")
 if [[ -n "$GOLEM_SST_ARGS" ]]; then
 	read -r -a SST_EXTRA_ARGS <<< "$GOLEM_SST_ARGS"
-	SST_CMD+=("${SST_EXTRA_ARGS[@]}")
+	SST_BASE_CMD+=("${SST_EXTRA_ARGS[@]}")
 fi
-SST_CMD+=("$GOLEM_ARCH_SCRIPT")
+if [[ "$GOLEM_MPI_RANKS" -gt 1 ]]; then
+	if [[ " $GOLEM_SST_ARGS " != *"--partitioner"* ]]; then
+		SST_BASE_CMD+=("--partitioner=$GOLEM_MPI_PARTITIONER")
+	fi
+	MPI_EXTRA_ARGS=()
+	if [[ -n "$GOLEM_MPI_ARGS" ]]; then
+		read -r -a MPI_EXTRA_ARGS <<< "$GOLEM_MPI_ARGS"
+	fi
+	SST_CMD=("$GOLEM_MPI_LAUNCHER" "${MPI_EXTRA_ARGS[@]}" -np "$GOLEM_MPI_RANKS" "${SST_BASE_CMD[@]}" "$GOLEM_ARCH_SCRIPT")
+	GOLEM_MPI_PARTITIONING=1
+	export GOLEM_MPI_PARTITIONING
+else
+	SST_CMD=("${SST_BASE_CMD[@]}" "$GOLEM_ARCH_SCRIPT")
+fi
 SST_CMD_DISPLAY="$(printf '%q ' "${SST_CMD[@]}")"
 SST_CMD_DISPLAY="${SST_CMD_DISPLAY% }"
 SAMPLE_TENSOR_CMD=()
@@ -1918,7 +2015,7 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
 	else
 		echo "  (cd small/mvm_noc_int_array && make clean ARCH=riscv64 && make ARCH=riscv64 CFLAGS=\"-DGOLEM_ARRAY_INPUT_SIZE=${GOLEM_ARRAY_INPUT_SIZE} -DGOLEM_ARRAY_OUTPUT_SIZE=${GOLEM_ARRAY_OUTPUT_SIZE} -DGOLEM_TOTAL_GROUPS=${GOLEM_TOTAL_GROUPS} -DGOLEM_TOTAL_CORES=${GOLEM_TOTAL_CORES} -DGOLEM_TOTAL_GEMM_CORES=${GOLEM_TOTAL_GEMM_CORES} -DGOLEM_NUM_ARRAYS=${GOLEM_NUM_ARRAYS} -DGOLEM_NUM_MEMORY_NODES=${GOLEM_NUM_MEMORY_NODES} -DGOLEM_MEM_NODE_SIZE_BYTES=${GOLEM_MEM_NODE_SIZE_BYTES} -DGOLEM_GLOBAL_STRIDE_BYTES=${GOLEM_GLOBAL_STRIDE_BYTES} -DGOLEM_DMA_STAGGER_CYCLES=${GOLEM_DMA_STAGGER_CYCLES} -DGOLEM_DMA_OVERLAP=${GOLEM_DMA_OVERLAP} -DGOLEM_CTRL_OVERLAP_AB=${GOLEM_CTRL_OVERLAP_AB} -DGOLEM_GROUP_MANAGER_ENABLE=${GOLEM_GROUP_MANAGER_ENABLE} -DGOLEM_CTRL_LINK_ENABLE=${GOLEM_CTRL_LINK_ENABLE} -DGOLEM_A_REUSE_N_TILES=${GOLEM_A_REUSE_N_TILES} -DGOLEM_B_REUSE_M_TILES=${GOLEM_B_REUSE_M_TILES} -DGOLEM_DMA_SLOT_COUNT=${GOLEM_DMA_SLOT_COUNT} -DGOLEM_WORKER_COMMAND_PROCESSOR_ENABLE=${GOLEM_WORKER_COMMAND_PROCESSOR_ENABLE:-0} -DGOLEM_BIAS_ENABLE=${GOLEM_BIAS_ENABLE} -DGOLEM_BIAS_VALUE=${GOLEM_BIAS_VALUE}\")"
 	fi
-	echo "  GOLEM_MESH_DIM_X=$GOLEM_MESH_DIM_X GOLEM_MVM_DUMP_ENABLE=$GOLEM_MVM_DUMP_ENABLE GOLEM_MVM_DUMP_DIR=$GOLEM_MVM_DUMP_DIR GOLEM_MVM_DUMP_MODE=$GOLEM_MVM_DUMP_MODE GOLEM_CTRL_LINK_ENABLE=$GOLEM_CTRL_LINK_ENABLE $SST_CMD_DISPLAY > $LOG_PATH 2>&1"
+	echo "  GOLEM_MESH_DIM_X=$GOLEM_MESH_DIM_X GOLEM_MVM_DUMP_ENABLE=$GOLEM_MVM_DUMP_ENABLE GOLEM_MVM_DUMP_DIR=$GOLEM_MVM_DUMP_DIR GOLEM_MVM_DUMP_MODE=$GOLEM_MVM_DUMP_MODE GOLEM_CTRL_LINK_ENABLE=$GOLEM_CTRL_LINK_ENABLE GOLEM_MPI_PARTITIONING=$GOLEM_MPI_PARTITIONING $SST_CMD_DISPLAY > $LOG_PATH 2>&1"
 	echo "  mv dramsim3*.{txt,json} $DRAMSIM_STATS_DIR/ (if generated)"
 	echo "  mv stdout-*/stderr-* $STDOUT_DIR/"
 	if [[ "$VERIFY_MVM" -eq 1 ]]; then
@@ -1935,7 +2032,11 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
 	echo "  python3 stats/extract_noc_summary_csv.py --input-file $GOLEM_STATS_FILE --link-bw $GOLEM_NOC_LINK_BW --output $NOC_SUMMARY_FILE"
 	echo "  python3 stats/extract_noc_hotspot_csv.py --input-file $GOLEM_STATS_FILE --link-bw $GOLEM_NOC_LINK_BW --summary $NOC_HOTSPOT_SUMMARY_FILE --router-table $NOC_HOTSPOT_ROUTER_FILE --port-table $NOC_HOTSPOT_PORT_FILE"
 	echo "  python3 stats/extract_noc_latency_summary_csv.py --log $LOG_PATH --log-dir $STDOUT_DIR --output $NOC_LATENCY_SUMMARY_FILE"
-	echo "  python3 stats/extract_memory_summary_csv.py --json $DRAMSIM_STATS_DIR/dramsim3.json --txt $DRAMSIM_STATS_DIR/dramsim3.txt --output $MEMORY_SUMMARY_FILE"
+	if [[ "$GOLEM_MPI_RANKS" -gt 1 ]]; then
+		echo "  python3 stats/extract_memory_summary_csv.py --json $DRAMSIM_STATS_DIR/node*/dramsim3.json --txt $DRAMSIM_STATS_DIR/node*/dramsim3.txt --output $MEMORY_SUMMARY_FILE"
+	else
+		echo "  python3 stats/extract_memory_summary_csv.py --json $DRAMSIM_STATS_DIR/dramsim3.json --txt $DRAMSIM_STATS_DIR/dramsim3.txt --output $MEMORY_SUMMARY_FILE"
+	fi
 	echo "  python3 stats/extract_memory_queue_summary_csv.py --log $LOG_PATH --log-dir $STDOUT_DIR --output $MEMORY_QUEUE_SUMMARY_FILE"
 	echo "  python3 stats/extract_submit_ready_causal_csv.py --log $LOG_PATH --log-dir $STDOUT_DIR --noc-latency-summary $NOC_LATENCY_SUMMARY_FILE --memory-queue-summary $MEMORY_QUEUE_SUMMARY_FILE --sched-clock 1GHz --memory-clock $GOLEM_MEMCTRL_CLOCK --summary $CAUSAL_SUMMARY_FILE --table $CAUSAL_TABLE_FILE"
 	echo "  append run summary -> $RUN_SUMMARY_CSV"
@@ -2074,11 +2175,13 @@ else
 fi
 
 shopt -s nullglob
-for f in "$SCRIPT_DIR"/dramsim3.txt "$SCRIPT_DIR"/dramsim3.json "$SCRIPT_DIR"/dramsim3epoch.json; do
-	if [[ -f "$f" ]]; then
-		mv "$f" "$DRAMSIM_STATS_DIR/"
-	fi
-done
+if [[ "$GOLEM_MPI_RANKS" -eq 1 ]]; then
+	for f in "$SCRIPT_DIR"/dramsim3.txt "$SCRIPT_DIR"/dramsim3.json "$SCRIPT_DIR"/dramsim3epoch.json; do
+		if [[ -f "$f" ]]; then
+			mv "$f" "$DRAMSIM_STATS_DIR/"
+		fi
+	done
+fi
 shopt -u nullglob
 print_progress_bar 3 "SST 运行完成"
 
@@ -2087,6 +2190,10 @@ for f in "$SCRIPT_DIR"/stdout-* "$SCRIPT_DIR"/stderr-*; do
 	mv "$f" "$STDOUT_DIR/"
 done
 shopt -u nullglob
+
+if [[ "$GOLEM_MPI_RANKS" -gt 1 && "$GOLEM_BENCH_DISABLE_SST_STATS" -eq 0 ]]; then
+	merge_ranked_stats "$GOLEM_STATS_FILE"
+fi
 
 if [[ "$VERIFY_MVM" -eq 1 ]]; then
 	echo "[4/4] Verifying MVM dumps..."
@@ -2212,11 +2319,27 @@ fi
 
 echo "[4/4] Exporting memory summary..."
 if [[ -f "$SCRIPT_DIR/stats/extract_memory_summary_csv.py" ]]; then
-	if [[ -f "$DRAMSIM_STATS_DIR/dramsim3.json" && -f "$DRAMSIM_STATS_DIR/dramsim3.txt" ]]; then
-		if ! python3 "$SCRIPT_DIR/stats/extract_memory_summary_csv.py" \
-			--json "$DRAMSIM_STATS_DIR/dramsim3.json" \
-			--txt "$DRAMSIM_STATS_DIR/dramsim3.txt" \
-			--output "$MEMORY_SUMMARY_FILE"; then
+	DRAMSIM_JSON_FILES=()
+	DRAMSIM_TXT_FILES=()
+	shopt -s nullglob
+	if [[ "$GOLEM_MPI_RANKS" -gt 1 ]]; then
+		DRAMSIM_JSON_FILES=("$DRAMSIM_STATS_DIR"/node*/dramsim3.json)
+		DRAMSIM_TXT_FILES=("$DRAMSIM_STATS_DIR"/node*/dramsim3.txt)
+	else
+		DRAMSIM_JSON_FILES=("$DRAMSIM_STATS_DIR/dramsim3.json")
+		DRAMSIM_TXT_FILES=("$DRAMSIM_STATS_DIR/dramsim3.txt")
+	fi
+	shopt -u nullglob
+	if [[ "${#DRAMSIM_JSON_FILES[@]}" -gt 0 && "${#DRAMSIM_JSON_FILES[@]}" -eq "${#DRAMSIM_TXT_FILES[@]}" ]]; then
+		MEMORY_SUMMARY_CMD=(python3 "$SCRIPT_DIR/stats/extract_memory_summary_csv.py")
+		for f in "${DRAMSIM_JSON_FILES[@]}"; do
+			MEMORY_SUMMARY_CMD+=(--json "$f")
+		done
+		for f in "${DRAMSIM_TXT_FILES[@]}"; do
+			MEMORY_SUMMARY_CMD+=(--txt "$f")
+		done
+		MEMORY_SUMMARY_CMD+=(--output "$MEMORY_SUMMARY_FILE")
+		if ! "${MEMORY_SUMMARY_CMD[@]}"; then
 			echo "[WARN] Memory summary extraction failed."
 		fi
 	else
@@ -2269,7 +2392,7 @@ else
 fi
 
 echo "[4/4] Appending run summary CSV..."
-RUN_START_EPOCH="$RUN_START_EPOCH" RUN_SUMMARY_CSV="$RUN_SUMMARY_CSV" LOG_PATH="$LOG_PATH" STATS_DIR="$STATS_DIR" python3 - <<'PY'
+RUN_START_EPOCH="$RUN_START_EPOCH" RUN_SUMMARY_CSV="$RUN_SUMMARY_CSV" LOG_PATH="$LOG_PATH" STATS_DIR="$STATS_DIR" GOLEM_MPI_RANKS="$GOLEM_MPI_RANKS" GOLEM_MPI_PARTITIONER="$GOLEM_MPI_PARTITIONER" python3 - <<'PY'
 import csv
 import datetime as dt
 import math
@@ -2469,6 +2592,8 @@ record = {
     "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
     "run_id": os.environ.get("GOLEM_RUN_ID", ""),
     "log_file": str(log_path),
+    "mpi_ranks": os.environ.get("GOLEM_MPI_RANKS", "1"),
+    "mpi_partitioner": os.environ.get("GOLEM_MPI_PARTITIONER", ""),
     "overlap": f"overlap{os.environ.get('GOLEM_DMA_OVERLAP', '0')}",
     "array_input_size": os.environ.get("GOLEM_ARRAY_INPUT_SIZE", ""),
     "array_output_size": os.environ.get("GOLEM_ARRAY_OUTPUT_SIZE", ""),

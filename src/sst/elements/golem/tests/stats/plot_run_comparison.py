@@ -18,6 +18,9 @@ COLORS = {
     "text": "#1f2937",
 }
 
+REPO_ROOT = Path(__file__).resolve().parents[6]
+DEFAULT_STATS_ROOT = REPO_ROOT / "src/sst/elements/golem/tests/artifacts/stats"
+
 
 def setup_style():
     plt.rcParams.update(
@@ -883,7 +886,7 @@ def main():
     )
     p.add_argument(
         "--out-dir",
-        default="/data4/lishun/pkg/sst-elements/src/sst/elements/golem/tests/artifacts/stats/analysis/comparison",
+        default=str(DEFAULT_STATS_ROOT / "analysis/comparison"),
     )
     args = p.parse_args()
 
@@ -898,7 +901,7 @@ def main():
 
     run_summary_idx = load_run_summary_index(
         Path(
-            "/data4/lishun/pkg/sst-elements/src/sst/elements/golem/tests/artifacts/stats/run_summary.csv"
+            DEFAULT_STATS_ROOT / "run_summary.csv"
         )
     )
     base_run_id = _extract_run_id(base_dir)

@@ -9,10 +9,13 @@ static constexpr uint32_t GOLEM_ROCC_FUNC7_TILE_GM2IVEC_BATCH = 0x14;
 static constexpr uint32_t GOLEM_ROCC_FUNC7_WCP_START = 0x15;
 static constexpr uint32_t GOLEM_ROCC_FUNC7_WCP_WAIT = 0x16;
 
+// Stock GNU binutils do not know the project-specific instruction mnemonics.
+#define GOLEM_R_INSN(F7, RD, RS1, RS2) ".insn r 0x0b, 7, " F7 ", " RD ", " RS1 ", " RS2
+
 static inline void mvm_set_matrix(const void* mm_addr) {
     long dummy;
     asm volatile (
-        "mvm.set %0, %1, x0"
+        GOLEM_R_INSN("0x1", "%0", "%1", "x0")
         : "=r"(dummy)        // output: rd 
         : "r"(mm_addr)       // input:  rs1
         : "memory"
@@ -28,7 +31,7 @@ static inline void mvm_set_matrix(const void* mm_addr) {
 static inline void mvm_load_vector(const void* mm_addr) {
     long dummy;
     asm volatile (
-        "mvm.l %0, %1, x0"
+        GOLEM_R_INSN("0x2", "%0", "%1", "x0")
         : "=r"(dummy)
         : "r"(mm_addr)
         : "memory"
@@ -44,7 +47,7 @@ static inline void mvm_load_vector(const void* mm_addr) {
 static inline void mvm_compute(uint64_t array_id) {
     long dummy;
     asm volatile (
-        "mvm %0, %1, x0"
+        GOLEM_R_INSN("0x3", "%0", "%1", "x0")
         : "=r"(dummy)
         : "r"(array_id)
         : "memory"
@@ -54,7 +57,7 @@ static inline void mvm_compute(uint64_t array_id) {
 // Queue-friendly variant: submit compute without destination writeback.
 static inline void mvm_compute_async(uint64_t array_id) {
     asm volatile (
-        "mvm x0, %0, x0"
+        GOLEM_R_INSN("0x3", "x0", "%0", "x0")
         :
         : "r"(array_id)
         : "memory"
@@ -120,7 +123,7 @@ static inline void wcp_wait() {
 static inline void mvm_store_vector(void* mm_addr, uint64_t array_id) {
     long dummy;
     asm volatile (
-        "mvm.s %0, %1, %2"
+        GOLEM_R_INSN("0x4", "%0", "%1", "%2")
         : "=r"(dummy)
         : "r"(mm_addr), "r"(array_id)
         : "memory"
@@ -136,7 +139,7 @@ static inline void mvm_store_vector(void* mm_addr, uint64_t array_id) {
 static inline void mvm_move_vector(uint64_t src_array_id, uint64_t dst_array_id) {
     long dummy;
     asm volatile (
-        "mvm.mv %0, %1, %2"
+        GOLEM_R_INSN("0x5", "%0", "%1", "%2")
         : "=r"(dummy)
         : "r"(src_array_id), "r"(dst_array_id)
         : "memory"
@@ -152,7 +155,7 @@ static inline void mvm_move_vector(uint64_t src_array_id, uint64_t dst_array_id)
 static inline void outputvectorstore(uint64_t local_gm_addr, uint64_t array_id) {
     long dummy;
     asm volatile (
-        "mvm.ovec2gm %0, %1, %2"
+        GOLEM_R_INSN("0x6", "%0", "%1", "%2")
         : "=r"(dummy)
         : "r"(local_gm_addr), "r"(array_id)
         : "memory"
@@ -168,7 +171,7 @@ static inline void outputvectorstore(uint64_t local_gm_addr, uint64_t array_id) 
 static inline void inputvectorload(uint64_t local_gm_addr, uint64_t array_id) {
     long dummy;
     asm volatile (
-        "mvm.gm2ivec %0, %1, %2"
+        GOLEM_R_INSN("0x7", "%0", "%1", "%2")
         : "=r"(dummy)
         : "r"(local_gm_addr), "r"(array_id)
         : "memory"
@@ -178,7 +181,7 @@ static inline void inputvectorload(uint64_t local_gm_addr, uint64_t array_id) {
 // Queue-friendly variant: submit without destination writeback.
 static inline void inputvectorload_async(uint64_t local_gm_addr, uint64_t array_id) {
     asm volatile (
-        "mvm.gm2ivec x0, %0, %1"
+        GOLEM_R_INSN("0x7", "x0", "%0", "%1")
         :
         : "r"(local_gm_addr), "r"(array_id)
         : "memory"
@@ -194,7 +197,7 @@ static inline void inputvectorload_async(uint64_t local_gm_addr, uint64_t array_
 static inline void inputmatrixload(uint64_t local_gm_addr, uint64_t array_id) {
     long dummy;
     asm volatile (
-        "mvm.gm2imat %0, %1, %2"
+        GOLEM_R_INSN("0x8", "%0", "%1", "%2")
         : "=r"(dummy)
         : "r"(local_gm_addr), "r"(array_id)
         : "memory"
@@ -204,7 +207,7 @@ static inline void inputmatrixload(uint64_t local_gm_addr, uint64_t array_id) {
 // Queue-friendly variant: submit without destination writeback.
 static inline void inputmatrixload_async(uint64_t local_gm_addr, uint64_t array_id) {
     asm volatile (
-        "mvm.gm2imat x0, %0, %1"
+        GOLEM_R_INSN("0x8", "x0", "%0", "%1")
         :
         : "r"(local_gm_addr), "r"(array_id)
         : "memory"
@@ -219,7 +222,7 @@ static inline void inputmatrixload_async(uint64_t local_gm_addr, uint64_t array_
 // =============================================================
 static inline void remote_store(uint64_t local_gm_addr, uint64_t remote_gm_addr) {
     asm volatile (
-        "remote.st x0, %0, %1"
+        GOLEM_R_INSN("0x9", "x0", "%0", "%1")
         :
         : "r"(local_gm_addr), "r"(remote_gm_addr)
         : "memory"
@@ -234,7 +237,7 @@ static inline void remote_store(uint64_t local_gm_addr, uint64_t remote_gm_addr)
 // =============================================================
 static inline void remote_load(uint64_t remote_gm_addr, uint64_t local_gm_addr) {
     asm volatile (
-        "remote.ld x0, %0, %1"
+        GOLEM_R_INSN("0xA", "x0", "%0", "%1")
         :
         : "r"(remote_gm_addr), "r"(local_gm_addr)
         : "memory"
@@ -249,7 +252,7 @@ static inline void remote_load(uint64_t remote_gm_addr, uint64_t local_gm_addr) 
 // =============================================================
 static inline void set_len(uint64_t byte_len) {
     asm volatile (
-        "mvm.slen x0, %0, x0"
+        GOLEM_R_INSN("0xB", "x0", "%0", "x0")
         :
         : "r"(byte_len)
         : "memory"
@@ -267,14 +270,14 @@ inline void configure_output_mode(uint32_t tile_id, uint32_t mode, bool clear_no
     int status;
     const uint32_t mode_cmd = mode ? 1u : 0u;
     asm volatile(
-        "mvm.ocfg %0, %1, %2"
+        GOLEM_R_INSN("0xC", "%0", "%1", "%2")
         : "=r"(status)
         : "r"(mode_cmd), "r"(tile_id)
         : "memory");
     if (clear_now) {
         const uint32_t clear_cmd = 2u;
         asm volatile(
-            "mvm.ocfg %0, %1, %2"
+            GOLEM_R_INSN("0xC", "%0", "%1", "%2")
             : "=r"(status)
             : "r"(clear_cmd), "r"(tile_id)
             : "memory");
@@ -289,7 +292,7 @@ inline void configure_output_mode(uint32_t tile_id, uint32_t mode, bool clear_no
 // =============================================================
 static inline void mm2gm(void* mm_addr, uint64_t gm_addr) {
     asm volatile (
-        "mm2gm x0, %0, %1"
+        GOLEM_R_INSN("0xD", "x0", "%0", "%1")
         :
         : "r"(mm_addr), "r"(gm_addr)
         : "memory"
@@ -304,7 +307,7 @@ static inline void mm2gm(void* mm_addr, uint64_t gm_addr) {
 // =============================================================
 static inline void gm2mm(void* mm_addr, uint64_t gm_addr) {
     asm volatile (
-        "gm2mm x0, %0, %1"
+        GOLEM_R_INSN("0xE", "x0", "%0", "%1")
         :
         : "r"(mm_addr), "r"(gm_addr)
         : "memory"
@@ -319,7 +322,7 @@ static inline void gm2mm(void* mm_addr, uint64_t gm_addr) {
 // =============================================================
 static inline void reg2gm(uint64_t value, uint64_t gm_addr) {
     asm volatile (
-        "reg2gm x0, %0, %1"
+        GOLEM_R_INSN("0xF", "x0", "%0", "%1")
         :
         : "r"(value), "r"(gm_addr)
         : "memory"
@@ -334,7 +337,7 @@ static inline void reg2gm(uint64_t value, uint64_t gm_addr) {
 static inline uint64_t gm2reg(uint64_t gm_addr) {
     uint64_t value;
     asm volatile (
-        "gm2reg %0, %1, x0"
+        GOLEM_R_INSN("0x10", "%0", "%1", "x0")
         : "=r"(value)     // output: rd (target register)
         : "r"(gm_addr)    // input: rs1 (GM address)
         : "memory"
@@ -375,6 +378,8 @@ static inline uint64_t read_instret() {
     );
     return instrs;
 }
+
+#undef GOLEM_R_INSN
 
 // // 获取核心的Global Memory基地址
 // // 每个核心的GM基地址 = 核心ID * 64KB (0x10000)

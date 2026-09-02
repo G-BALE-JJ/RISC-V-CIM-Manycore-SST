@@ -11,9 +11,9 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 WORKTREE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 
-export SST_CORE_PREFIX="${SST_CORE_PREFIX:-/data4/jjgong/local/sstcore}"
+export SST_CORE_PREFIX="${SST_CORE_PREFIX:-/local/sstcore}"
 export SST_ELEMENTS_INSTALL_PREFIX="${SST_ELEMENTS_INSTALL_PREFIX:-$WORKTREE_ROOT/install}"
-export SST_PYTHON_LIB_DIR="${SST_PYTHON_LIB_DIR:-/data4/jjgong/miniconda3/lib}"
+export SST_PYTHON_LIB_DIR="${SST_PYTHON_LIB_DIR:-/usr/lib/x86_64-linux-gnu}"
 
 case ":${PATH:-}:" in
 	*":$SST_CORE_PREFIX/bin:"*) ;;

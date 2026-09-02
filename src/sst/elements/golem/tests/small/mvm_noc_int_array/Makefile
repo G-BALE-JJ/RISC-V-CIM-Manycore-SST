@@ -1,10 +1,12 @@
 CC=$(ARCH)-linux-musl-gcc
-RISCV_MUSL_TOOLCHAIN_BIN ?= /data/lzq/packages/install/riscv64_musl_toolchain/bin
+RISCV_MUSL_TOOLCHAIN_BIN ?= /local/scratch/src/riscv64-linux-musl-cross/bin
 CXX=$(RISCV_MUSL_TOOLCHAIN_BIN)/riscv64-linux-musl-g++
 
-LDFLAGS=-static -fopenmp
-LDFLAGS_PTHREAD=-static -pthread
-LDFLAGS_STATIC=-static
+# The bundled musl toolchain defaults to PIE; static RISC-V worker binaries
+# must disable it or ld rejects dynamic relocations in read-only segments.
+LDFLAGS=-static -no-pie -fopenmp
+LDFLAGS_PTHREAD=-static -no-pie -pthread
+LDFLAGS_STATIC=-static -no-pie
 
 PROG1=mvm_noc_int_array
 PROG3=mvm_single_router

@@ -2,10 +2,14 @@
 import argparse
 import os
 import struct
+from pathlib import Path
 from typing import List
 
 import onnx
 from onnx import numpy_helper
+
+REPO_ROOT = Path(__file__).resolve().parents[7]
+DEFAULT_TEST_ROOT = REPO_ROOT / "src/sst/elements/golem/tests"
 
 
 def read_f32_file(path: str) -> List[float]:
@@ -198,13 +202,13 @@ def main() -> None:
     )
     ap.add_argument(
         "--dataset-dir",
-        default="/data4/lishun/pkg/sst-elements/src/sst/elements/golem/tests/task/task lenet5",
+        default=str(DEFAULT_TEST_ROOT / "task/task lenet5"),
         help="Directory containing lenet5.onnx(.data) and input/imageX.bin",
     )
     ap.add_argument("--image-index", type=int, default=0, help="Input image index 0..9")
     ap.add_argument(
         "--out-dir",
-        default="/data4/lishun/pkg/sst-elements/src/sst/elements/golem/tests/data/real_lenet5",
+        default=str(DEFAULT_TEST_ROOT / "data/real_lenet5"),
         help="Output directory for generated bins",
     )
     ap.add_argument(

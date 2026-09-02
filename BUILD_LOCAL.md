@@ -14,7 +14,7 @@ directory, and one local install prefix.
 From a fresh checkout/worktree:
 
 ```bash
-cd /data4/lishun/pkg/wt-huti-v0-full
+cd /path/to/RISC-V-CIM-Manycore-SST
 scripts/build_and_install_local.sh
 ```
 
@@ -31,13 +31,13 @@ run make install
 By default it installs this worktree's elements under:
 
 ```text
-/data4/lishun/pkg/wt-huti-v0-full/install/
+install/ (inside this worktree)
 ```
 
 and keeps generated build files under:
 
 ```text
-/data4/lishun/pkg/wt-huti-v0-full/build/sst-elements/
+build/sst-elements/ (inside this worktree)
 ```
 
 The prepared build tree copies this worktree's sources into
@@ -51,8 +51,8 @@ is only needed after deleting source files or when you want a full reset.
 The one-command script assumes these local dependencies:
 
 ```text
-SST core install:      /data4/lishun/pkg/sst_install
-DRAMSim3 source/build: /data4/lishun/pkg/DRAMsim3
+SST core install:      /local/sstcore
+DRAMSim3 source/build: /local/packages/dramsim3
 ```
 
 Override them with environment variables when needed:
@@ -74,7 +74,7 @@ scripts/build_and_install_local.sh --jobs 32
 Before running this branch's experiments, source the local environment:
 
 ```bash
-cd /data4/lishun/pkg/wt-huti-v0-full
+cd /data/jjgong/LLM/RISC-V-CIM-Manycore-SST
 source scripts/env_local_install.sh
 cd build/sst-elements/src/sst/elements/golem/tests
 ```
@@ -86,3 +86,12 @@ parallel without overwriting each other's `libgolem.so`.
 
 `build/` and `install/` are ignored by git and should hold only local generated
 files.
+
+## FlashAttention regression
+
+After building and installing the local elements library, run the active E3
+baseline with:
+
+```bash
+scripts/test_flash_attention.sh
+```

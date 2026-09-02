@@ -22,6 +22,7 @@ PV_RESTORE_PIPELINE=0
 PV_OUTPUT_PIPELINE=0
 PV_EARLY_COMPUTE=0
 PV_MATRIX_SOFTMAX_OVERLAP=0
+MPI_RANKS="${GOLEM_MPI_RANKS:-1}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -48,6 +49,15 @@ while [[ $# -gt 0 ]]; do
     *) echo "Unknown argument: $1" >&2; exit 2 ;;
   esac
 done
+
+if ! [[ "$MPI_RANKS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "GOLEM_MPI_RANKS must be a positive integer" >&2
+  exit 2
+fi
+if (( MPI_RANKS > 1 )); then
+  echo "scale attention MPI is not enabled for archive architecture; use materialized attention for MPI or run scale with GOLEM_MPI_RANKS=1" >&2
+  exit 2
+fi
 
 case "$SCALE_POINT" in
   e2)
@@ -104,7 +114,7 @@ if [[ "$SCALE_POINT" == e5 ]] && (( ! DRY_RUN && ! ALLOW_EXPENSIVE )); then
   exit 2
 fi
 
-ARTIFACT_ROOT="${ARTIFACT_ROOT:-/data4/jjgong/tmp/$RUN_ID}"
+ARTIFACT_ROOT="${ARTIFACT_ROOT:-${TMPDIR:-/tmp}/$RUN_ID}"
 Q_FILE="$ARTIFACT_ROOT/q_${TOTAL_QUERIES}x${HEAD_DIM}.bin"
 K_FILE="$ARTIFACT_ROOT/k_${KEYS}x${HEAD_DIM}.bin"
 V_FILE="$ARTIFACT_ROOT/v_${KEYS}x${HEAD_DIM}.bin"

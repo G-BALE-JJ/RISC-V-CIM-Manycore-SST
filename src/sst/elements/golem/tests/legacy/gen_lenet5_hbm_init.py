@@ -5,6 +5,7 @@ import struct
 
 
 TESTS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_LENET_DIR = os.path.join(TESTS_DIR, "task", "task lenet5")
 ARTIFACT_ROOT = os.getenv("GOLEM_ARTIFACT_ROOT", os.path.join(TESTS_DIR, "artifacts"))
 HBM_DIR = os.getenv("GOLEM_HBM_DIR", os.path.join(ARTIFACT_ROOT, "hbm"))
 MEM_NODE_SIZE = int(os.getenv("GOLEM_MEM_NODE_SIZE_BYTES", str(128 * 1024 * 1024)))
@@ -16,11 +17,11 @@ GOLEM_DIM = int(os.getenv("GOLEM_DIM", "16"))
 
 WEIGHTS_PATH = os.getenv(
     "LENET5_WEIGHTS",
-    "/data4/lishun/pkg/sst-elements/src/sst/elements/golem/tests/task/task lenet5/lenet5_fp32.weights",
+    os.path.join(DEFAULT_LENET_DIR, "lenet5_fp32.weights"),
 )
 IMAGE_PATH = os.getenv(
     "LENET5_INPUT",
-    "/data4/lishun/pkg/sst-elements/src/sst/elements/golem/tests/task/task lenet5/input/image8.bin",
+    os.path.join(DEFAULT_LENET_DIR, "input", "image8.bin"),
 )
 
 IMAGE_SIZE = 28 * 28

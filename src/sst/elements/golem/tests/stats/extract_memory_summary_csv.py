@@ -59,19 +59,39 @@ def main():
     parser = argparse.ArgumentParser(
         description="Extract compact HBM/DRAMSim3 summary metrics"
     )
-    parser.add_argument("--json", required=True, help="dramsim3.json path")
-    parser.add_argument("--txt", required=True, help="dramsim3.txt path")
+    parser.add_argument(
+        "--json",
+        action="append",
+        required=True,
+        help="dramsim3.json path (repeat for MPI memory nodes)",
+    )
+    parser.add_argument(
+        "--txt",
+        action="append",
+        required=True,
+        help="dramsim3.txt path (repeat for MPI memory nodes)",
+    )
     parser.add_argument("--output", required=True, help="Output CSV path")
     args = parser.parse_args()
 
-    json_path = Path(args.json)
-    txt_path = Path(args.txt)
+    if len(args.json) != len(args.txt):
+        parser.error("--json and --txt must have the same number of paths")
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    data = json.loads(json_path.read_text())
-    channels = [data[key] for key in sorted(data.keys(), key=lambda x: int(x))]
-    txt_channels = parse_channel_blocks(txt_path.read_text(errors="ignore"))
+    channels = []
+    for json_name in args.json:
+        data = json.loads(Path(json_name).read_text())
+        channels.extend(data[key] for key in sorted(data.keys(), key=lambda x: int(x)))
+
+    txt_channels = {}
+    for txt_name in args.txt:
+        for channel, channel_stats in parse_channel_blocks(
+            Path(txt_name).read_text(errors="ignore")
+        ).items():
+            merged_stats = txt_channels.setdefault(channel, {})
+            for key, value in channel_stats.items():
+                merged_stats[key] = merged_stats.get(key, 0.0) + value
 
     avg_latencies = [float(ch.get("average_read_latency", 0.0)) for ch in channels]
     avg_bandwidths = [float(ch.get("average_bandwidth", 0.0)) for ch in channels]
