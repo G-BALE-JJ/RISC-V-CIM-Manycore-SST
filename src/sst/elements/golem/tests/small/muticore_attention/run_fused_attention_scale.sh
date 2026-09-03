@@ -3,7 +3,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TESTS_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+WORKTREE_ROOT="$(cd "$TESTS_DIR/../../../../.." && pwd -P)"
 BASE_RUNNER="$TESTS_DIR/run_noc_dma_pipeline.sh"
+LOCAL_ELEMENT_LIB="$WORKTREE_ROOT/install/lib/sst-elements-library"
 ARTIFACT_ROOT=""
 TIMEOUT_SECONDS=7200
 TIMEOUT_EXPLICIT=0
@@ -23,6 +25,8 @@ PV_OUTPUT_PIPELINE=0
 PV_EARLY_COMPUTE=0
 PV_MATRIX_SOFTMAX_OVERLAP=0
 MPI_RANKS="${GOLEM_MPI_RANKS:-1}"
+MPI_PARTITIONER=sst.simple
+ATTENTION_SST_ARGS="${GOLEM_ATTENTION_SST_ARGS:-}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -54,9 +58,23 @@ if ! [[ "$MPI_RANKS" =~ ^[1-9][0-9]*$ ]]; then
   echo "GOLEM_MPI_RANKS must be a positive integer" >&2
   exit 2
 fi
-if (( MPI_RANKS > 1 )); then
-  echo "scale attention MPI is not enabled for archive architecture; use materialized attention for MPI or run scale with GOLEM_MPI_RANKS=1" >&2
+if (( MPI_RANKS > 4 || 4 % MPI_RANKS != 0 )); then
+  echo "GOLEM_MPI_RANKS must divide the four query-manager bands (supported: 1, 2, 4)" >&2
   exit 2
+fi
+if (( MPI_RANKS > 1 )); then
+  MPI_PARTITIONER=sst.self
+fi
+if [[ " $ATTENTION_SST_ARGS " == *" --partitioner"* ||
+      " $ATTENTION_SST_ARGS " == *" --lib-path"* ||
+      " $ATTENTION_SST_ARGS " == *" --add-lib-path"* ]]; then
+  echo "GOLEM_ATTENTION_SST_ARGS cannot override the partitioner or element library path" >&2
+  exit 2
+fi
+if [[ ! -f "$LOCAL_ELEMENT_LIB/libgolem.so" ]]; then
+  echo "Missing local element library: $LOCAL_ELEMENT_LIB/libgolem.so" >&2
+  echo "Build it first with scripts/build_and_install_local.sh" >&2
+  exit 1
 fi
 
 case "$SCALE_POINT" in
@@ -67,7 +85,6 @@ case "$SCALE_POINT" in
     HEAD_DIM=64
     MANAGER_QUERIES=64
     ARRAY_INPUT=64
-    BUILD_TARGET=scale-e2
     GUEST_NAME=fused_attention_scale_e2
     ;;
   e3)
@@ -77,7 +94,6 @@ case "$SCALE_POINT" in
     HEAD_DIM=128
     MANAGER_QUERIES=256
     ARRAY_INPUT=128
-    BUILD_TARGET=scale-e3
     GUEST_NAME=fused_attention_scale_e3
     ;;
   e4)
@@ -87,7 +103,6 @@ case "$SCALE_POINT" in
     HEAD_DIM=128
     MANAGER_QUERIES=512
     ARRAY_INPUT=128
-    BUILD_TARGET=scale-e4
     GUEST_NAME=fused_attention_scale_e4
     ;;
   e5)
@@ -97,7 +112,6 @@ case "$SCALE_POINT" in
     HEAD_DIM=128
     MANAGER_QUERIES=1024
     ARRAY_INPUT=128
-    BUILD_TARGET=scale-e5
     GUEST_NAME=fused_attention_scale_e5
     if (( ! TIMEOUT_EXPLICIT )); then TIMEOUT_SECONDS=28800; fi
     ;;
@@ -120,6 +134,8 @@ K_FILE="$ARTIFACT_ROOT/k_${KEYS}x${HEAD_DIM}.bin"
 V_FILE="$ARTIFACT_ROOT/v_${KEYS}x${HEAD_DIM}.bin"
 RESULT_JSON="$ARTIFACT_ROOT/fused_attention_result.json"
 LIFECYCLE_JSON="$ARTIFACT_ROOT/attention_lifecycle.json"
+MPI_PARTITION_JSON="$ARTIFACT_ROOT/attention_mpi_partition.json"
+MPI_PLACEMENT_JSON="$ARTIFACT_ROOT/attention_mpi_placement.json"
 GUEST="$SCRIPT_DIR/riscv64/$GUEST_NAME"
 HBM_DIR="$ARTIFACT_ROOT/hbm"
 STATS_FILE="$ARTIFACT_ROOT/stats/overlap0/$RUN_ID/stats_selfcom.txt"
@@ -129,11 +145,19 @@ K_OFFSET=$((0x02100000))
 V_OFFSET=$((0x02200000))
 O_OFFSET=$((0x02300000))
 
+if [[ ! -x "$GUEST" ]]; then
+  echo "Missing FlashAttention guest: $GUEST" >&2
+  echo "Build it first with scripts/build_and_install_local.sh" >&2
+  exit 1
+fi
+
 GENERATE_CMD=(python3 "$SCRIPT_DIR/attention_case.py" generate
   --queries "$TOTAL_QUERIES" --keys "$KEYS" --head-dim "$HEAD_DIM"
   --q-file "$Q_FILE" --k-file "$K_FILE" --v-file "$V_FILE")
 
 RUN_CMD=(timeout "$TIMEOUT_SECONDS" env
+  "SST_LIB_PATH=$LOCAL_ELEMENT_LIB"
+  "GOLEM_SST_ARGS=--lib-path=$LOCAL_ELEMENT_LIB${ATTENTION_SST_ARGS:+ $ATTENTION_SST_ARGS}"
   "GOLEM_RUN_ID=$RUN_ID"
   "GOLEM_ARTIFACT_ROOT=$ARTIFACT_ROOT"
   "VANADIS_EXE=$GUEST"
@@ -141,6 +165,8 @@ RUN_CMD=(timeout "$TIMEOUT_SECONDS" env
   GOLEM_ARCH_SCRIPT=architecture/archive/ncores_selfcom_dma.py
   GOLEM_ATTENTION_FUSED=1
   GOLEM_ATTENTION_HBM_STRIPED=1
+  "GOLEM_ATTENTION_QUERY_BLOCK_MPI=$((MPI_RANKS > 1 ? 1 : 0))"
+  "GOLEM_ATTENTION_PLACEMENT_FILE=$MPI_PLACEMENT_JSON"
   "GOLEM_ATTENTION_QUERIES=$TOTAL_QUERIES"
   "GOLEM_ATTENTION_KEYS=$KEYS"
   "GOLEM_ATTENTION_HEAD_DIM=$HEAD_DIM"
@@ -182,7 +208,8 @@ RUN_CMD=(timeout "$TIMEOUT_SECONDS" env
   --gemm-block-m 16 --gemm-block-n 16 --gemm-block-k "$HEAD_DIM"
   --array-in "$ARRAY_INPUT" --array-out 16 --num-arrays 16
   --groups 4 --num-cores 20 --gemm-cores 20 --num-mem-nodes 5 --mesh-dim-x 4
-  --global-stride-kb 1024 --mem-node-size "$MEM_NODE_SIZE")
+  --global-stride-kb 1024 --mem-node-size "$MEM_NODE_SIZE"
+  --mpi-ranks "$MPI_RANKS" --mpi-partitioner "$MPI_PARTITIONER")
 
 VERIFY_CMD=(python3 "$SCRIPT_DIR/verify_fused_attention_scale_output.py"
   --q-file "$Q_FILE" --k-file "$K_FILE" --v-file "$V_FILE"
@@ -194,6 +221,10 @@ VERIFY_STATS_CMD=(python3 "$SCRIPT_DIR/verify_fused_attention_scale_stats.py"
   --accelerator-clock "${VANADIS_CPU_CLOCK:-1.0GHz}"
   --timebase-ticks-per-second 1000000000000
   --result-json "$LIFECYCLE_JSON" "$STATS_FILE")
+VERIFY_MPI_CMD=(python3 "$SCRIPT_DIR/verify_attention_mpi_partition.py"
+  --stats-file "$STATS_FILE" --mpi-ranks "$MPI_RANKS"
+  --placement-file "$MPI_PLACEMENT_JSON"
+  --result-json "$MPI_PARTITION_JSON")
 if (( PV_MATRIX_BROADCAST )); then
   VERIFY_STATS_CMD+=(--pv-matrix-broadcast)
 fi
@@ -227,19 +258,27 @@ fi
 
 if (( DRY_RUN )); then
   printf '%q ' "${GENERATE_CMD[@]}"; printf '\n'
-  echo "make -C $SCRIPT_DIR $BUILD_TARGET"
   printf '%q ' "${RUN_CMD[@]}"; printf '\n'
   printf '%q ' "${VERIFY_CMD[@]}"; printf '\n'
   printf '%q ' "${VERIFY_STATS_CMD[@]}"; printf '\n'
+  if (( MPI_RANKS > 1 )); then
+    printf '%q ' "${VERIFY_MPI_CMD[@]}"; printf '\n'
+  fi
   exit 0
 fi
 
 mkdir -p "$ARTIFACT_ROOT"
+rm -f "$RESULT_JSON" "$LIFECYCLE_JSON" "$MPI_PARTITION_JSON" "$MPI_PLACEMENT_JSON" "$STATS_FILE"
+for rank in 0 1 2 3; do
+  rm -f "${STATS_FILE%.txt}_${rank}.txt"
+done
 "${GENERATE_CMD[@]}"
-make -C "$SCRIPT_DIR" "$BUILD_TARGET"
 "${RUN_CMD[@]}"
 "${VERIFY_CMD[@]}"
 "${VERIFY_STATS_CMD[@]}"
+if (( MPI_RANKS > 1 )); then
+  "${VERIFY_MPI_CMD[@]}"
+fi
 
-echo "Fused Attention ${SCALE_POINT^^} PASS: B1,H1,S${TOTAL_QUERIES},D${HEAD_DIM},4 managers,16 workers,1 tensor completion"
+echo "Fused Attention ${SCALE_POINT^^} PASS: B1,H1,S${TOTAL_QUERIES},D${HEAD_DIM},4 managers,16 workers,${MPI_RANKS} MPI rank(s),1 tensor completion"
 echo "Artifacts: $ARTIFACT_ROOT"

@@ -75,6 +75,7 @@ SST_CORE_PREFIX="${SST_CORE_PREFIX:-/local/sstcore}"
 SST_DRAMSIM3_PREFIX="${SST_DRAMSIM3_PREFIX:-/local/packages/dramsim3}"
 INSTALL_HOME="$BUILD_ROOT/.sst-home"
 INSTALL_HOME_CONFIG="$INSTALL_HOME/.sst/sstsimulator.conf"
+ATTENTION_DIR="$WORKTREE_ROOT/src/sst/elements/golem/tests/small/muticore_attention"
 
 restore_handwritten_test_makefiles() {
 	local rel
@@ -122,27 +123,30 @@ if [[ "$reconfigure" -eq 1 ]]; then
 fi
 
 if [[ "$run_autogen" -eq 1 ]]; then
-	echo "[1/4] Running autogen.sh"
+	echo "[1/5] Running autogen.sh"
 	./autogen.sh
 else
-	echo "[1/4] Skipping autogen.sh"
+	echo "[1/5] Skipping autogen.sh"
 fi
 
-echo "[2/4] Configuring local install"
+echo "[2/5] Configuring local install"
 ./configure \
 	--prefix="$INSTALL_PREFIX" \
 	--with-sst-core="$SST_CORE_PREFIX" \
 	--with-dramsim3="$SST_DRAMSIM3_PREFIX"
 
-echo "[3/4] Building with $jobs jobs"
+echo "[3/5] Building SST elements with $jobs jobs"
 make -j"$jobs"
 
-echo "[4/4] Installing to $INSTALL_PREFIX"
+echo "[4/5] Installing to $INSTALL_PREFIX"
 mkdir -p "$INSTALL_HOME/.sst"
 if [[ ! -f "$INSTALL_HOME_CONFIG" ]]; then
 	cp "$SST_CORE_PREFIX/etc/sst/sstsimulator.conf" "$INSTALL_HOME_CONFIG"
 fi
 HOME="$INSTALL_HOME" make install
+
+echo "[5/5] Building FlashAttention RISC-V guests"
+make -C "$ATTENTION_DIR" -j"$jobs" scale-e2 scale-e3 scale-e4 scale-e5
 
 cat <<EOF
 [OK] Build and install complete.

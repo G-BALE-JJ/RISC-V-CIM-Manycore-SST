@@ -1,0 +1,39 @@
+{
+  "profile": "e3",
+  "shape": {
+    "batch": 1,
+    "heads": 1,
+    "queries": 1024,
+    "keys": 1024,
+    "head_dim": 128,
+    "dtype": "fp32"
+  },
+  "topology": {
+    "managers": 4,
+    "workers": 16,
+    "mpi_ranks": 2,
+    "partitioner": "sst.self",
+    "placement": "query_block"
+  },
+  "verification": {
+    "status": "PASS",
+    "checked": 131072,
+    "mismatches": 0,
+    "max_abs_error": 1.596650653161967e-09,
+    "score_probability_hbm_bytes": 0
+  },
+  "lifecycle": {
+    "status": "PASS",
+    "accelerator_completion_cycles": 3561012,
+    "wait_return_cycles": 3561012,
+    "order_valid": true,
+    "conservation_valid": true
+  },
+  "partition": {
+    "status": "PASS",
+    "cores_per_rank": 10,
+    "manager_groups_per_rank": 2
+  },
+  "source": "scripts/build_and_install_local.sh --reconfigure --jobs 16; scripts/test_flash_attention.sh --mpi-ranks 2 --timeout 600",
+  "artifact_root": "/tmp/fused_attention_e3_s1024_d128_mpi2"
+}

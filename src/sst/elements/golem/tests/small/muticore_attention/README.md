@@ -9,6 +9,13 @@ Run the verified baseline:
 ./run_flash_attention.sh
 ```
 
+Run the frozen multi-rank query-block MPI regressions from the repository root:
+
+```bash
+scripts/test_flash_attention.sh --mpi-ranks 2
+scripts/test_flash_attention.sh --mpi-ranks 4
+```
+
 Optional pressure profiles:
 
 ```bash
@@ -17,8 +24,9 @@ Optional pressure profiles:
 ```
 
 The active path uses the locally built SST/Golem library and the RISC-V guest
-binary built by the local `Makefile`. It is intentionally single-rank; the
-scale/archive architecture rejects `GOLEM_MPI_RANKS > 1`.
+binary built by the local `Makefile`. MPI supports 2 or 4 ranks. Each manager
+and its four workers remain colocated, so the four query bands are assigned
+two-per-rank or one-per-rank.
 
 Key files:
 
@@ -28,3 +36,4 @@ Key files:
 - `attention_case.py`: deterministic Q/K/V generation;
 - `verify_fused_attention_scale_output.py`: numerical verification;
 - `verify_fused_attention_scale_stats.py`: lifecycle/statistics verification.
+- `verify_attention_mpi_partition.py`: query-block rank placement verification.

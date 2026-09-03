@@ -4,4 +4,25 @@
 - 当前 active attention 入口仅为 `small/muticore_attention/run_flash_attention.sh`，默认执行 E3 scale/archive profile。
 - 旧 standalone Softmax workload、materialized attention 和阶段性 runner 已从工作树删除，不再作为构建或测试依赖。
 - 之前的 `Bad system call` 发生在受限执行环境中，属于 seccomp 拦截交叉编译器 syscall，不是源码错误。
-- FlashAttention scale/archive 路径保持单 rank；MPI query-block 分区不属于当前 active scope。
+- 2026-09-03 新任务要求：保持参考项目 GEMM 测试路径和行为不变，MPI 改造仅服务于 active FlashAttention。
+- Attention guest 已由 core0..3 分别担任 manager，每个 manager 管理 4 个 worker，并通过 `query_row_begin = manager_id * manager_queries` 天然划分四个 query band；无需修改 GEMM workload 即可做 query-block 分区。
+- 参考 GEMM ctrl 架构没有手工调用 `setRank`；由 `sst.simple` 对可切割拓扑自动分区。可复用机制是 NoCut 条件化、每 memory node 独立 DRAMSim3 输出和 runner 的 MPI/统计合并链路。
+- archive 中 NoC 本地/路由连接默认可切割，但 core-to-NodeOS、core-to-MMU 三类链接被无条件 `setNoCut()`，会阻止参考 MPI 分区方式；应与 ctrl 一样仅在单 rank 设置 NoCut。
+- E2 单 rank 与 2-rank 均通过：16384 values、0 mismatch、max error `4.496752113464925e-09`、completion/wait `91287` cycles。
+- E2 两种 rank 数的四个 `hbm_out_node*.bin` SHA-256 完全一致，两个 lifecycle JSON 无 diff，证明当前 MPI 分区不改变数值或时序模型结果。
+- 2-rank 产生 `stats_selfcom_0.txt`/`stats_selfcom_1.txt` 并成功合并；DRAMSim3 node0..4 均写入独立目录。
+- 自动 `sst.simple` 分区虽正确运行，但不满足 query-block 共置：rank0 有 15 个 core，rank1 仅有 core0/8/10/16/18，manager/worker group 被拆散。
+- 根因是 archive 仅解除 NoCut 后完全交给自动 partitioner，没有给 Attention manager group 显式 rank 约束。
+- SST 本机源码确认 `sst.simple` 会重做自动分区并覆盖配置中的 `setRank()`；`sst.self` 是空操作 partitioner，专用于配置脚本已完成 rank 放置的场景。
+- 因此 query-block MPI 必须组合使用 archive 中的显式 `setRank()` 和 Attention runner 的 `--mpi-partitioner sst.self`；GEMM 继续使用通用 runner 默认的 `sst.simple`。
+- `/local/sstcore/etc/sst/sstsimulator.conf` 的 element 默认目录仍指向 `/data/shun/RISC-V-CIM-Manycore-SST`。直接运行 scale runner 时，本地 build 路径只含 `libgolem.so`，其余 element 从旧目录加载，造成 LLM `libgolem` 与旧 `libmerlin`/ELI 元数据混用。
+- Attention 入口必须把 `SST_LIB_PATH` 和动态库路径限定到本工作树完整 install 目录，并通过 SST `--lib-path` 覆盖全局配置，才能满足本地完全移植要求。
+- 纯本地 element + `sst.self` 的 E2 双 rank 实测通过：数值 16384 项、0 mismatch、最大误差 `4.496752113464925e-09`，完成与 wait 均为 91287 cycles。
+- 分区验证器确认 rank0 为偶数 manager group 的 10 个 core、rank1 为奇数 manager group 的 10 个 core；无缺失、冲突或错放。
+- 纯本地 E2 单 rank 与双 rank 的数值 JSON、生命周期 JSON 及四个 HBM 输出 SHA-256 全部一致。
+- E2 4-rank 实测通过，每个 rank 恰好承载 1 个 manager 和其 4 个 worker；数值与生命周期保持一致。
+- E3 2-rank 正式回归通过：131072 项、0 mismatch、最大误差 `1.596650653161967e-09`，完成与 wait 均为 3561012 cycles，query-block 映射无错放。
+- `scripts/test_flash_attention.sh --mpi-ranks 2` 现在是独立于构建的冻结 MPI 基线入口；构建仍由 `scripts/build_and_install_local.sh` 单独执行。
+- 独立审查指出通用 SST 参数污染、stale rank stats、冻结字段遗漏、4-rank 回归缺口和路由器验证缺口；收尾阶段逐项收紧。
+- 真实 CSV 可观测 20 个 CPU 顶层组件和全部 28 个 `rtr_*`；OS/dirctrl/memory 没有 CSV 统计行，因此架构在实际构图时另行原子导出完整 placement manifest，运行后统一校验 200 个顶层组件。
+- E3 单 rank、2-rank、4-rank 冻结回归均通过：131072 项、0 mismatch、最大误差 `1.596650653161967e-09`，完成与 wait 均为 3561012 cycles。

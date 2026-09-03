@@ -6,9 +6,11 @@ N-Core 流水线 Mailbox 测试 - 多进程版本
 优势: 每个进程独占 1 个核心，彻底避开 pthread/futex/LLSC
 """
 
+import json
 import os
 import re
 import sys
+from pathlib import Path
 import sst
 
 if __package__ in {None, ""}:
@@ -112,6 +114,19 @@ HBM_DIR = os.getenv("GOLEM_HBM_DIR", os.path.join(ARTIFACT_ROOT, "hbm"))
 HBM_DUMP_OUTPUT = _env_flag("GOLEM_HBM_DUMP_OUTPUT", True)
 STATS_DIR = os.getenv("GOLEM_STATS_DIR", os.path.join(ARTIFACT_ROOT, "stats"))
 STATS_FILE = os.getenv("GOLEM_STATS_FILE", os.path.join(STATS_DIR, "stats_selfcom.txt"))
+DRAMSIM3_OUT_DIR = os.getenv(
+    "GOLEM_DRAMSIM3_OUT_DIR", os.path.join(STATS_DIR, "dramsim3")
+)
+MPI_PARTITIONING = _env_flag("GOLEM_MPI_PARTITIONING", False)
+ATTENTION_QUERY_BLOCK_MPI = _env_flag("GOLEM_ATTENTION_QUERY_BLOCK_MPI", False)
+MPI_RANKS = int(os.getenv("GOLEM_MPI_RANKS", "1"))
+ATTENTION_PLACEMENT_FILE = os.getenv("GOLEM_ATTENTION_PLACEMENT_FILE", "")
+attention_component_ranks = {}
+
+if ATTENTION_QUERY_BLOCK_MPI and (not MPI_PARTITIONING or MPI_RANKS not in (2, 4)):
+    raise ValueError(
+        "GOLEM_ATTENTION_QUERY_BLOCK_MPI requires MPI partitioning with 2 or 4 ranks"
+    )
 
 os.makedirs(HBM_DIR, exist_ok=True)
 os.makedirs(STATS_DIR, exist_ok=True)
@@ -125,6 +140,42 @@ memctrl_clock = os.getenv("GOLEM_MEMCTRL_CLOCK", cpu_clock)
 protocol = "MESI"
 numCpus = int(os.getenv("VANADIS_NUM_CORES", 16))
 os.environ["VANADIS_NUM_CORES"] = str(numCpus)
+if ATTENTION_QUERY_BLOCK_MPI and numCpus != 20:
+    raise ValueError("Attention query-block MPI requires exactly 20 cores")
+
+
+def attention_rank_for_core(core_id: int) -> int:
+    manager_id = core_id if core_id < 4 else core_id % 4
+    return manager_id % MPI_RANKS
+
+
+def attention_rank_for_memory_node(node_index: int) -> int:
+    return 0 if node_index == OS_MEMORY_NODE_INDEX else (node_index - 1) % MPI_RANKS
+
+
+def set_attention_component_rank(component, component_name: str, rank: int) -> None:
+    component.setRank(rank)
+    attention_component_ranks[component_name] = rank
+
+
+def set_attention_cpu_rank(prefix: str, rank: int) -> None:
+    for suffix in (
+        "",
+        ".processorBus",
+        ".l1dcache",
+        ".l1icache",
+        ".dtlb",
+        ".itlb",
+        ".bus",
+        ".l2cache",
+    ):
+        component_name = prefix + suffix
+        component = sst.findComponentByName(component_name)
+        if component is None:
+            raise RuntimeError(f"missing CPU component for MPI placement: {component_name}")
+        set_attention_component_rank(component, component_name, rank)
+
+
 # 关键修正：每个核心 1 个硬件线程
 numThreads = 1
 verbosity = int(os.getenv("VANADIS_VERBOSE", 0))
@@ -183,6 +234,10 @@ print(f"[PTHREAD] 每核心硬件线程数: {numThreads}")
 print(f"[PTHREAD] 模式: 多进程单线程（共享地址空间）")
 print(f"[PTHREAD] HBM目录: {HBM_DIR}")
 print(f"[PTHREAD] 统计文件: {STATS_FILE}")
+print(
+    f"[MPI] partitioning={int(MPI_PARTITIONING)} "
+    f"dramsim3_out_dir={DRAMSIM3_OUT_DIR}"
+)
 
 # MMU 类型
 mmuType = "simpleMMU"
@@ -378,6 +433,22 @@ if len(cpu_routers) != numCpus:
         f"insufficient CPU routers: need {numCpus}, got {len(cpu_routers)}"
     )
 
+if ATTENTION_QUERY_BLOCK_MPI:
+    for router_id, router in enumerate(noc.routers):
+        set_attention_component_rank(router, f"rtr_{router_id}", 0)
+    for node_index, router_id in enumerate(MEMORY_ROUTERS):
+        set_attention_component_rank(
+            noc.get_router(router_id),
+            f"rtr_{router_id}",
+            attention_rank_for_memory_node(node_index),
+        )
+    for core_id, router_id in enumerate(cpu_routers):
+        set_attention_component_rank(
+            noc.get_router(router_id),
+            f"rtr_{router_id}",
+            attention_rank_for_core(core_id),
+        )
+
 # CPU_Builder creates GlobalMemory, which reads GOLEM_MEMORY_ROUTERS at build time.
 print("[SST] 实例化 CPU_Builder...")
 builder = CPU_Builder()
@@ -388,6 +459,10 @@ for core_id in range(numCpus):
     ports = builder.build(
         f"core{core_id}", core_id, core_id, add_l2_cache=True, add_rocc_golem=True
     )
+    if ATTENTION_QUERY_BLOCK_MPI:
+        set_attention_cpu_rank(
+            f"core{core_id}", attention_rank_for_core(core_id)
+        )
     cpu_ports.append(ports)
 
 print("[SST] CPU 模块构建完成。")
@@ -413,6 +488,8 @@ for core_id, router_id in enumerate(cpu_routers):
 print("[SST] 创建 NodeOS...")
 node_os = sst.Component("os", "vanadis.VanadisNodeOS")
 node_os.addParams(osParams)
+if ATTENTION_QUERY_BLOCK_MPI:
+    set_attention_component_rank(node_os, "os", 0)
 
 # 添加所有进程
 num = 0
@@ -433,6 +510,8 @@ node_os_mem_if = node_os.setSubComponent(
 # OS L1 Cache
 os_l1 = sst.Component("node.os_l1cache", "memHierarchy.Cache")
 os_l1.addParams(osl1cacheParams)
+if ATTENTION_QUERY_BLOCK_MPI:
+    set_attention_component_rank(os_l1, "node.os_l1cache", 0)
 os_l1_hi = os_l1.setSubComponent("highlink", "memHierarchy.MemLink")
 os_l1_lo = os_l1.setSubComponent("lowlink", "memHierarchy.MemNIC")
 memory_destinations = ",".join(str(100 + idx) for idx in range(NUM_MEMORY_NODES))
@@ -468,6 +547,10 @@ for idx, router_id in enumerate(MEMORY_ROUTERS):
     print(f"  地址范围: 0x{addr_start:x} - 0x{addr_end:x}")
 
     dirctrl = sst.Component(f"dirctrl_{idx}", "memHierarchy.DirectoryController")
+    if ATTENTION_QUERY_BLOCK_MPI:
+        set_attention_component_rank(
+            dirctrl, f"dirctrl_{idx}", attention_rank_for_memory_node(idx)
+        )
     dirctrl.addParams(
         {
             "coherence_protocol": protocol,
@@ -499,6 +582,10 @@ for idx, router_id in enumerate(MEMORY_ROUTERS):
     dir_lo = dirctrl.setSubComponent("lowlink", "memHierarchy.MemLink")
 
     memctrl = sst.Component(f"memory_{idx}", "memHierarchy.MemController")
+    if ATTENTION_QUERY_BLOCK_MPI:
+        set_attention_component_rank(
+            memctrl, f"memory_{idx}", attention_rank_for_memory_node(idx)
+        )
     mem_params = {
         "clock": memctrl_clock,
         "backend.mem_size": memSizePerNode,
@@ -536,12 +623,15 @@ for idx, router_id in enumerate(MEMORY_ROUTERS):
     memctrl.addParams(mem_params)
     mem_hi = memctrl.setSubComponent("highlink", "memHierarchy.MemLink")
     mem_backend = memctrl.setSubComponent("backend", "memHierarchy.dramsim3")
-    mem_backend.addParams(
-        {
-            "mem_size": memSizePerNode,
-            "config_ini": DRAMSIM3_CONFIG,
-        }
-    )
+    backend_params = {
+        "mem_size": memSizePerNode,
+        "config_ini": DRAMSIM3_CONFIG,
+    }
+    if MPI_PARTITIONING:
+        node_output_dir = os.path.join(DRAMSIM3_OUT_DIR, f"node{idx}")
+        os.makedirs(node_output_dir, exist_ok=True)
+        backend_params["output_dir"] = node_output_dir
+    mem_backend.addParams(backend_params)
     mem_backend.enableAllStatistics()
 
     link_dir_mem = sst.Link(f"link_dir{idx}_to_mem{idx}")
@@ -561,15 +651,42 @@ for core_id, ports in enumerate(cpu_ports):
 
     link_core_os = sst.Link(f"link_core{core_id}_os")
     link_core_os.connect(os_link, (node_os, f"core{core_id}", "5ns"))
-    link_core_os.setNoCut()
+    if not MPI_PARTITIONING:
+        link_core_os.setNoCut()
 
     link_mmu_dtlb = sst.Link(f"link_core{core_id}_mmu_dtlb")
     link_mmu_dtlb.connect((node_os_mmu, f"core{core_id}.dtlb", "1ns"), dtlb)
-    link_mmu_dtlb.setNoCut()
+    if not MPI_PARTITIONING:
+        link_mmu_dtlb.setNoCut()
 
     link_mmu_itlb = sst.Link(f"link_core{core_id}_mmu_itlb")
     link_mmu_itlb.connect((node_os_mmu, f"core{core_id}.itlb", "1ns"), itlb)
-    link_mmu_itlb.setNoCut()
+    if not MPI_PARTITIONING:
+        link_mmu_itlb.setNoCut()
+
+if ATTENTION_QUERY_BLOCK_MPI:
+    if not ATTENTION_PLACEMENT_FILE:
+        raise ValueError(
+            "GOLEM_ATTENTION_PLACEMENT_FILE is required for query-block MPI verification"
+        )
+    placement_path = Path(ATTENTION_PLACEMENT_FILE)
+    placement_path.parent.mkdir(parents=True, exist_ok=True)
+    placement_tmp = placement_path.with_name(
+        f"{placement_path.name}.{os.getpid()}.tmp"
+    )
+    placement_tmp.write_text(
+        json.dumps(
+            {
+                "mpi_ranks": MPI_RANKS,
+                "component_ranks": attention_component_ranks,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    os.replace(placement_tmp, placement_path)
 
 # --- 11. 总结 ---
 print("\n" + "=" * 60)
